@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -120,10 +121,6 @@ def walk_forward_train_test(
         y_pred = model.predict(X_test)
 
         results.append({
-            "train_start": train.index.min().date(),
-            "train_end": train.index.max().date(),
-            "test_start": test.index.min().date(),
-            "test_end": test.index.max().date(),
             "mae": mean_absolute_error(y_test, y_pred),
             "rmse": np.sqrt(mean_squared_error(y_test, y_pred)),
             "hit_rate": float((np.sign(y_pred) == np.sign(y_test)).mean()),
@@ -164,7 +161,7 @@ def main():
     pca_target = 50
     theta = 0.75
     k_neighbors = 20
-    alpha = 0.5  # peso del kNN en el ensamble
+    alpha = 0.5
 
     print(f"Descargando {ticker}...")
     raw = yf.download(ticker, period="max", progress=False)
@@ -182,80 +179,57 @@ def main():
         *[f"ret_lag_{k}" for k in range(1, 21)]
     ]
 
-    # =========================
-    # VALIDACIÓN WALK-FORWARD
-    # =========================
-    res_df, pred_df = walk_forward_train_test(
-        feat,
-        feature_cols=feature_cols,
-        target_col="y_fwd",
-        pca_target=pca_target
+    res_df, _ = walk_forward_train_test(
+        feat, feature_cols, "y_fwd", pca_target=pca_target
     )
 
-    print("\n=== Resumen global (walk-forward) ===")
+    print("\n=== RESUMEN HISTÓRICO ===")
     print(f"Hit-rate prom : {res_df['hit_rate'].mean():.4f}")
     print(f"MAE retorno   : {res_df['mae'].mean():.6f}")
-    print(f"Features     : {res_df['n_features'].iloc[0]}")
-    print(f"PCA comps    : {res_df['n_pca'].iloc[0]}")
+    print(f"PCA dims      : {res_df['n_pca'].iloc[0]}")
 
-    # =========================
-    # MODO OPERATIVO
-    # =========================
     print("\n=== PREDICCIÓN ACTUAL (ENSAMBLE) ===")
 
     n_features = len(feature_cols)
-    n_pca = min(pca_target, max(1, n_features - 1))
+    n_pca = min(pca_target, n_features - 1)
 
-    final_model = Pipeline([
+    model = Pipeline([
         ("scaler", StandardScaler()),
         ("pca", PCA(n_components=n_pca, random_state=42)),
         ("ridge", Ridge(alpha=1.0))
     ])
 
-    X_all = feat[feature_cols].values
-    y_all = feat["y_fwd"].values
-    final_model.fit(X_all, y_all)
+    X = feat[feature_cols].values
+    y = feat["y_fwd"].values
+    model.fit(X, y)
+
+    X_pca = model.named_steps["pca"].transform(
+        model.named_steps["scaler"].transform(X)
+    )
 
     last_row = feat.iloc[-1]
     X_last = last_row[feature_cols].values.reshape(1, -1)
-
-    # Predicción global
-    y_pred_global = float(final_model.predict(X_last)[0])
-
-    # Proyección PCA
-    X_all_pca = final_model.named_steps["pca"].transform(
-        final_model.named_steps["scaler"].transform(X_all)
-    )
-    X_last_pca = final_model.named_steps["pca"].transform(
-        final_model.named_steps["scaler"].transform(X_last)
+    X_last_pca = model.named_steps["pca"].transform(
+        model.named_steps["scaler"].transform(X_last)
     )
 
-    # Predicción caótica local
-    y_pred_knn = knn_caotico_predict(
-        X_train=X_all_pca,
-        y_train=y_all,
-        X_query=X_last_pca,
-        k=k_neighbors
-    )
+    y_global = float(model.predict(X_last)[0])
+    y_knn = knn_caotico_predict(X_pca, y, X_last_pca, k_neighbors)
 
-    # ENSAMBLE
-    y_pred_ens = alpha * y_pred_knn + (1 - alpha) * y_pred_global
+    y_ens = alpha * y_knn + (1 - alpha) * y_global
 
-    ret_pct = y_pred_ens * 100.0
     price_now = float(last_row["Close"])
-    price_pred = price_now * np.exp(y_pred_ens)
+    price_pred = price_now * np.exp(y_ens)
 
-    accion = recomendar(ret_pct, theta)
+    accion = recomendar(y_ens * 100, theta)
 
-    print(f"Activo              : {ticker}")
-    print(f"Fecha base          : {last_row.name.date()}")
-    print(f"Dimensión efectiva  : PCA = {n_pca}")
-    print(f"Retorno global      : {y_pred_global*100:.2f} %")
-    print(f"Retorno kNN caótico : {y_pred_knn*100:.2f} %")
-    print(f"Retorno ENSAMBLE    : {ret_pct:.2f} %")
+    print(f"Retorno global      : {y_global*100:.2f} %")
+    print(f"Retorno kNN caótico : {y_knn*100:.2f} %")
+    print(f"Retorno ENSAMBLE    : {y_ens*100:.2f} %")
     print(f"Precio actual       : {price_now:.2f} USD")
     print(f"Precio esperado     : {price_pred:.2f} USD")
     print(f"RECOMENDACIÓN       : {accion}")
+
 
 if __name__ == "__main__":
     main()
