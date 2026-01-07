@@ -6,6 +6,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
@@ -17,10 +18,6 @@ def log_return(series: pd.Series) -> pd.Series:
 
 
 def hurst_rs(x: np.ndarray) -> float:
-    """
-    Estimador simple Hurst (R/S).
-    Retorna np.nan si no alcanza datos.
-    """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     n = len(x)
@@ -47,27 +44,32 @@ def rolling_hurst(returns: pd.Series, window: int) -> pd.Series:
 def make_features(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     out = df.copy()
 
-    # Retornos y rangos
     out["ret1"] = log_return(out["Close"])
     out["range"] = np.log(out["High"] / out["Low"])
     out["vol_chg"] = np.log(out["Volume"].replace(0, np.nan)).diff()
 
-    # Embedding de retornos
     for k in range(1, 21):
         out[f"ret_lag_{k}"] = out["ret1"].shift(k)
 
-    # Volatilidad realizada
     out["rv_20"] = out["ret1"].rolling(20).std()
     out["rv_60"] = out["ret1"].rolling(60).std()
 
-    # Fractales
     out["hurst_60"] = rolling_hurst(out["ret1"], 60)
     out["hurst_120"] = rolling_hurst(out["ret1"], 120)
 
-    # Target: retorno a 10 días
     out["y_fwd"] = np.log(out["Close"].shift(-horizon) / out["Close"])
 
     return out.dropna()
+
+
+# =========================
+# kNN CAÓTICO (dinámica local)
+# =========================
+def knn_caotico_predict(X_train, y_train, X_query, k=20):
+    nn = NearestNeighbors(n_neighbors=k, metric="euclidean")
+    nn.fit(X_train)
+    _, indices = nn.kneighbors(X_query)
+    return float(np.mean(y_train[indices[0]]))
 
 
 # =========================
@@ -93,7 +95,6 @@ def walk_forward_train_test(
     cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
     cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
 
-    # ✅ PCA dinámico (evita crash si pides más componentes que features)
     n_features = len(feature_cols)
     n_pca = min(pca_target, max(1, n_features - 1))
 
@@ -140,19 +141,13 @@ def walk_forward_train_test(
         cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
         cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
 
-    res_df = pd.DataFrame(results)
-    pred_df = pd.concat(preds_all).sort_index() if preds_all else pd.DataFrame()
-    return res_df, pred_df
+    return pd.DataFrame(results), pd.concat(preds_all).sort_index()
 
 
 # =========================
-# Operativo: entrenar final + recomendar
+# Recomendación
 # =========================
 def recomendar(ret_pct: float, theta: float) -> str:
-    """
-    ret_pct: retorno esperado en %
-    theta: umbral en %
-    """
     if ret_pct >= theta:
         return "COMPRA"
     if ret_pct <= -theta:
@@ -160,19 +155,19 @@ def recomendar(ret_pct: float, theta: float) -> str:
     return "MANTÉN"
 
 
+# =========================
+# MAIN
+# =========================
 def main():
     ticker = "SPY"
     horizon = 10
     pca_target = 50
-
-    # Umbral inicial (en % a 10 días). Ajustable después por backtest con costos.
     theta = 0.75
+    k_neighbors = 20
+    alpha = 0.5  # peso del kNN en el ensamble
 
     print(f"Descargando {ticker}...")
     raw = yf.download(ticker, period="max", progress=False)
-
-    if raw.empty:
-        raise RuntimeError("No se pudo descargar data (revisa internet / ticker).")
 
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
@@ -187,7 +182,9 @@ def main():
         *[f"ret_lag_{k}" for k in range(1, 21)]
     ]
 
-    # 1) Validación walk-forward (lenta, pero útil)
+    # =========================
+    # VALIDACIÓN WALK-FORWARD
+    # =========================
     res_df, pred_df = walk_forward_train_test(
         feat,
         feature_cols=feature_cols,
@@ -196,35 +193,15 @@ def main():
     )
 
     print("\n=== Resumen global (walk-forward) ===")
-    if res_df.empty:
-        print("No se generaron folds (quizás pocos datos luego de features).")
-        return
+    print(f"Hit-rate prom : {res_df['hit_rate'].mean():.4f}")
+    print(f"MAE retorno   : {res_df['mae'].mean():.6f}")
+    print(f"Features     : {res_df['n_features'].iloc[0]}")
+    print(f"PCA comps    : {res_df['n_pca'].iloc[0]}")
 
-    print(f"MAE promedio : {res_df['mae'].mean():.6f}")
-    print(f"RMSE promedio: {res_df['rmse'].mean():.6f}")
-    print(f"Hit-rate prom: {res_df['hit_rate'].mean():.4f}")
-    print(f"Total tests  : {int(res_df['n_test'].sum())}")
-    print(f"Features     : {int(res_df['n_features'].iloc[0])}")
-    print(f"PCA comps    : {int(res_df['n_pca'].iloc[0])}")
-
-    # Reporte MAE precio aprox con pred_df
-    close_aligned = feat.loc[pred_df.index, "Close"]
-    price_pred = close_aligned * np.exp(pred_df["y_pred"])
-    price_true = close_aligned * np.exp(pred_df["y_true"])
-    mae_price = float(np.mean(np.abs(price_true - price_pred)))
-    print(f"MAE precio aprox (USD): {mae_price:.4f}")
-
-    # Guardar outputs
-    res_df.to_csv("walkforward_folds.csv", index=False)
-    out = pred_df.copy()
-    out["close_t"] = close_aligned
-    out["price_pred_h"] = price_pred
-    out["price_true_h"] = price_true
-    out.to_csv("preds_timeseries.csv")
-    print("\nGuardado: walkforward_folds.csv y preds_timeseries.csv")
-
-    # 2) MODO OPERATIVO: entrenar una vez y predecir el próximo horizonte
-    print("\n=== PREDICCIÓN ACTUAL (OPERATIVO) ===")
+    # =========================
+    # MODO OPERATIVO
+    # =========================
+    print("\n=== PREDICCIÓN ACTUAL (ENSAMBLE) ===")
 
     n_features = len(feature_cols)
     n_pca = min(pca_target, max(1, n_features - 1))
@@ -242,24 +219,43 @@ def main():
     last_row = feat.iloc[-1]
     X_last = last_row[feature_cols].values.reshape(1, -1)
 
-    y_pred_next = float(final_model.predict(X_last)[0])  # log-return
-    ret_pct = y_pred_next * 100.0
+    # Predicción global
+    y_pred_global = float(final_model.predict(X_last)[0])
 
+    # Proyección PCA
+    X_all_pca = final_model.named_steps["pca"].transform(
+        final_model.named_steps["scaler"].transform(X_all)
+    )
+    X_last_pca = final_model.named_steps["pca"].transform(
+        final_model.named_steps["scaler"].transform(X_last)
+    )
+
+    # Predicción caótica local
+    y_pred_knn = knn_caotico_predict(
+        X_train=X_all_pca,
+        y_train=y_all,
+        X_query=X_last_pca,
+        k=k_neighbors
+    )
+
+    # ENSAMBLE
+    y_pred_ens = alpha * y_pred_knn + (1 - alpha) * y_pred_global
+
+    ret_pct = y_pred_ens * 100.0
     price_now = float(last_row["Close"])
-    price_pred_next = price_now * np.exp(y_pred_next)
+    price_pred = price_now * np.exp(y_pred_ens)
 
     accion = recomendar(ret_pct, theta)
-    direccion = "ALCISTA 📈" if ret_pct > 0 else "BAJISTA 📉"
 
-    print(f"Activo           : {ticker}")
-    print(f"Fecha base       : {last_row.name.date()}")
-    print(f"Horizonte        : {horizon} días hábiles (~2 semanas)")
-    print(f"Precio actual    : {price_now:.2f} USD")
-    print(f"Retorno esperado : {ret_pct:.2f} %")
-    print(f"Precio esperado  : {price_pred_next:.2f} USD")
-    print(f"Dirección        : {direccion}")
-    print(f"Umbral (theta)   : ±{theta:.2f} %")
-    print(f"RECOMENDACIÓN    : {accion}")
+    print(f"Activo              : {ticker}")
+    print(f"Fecha base          : {last_row.name.date()}")
+    print(f"Dimensión efectiva  : PCA = {n_pca}")
+    print(f"Retorno global      : {y_pred_global*100:.2f} %")
+    print(f"Retorno kNN caótico : {y_pred_knn*100:.2f} %")
+    print(f"Retorno ENSAMBLE    : {ret_pct:.2f} %")
+    print(f"Precio actual       : {price_now:.2f} USD")
+    print(f"Precio esperado     : {price_pred:.2f} USD")
+    print(f"RECOMENDACIÓN       : {accion}")
 
 
 if __name__ == "__main__":
