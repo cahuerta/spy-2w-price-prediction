@@ -133,3 +133,29 @@ def predict_and_save():
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
+# =========================
+# Evaluación automática
+# =========================
+from evaluator import evaluate_all
+
+
+@app.get("/evaluate")
+def evaluate():
+    """
+    Evalúa automáticamente predicciones pasadas
+    y guarda resultados en /data
+    """
+    try:
+        result = evaluate_all()
+        return {
+            "ok": True,
+            "evaluated": result["evaluated"],
+            "skipped": result["skipped"],
+            "total_evaluated": len(result["evaluated"]),
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+}
