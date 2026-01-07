@@ -1,238 +1,135 @@
-import time
-import numpy as np
-import pandas as pd
-import yfinance as yf
+# main.py
+# Web Service FastAPI para Render
+# - Abre puerto (Render OK)
+# - Llama a model.py (misma matemática)
+# - Endpoint REST /predict
+# - Healthcheck /
+# - Listo para cron, app Vercel, email y disk
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
-from sklearn.decomposition import PCA
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import os
+import json
+from datetime import datetime
 
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 
-# =========================
-# Utils
-# =========================
-def log_return(series: pd.Series) -> pd.Series:
-    return np.log(series).diff()
-
-
-def hurst_rs(x: np.ndarray) -> float:
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    n = len(x)
-    if n < 30:
-        return np.nan
-
-    x = x - x.mean()
-    z = np.cumsum(x)
-    r = z.max() - z.min()
-    s = x.std(ddof=1)
-    if s == 0 or r == 0:
-        return np.nan
-
-    return float(np.log(r / s) / np.log(n))
-
-
-def rolling_hurst(returns: pd.Series, window: int) -> pd.Series:
-    return returns.rolling(window).apply(lambda a: hurst_rs(a), raw=True)
+from model import run_model, format_report
 
 
 # =========================
-# Feature engineering
+# App
 # =========================
-def make_features(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
-    out = df.copy()
-
-    out["ret1"] = log_return(out["Close"])
-    out["range"] = np.log(out["High"] / out["Low"])
-    out["vol_chg"] = np.log(out["Volume"].replace(0, np.nan)).diff()
-
-    for k in range(1, 21):
-        out[f"ret_lag_{k}"] = out["ret1"].shift(k)
-
-    out["rv_20"] = out["ret1"].rolling(20).std()
-    out["rv_60"] = out["ret1"].rolling(60).std()
-
-    out["hurst_60"] = rolling_hurst(out["ret1"], 60)
-    out["hurst_120"] = rolling_hurst(out["ret1"], 120)
-
-    out["y_fwd"] = np.log(out["Close"].shift(-horizon) / out["Close"])
-
-    return out.dropna()
+app = FastAPI(
+    title="SPY Prediction Service",
+    description="Modelo predictivo PCA + Ridge + kNN caótico",
+    version="1.0.0"
+)
 
 
 # =========================
-# kNN CAÓTICO (dinámica local)
+# Healthcheck (OBLIGATORIO)
 # =========================
-def knn_caotico_predict(X_train, y_train, X_query, k=20):
-    nn = NearestNeighbors(n_neighbors=k, metric="euclidean")
-    nn.fit(X_train)
-    _, indices = nn.kneighbors(X_query)
-    return float(np.mean(y_train[indices[0]]))
+@app.get("/")
+def health():
+    return {
+        "status": "ok",
+        "service": "spy-2w-price-prediction",
+        "time": datetime.utcnow().isoformat()
+    }
 
 
 # =========================
-# Walk-forward training
+# Predicción principal
 # =========================
-def walk_forward_train_test(
-    data: pd.DataFrame,
-    feature_cols: list,
-    target_col: str,
-    train_years: int = 5,
-    test_months: int = 6,
-    pca_target: int = 50,
+@app.get("/predict")
+def predict(
+    ticker: str = Query("SPY"),
+    horizon: int = Query(10),
+    pca_target: int = Query(50),
+    theta: float = Query(0.75),
+    k_neighbors: int = Query(20),
+    alpha: float = Query(0.5),
 ):
-    df = data.sort_index()
+    """
+    Ejecuta el modelo completo y devuelve:
+    - métricas históricas
+    - predicción actual
+    - recomendación
+    """
 
-    start = df.index.min()
-    end = df.index.max()
+    try:
+        result = run_model(
+            ticker=ticker,
+            horizon=horizon,
+            pca_target=pca_target,
+            theta=theta,
+            k_neighbors=k_neighbors,
+            alpha=alpha,
+        )
 
-    results = []
-    preds_all = []
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "timestamp": datetime.utcnow().isoformat(),
+                "result": result
+            }
+        )
 
-    cur_train_start = start
-    cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
-    cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
-
-    n_features = len(feature_cols)
-    n_pca = min(pca_target, max(1, n_features - 1))
-
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=n_pca, random_state=42)),
-        ("ridge", Ridge(alpha=1.0))
-    ])
-
-    while cur_test_end <= end:
-        train = df[(df.index >= cur_train_start) & (df.index < cur_train_end)]
-        test = df[(df.index >= cur_train_end) & (df.index < cur_test_end)]
-
-        if len(train) < 300 or len(test) < 30:
-            break
-
-        X_train = train[feature_cols].values
-        y_train = train[target_col].values
-        X_test = test[feature_cols].values
-        y_test = test[target_col].values
-
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-
-        results.append({
-            "mae": mean_absolute_error(y_test, y_pred),
-            "rmse": np.sqrt(mean_squared_error(y_test, y_pred)),
-            "hit_rate": float((np.sign(y_pred) == np.sign(y_test)).mean()),
-            "n_test": len(test),
-            "n_features": n_features,
-            "n_pca": n_pca
-        })
-
-        preds_all.append(pd.DataFrame({
-            "y_true": y_test,
-            "y_pred": y_pred
-        }, index=test.index))
-
-        cur_train_start += pd.DateOffset(months=test_months)
-        cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
-        cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
-
-    return pd.DataFrame(results), pd.concat(preds_all).sort_index()
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": str(e)
+            }
+        )
 
 
 # =========================
-# Recomendación
+# Endpoint texto (email/logs)
 # =========================
-def recomendar(ret_pct: float, theta: float) -> str:
-    if ret_pct >= theta:
-        return "COMPRA"
-    if ret_pct <= -theta:
-        return "VENDE"
-    return "MANTÉN"
+@app.get("/predict/text")
+def predict_text():
+    """
+    Devuelve el reporte en texto plano
+    (ideal para email o logs)
+    """
+    try:
+        result = run_model()
+        report = format_report(result)
+        return {"text": report}
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # =========================
-# MAIN
+# Guardado en disco (opcional, futuro)
 # =========================
-def main():
-    ticker = "SPY"
-    horizon = 10
-    pca_target = 50
-    theta = 0.75
-    k_neighbors = 20
-    alpha = 0.5
+@app.get("/predict/save")
+def predict_and_save():
+    """
+    Guarda resultado en /data si existe disk montado
+    """
+    try:
+        result = run_model()
+        report = format_report(result)
 
-    print(f"Descargando {ticker}...")
-    raw = yf.download(ticker, period="max", progress=False)
+        base_path = os.getenv("DATA_PATH", "/data")
+        os.makedirs(base_path, exist_ok=True)
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
+        filename = f"prediction_{datetime.utcnow().date()}.json"
+        path = os.path.join(base_path, filename)
 
-    df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    df.index = pd.to_datetime(df.index)
+        with open(path, "w") as f:
+            json.dump(result, f, indent=2)
 
-    feat = make_features(df, horizon=horizon)
+        return {
+            "ok": True,
+            "saved_to": path,
+            "recommendation": result["prediction"]["recommendation"]
+        }
 
-    feature_cols = [
-        "range", "vol_chg", "rv_20", "rv_60", "hurst_60", "hurst_120",
-        *[f"ret_lag_{k}" for k in range(1, 21)]
-    ]
-
-    res_df, _ = walk_forward_train_test(
-        feat, feature_cols, "y_fwd", pca_target=pca_target
-    )
-
-    print("\n=== RESUMEN HISTÓRICO ===")
-    print(f"Hit-rate prom : {res_df['hit_rate'].mean():.4f}")
-    print(f"MAE retorno   : {res_df['mae'].mean():.6f}")
-    print(f"PCA dims      : {res_df['n_pca'].iloc[0]}")
-
-    print("\n=== PREDICCIÓN ACTUAL (ENSAMBLE) ===")
-
-    n_features = len(feature_cols)
-    n_pca = min(pca_target, n_features - 1)
-
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=n_pca, random_state=42)),
-        ("ridge", Ridge(alpha=1.0))
-    ])
-
-    X = feat[feature_cols].values
-    y = feat["y_fwd"].values
-    model.fit(X, y)
-
-    X_pca = model.named_steps["pca"].transform(
-        model.named_steps["scaler"].transform(X)
-    )
-
-    last_row = feat.iloc[-1]
-    X_last = last_row[feature_cols].values.reshape(1, -1)
-    X_last_pca = model.named_steps["pca"].transform(
-        model.named_steps["scaler"].transform(X_last)
-    )
-
-    y_global = float(model.predict(X_last)[0])
-    y_knn = knn_caotico_predict(X_pca, y, X_last_pca, k_neighbors)
-
-    y_ens = alpha * y_knn + (1 - alpha) * y_global
-
-    price_now = float(last_row["Close"])
-    price_pred = price_now * np.exp(y_ens)
-
-    accion = recomendar(y_ens * 100, theta)
-
-    print(f"Retorno global      : {y_global*100:.2f} %")
-    print(f"Retorno kNN caótico : {y_knn*100:.2f} %")
-    print(f"Retorno ENSAMBLE    : {y_ens*100:.2f} %")
-    print(f"Precio actual       : {price_now:.2f} USD")
-    print(f"Precio esperado     : {price_pred:.2f} USD")
-    print(f"RECOMENDACIÓN       : {accion}")
-
-
-if __name__ == "__main__":
-    main()
-    print("Proceso completado, manteniendo servicio activo...")
-    while True:
-        time.sleep(60)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
