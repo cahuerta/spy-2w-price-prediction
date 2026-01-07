@@ -257,6 +257,8 @@ def main():
     print(f"Precio esperado     : {price_pred:.2f} USD")
     print(f"RECOMENDACIÓN       : {accion}")
 
-
 if __name__ == "__main__":
     main()
+    print("Proceso completado, manteniendo servicio activo...")
+    while True:
+        time.sleep(60)
