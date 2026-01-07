@@ -92,10 +92,13 @@ def walk_forward_train_test(
     cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
     cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
 
-    # 🔥 PIPELINE CON PCA (50 DIMENSIONES)
+    # ✅ PCA dinámico: nunca excede el máximo permitido
+    n_features = len(feature_cols)
+    n_pca = min(50, n_features - 1)  # con 26 features => 25 componentes
+
     model = Pipeline([
         ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=50, random_state=42)),
+        ("pca", PCA(n_components=n_pca, random_state=42)),
         ("ridge", Ridge(alpha=1.0))
     ])
 
@@ -122,7 +125,9 @@ def walk_forward_train_test(
             "mae": mean_absolute_error(y_test, y_pred),
             "rmse": np.sqrt(mean_squared_error(y_test, y_pred)),
             "hit_rate": float((np.sign(y_pred) == np.sign(y_test)).mean()),
-            "n_test": len(test)
+            "n_test": len(test),
+            "n_features": n_features,
+            "n_pca": n_pca
         })
 
         preds_all.append(pd.DataFrame({
@@ -134,7 +139,7 @@ def walk_forward_train_test(
         cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
         cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
 
-    return pd.DataFrame(results), pd.concat(preds_all).sort_index()
+    return pd.DataFrame(results), pd.concat(preds_all).sort_index() if preds_all else pd.DataFrame()
 
 
 # =========================
@@ -146,6 +151,9 @@ def main():
 
     print(f"Descargando {ticker}...")
     raw = yf.download(ticker, period="max", progress=False)
+
+    if raw.empty:
+        raise RuntimeError("No se pudo descargar data (revisa internet / ticker).")
 
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
@@ -167,10 +175,16 @@ def main():
     )
 
     print("\n=== Resumen global ===")
+    if res_df.empty:
+        print("No se generaron folds (quizás pocos datos luego de features).")
+        return
+
     print(f"MAE promedio : {res_df['mae'].mean():.6f}")
     print(f"RMSE promedio: {res_df['rmse'].mean():.6f}")
     print(f"Hit-rate prom: {res_df['hit_rate'].mean():.4f}")
     print(f"Total tests  : {int(res_df['n_test'].sum())}")
+    print(f"Features     : {int(res_df['n_features'].iloc[0])}")
+    print(f"PCA comps    : {int(res_df['n_pca'].iloc[0])}")
 
     close_aligned = feat.loc[pred_df.index, "Close"]
     price_pred = close_aligned * np.exp(pred_df["y_pred"])
