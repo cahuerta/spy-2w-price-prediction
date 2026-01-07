@@ -79,6 +79,7 @@ def walk_forward_train_test(
     target_col: str,
     train_years: int = 5,
     test_months: int = 6,
+    pca_target: int = 50,
 ):
     df = data.sort_index()
 
@@ -92,9 +93,9 @@ def walk_forward_train_test(
     cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
     cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
 
-    # ✅ PCA dinámico: nunca excede el máximo permitido
+    # ✅ PCA dinámico (evita crash si pides más componentes que features)
     n_features = len(feature_cols)
-    n_pca = min(50, n_features - 1)  # con 26 features => 25 componentes
+    n_pca = min(pca_target, max(1, n_features - 1))
 
     model = Pipeline([
         ("scaler", StandardScaler()),
@@ -139,15 +140,33 @@ def walk_forward_train_test(
         cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
         cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
 
-    return pd.DataFrame(results), pd.concat(preds_all).sort_index() if preds_all else pd.DataFrame()
+    res_df = pd.DataFrame(results)
+    pred_df = pd.concat(preds_all).sort_index() if preds_all else pd.DataFrame()
+    return res_df, pred_df
 
 
 # =========================
-# Main
+# Operativo: entrenar final + recomendar
 # =========================
+def recomendar(ret_pct: float, theta: float) -> str:
+    """
+    ret_pct: retorno esperado en %
+    theta: umbral en %
+    """
+    if ret_pct >= theta:
+        return "COMPRA"
+    if ret_pct <= -theta:
+        return "VENDE"
+    return "MANTÉN"
+
+
 def main():
     ticker = "SPY"
     horizon = 10
+    pca_target = 50
+
+    # Umbral inicial (en % a 10 días). Ajustable después por backtest con costos.
+    theta = 0.75
 
     print(f"Descargando {ticker}...")
     raw = yf.download(ticker, period="max", progress=False)
@@ -168,13 +187,15 @@ def main():
         *[f"ret_lag_{k}" for k in range(1, 21)]
     ]
 
+    # 1) Validación walk-forward (lenta, pero útil)
     res_df, pred_df = walk_forward_train_test(
         feat,
         feature_cols=feature_cols,
-        target_col="y_fwd"
+        target_col="y_fwd",
+        pca_target=pca_target
     )
 
-    print("\n=== Resumen global ===")
+    print("\n=== Resumen global (walk-forward) ===")
     if res_df.empty:
         print("No se generaron folds (quizás pocos datos luego de features).")
         return
@@ -186,21 +207,59 @@ def main():
     print(f"Features     : {int(res_df['n_features'].iloc[0])}")
     print(f"PCA comps    : {int(res_df['n_pca'].iloc[0])}")
 
+    # Reporte MAE precio aprox con pred_df
     close_aligned = feat.loc[pred_df.index, "Close"]
     price_pred = close_aligned * np.exp(pred_df["y_pred"])
     price_true = close_aligned * np.exp(pred_df["y_true"])
-
     mae_price = float(np.mean(np.abs(price_true - price_pred)))
     print(f"MAE precio aprox (USD): {mae_price:.4f}")
 
+    # Guardar outputs
     res_df.to_csv("walkforward_folds.csv", index=False)
     out = pred_df.copy()
     out["close_t"] = close_aligned
     out["price_pred_h"] = price_pred
     out["price_true_h"] = price_true
     out.to_csv("preds_timeseries.csv")
-
     print("\nGuardado: walkforward_folds.csv y preds_timeseries.csv")
+
+    # 2) MODO OPERATIVO: entrenar una vez y predecir el próximo horizonte
+    print("\n=== PREDICCIÓN ACTUAL (OPERATIVO) ===")
+
+    n_features = len(feature_cols)
+    n_pca = min(pca_target, max(1, n_features - 1))
+
+    final_model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=n_pca, random_state=42)),
+        ("ridge", Ridge(alpha=1.0))
+    ])
+
+    X_all = feat[feature_cols].values
+    y_all = feat["y_fwd"].values
+    final_model.fit(X_all, y_all)
+
+    last_row = feat.iloc[-1]
+    X_last = last_row[feature_cols].values.reshape(1, -1)
+
+    y_pred_next = float(final_model.predict(X_last)[0])  # log-return
+    ret_pct = y_pred_next * 100.0
+
+    price_now = float(last_row["Close"])
+    price_pred_next = price_now * np.exp(y_pred_next)
+
+    accion = recomendar(ret_pct, theta)
+    direccion = "ALCISTA 📈" if ret_pct > 0 else "BAJISTA 📉"
+
+    print(f"Activo           : {ticker}")
+    print(f"Fecha base       : {last_row.name.date()}")
+    print(f"Horizonte        : {horizon} días hábiles (~2 semanas)")
+    print(f"Precio actual    : {price_now:.2f} USD")
+    print(f"Retorno esperado : {ret_pct:.2f} %")
+    print(f"Precio esperado  : {price_pred_next:.2f} USD")
+    print(f"Dirección        : {direccion}")
+    print(f"Umbral (theta)   : ±{theta:.2f} %")
+    print(f"RECOMENDACIÓN    : {accion}")
 
 
 if __name__ == "__main__":
