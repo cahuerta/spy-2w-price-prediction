@@ -78,7 +78,7 @@ def knn_caotico_predict(X_train, y_train, X_query, k=20):
 # =========================
 def walk_forward_train_test(
     data: pd.DataFrame,
-    feature_cols: list[str],
+    feature_cols: list,
     target_col: str,
     train_years: int = 5,
     test_months: int = 6,
