@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 
 from model import run_model, format_report
 from evaluator import evaluate_all
-
+from signals import compute_signal, compute_all_signals
 
 # =========================
 # App
@@ -170,6 +170,50 @@ def evaluate(
             "total_evaluated": len(result.get("evaluated", []))
         }
 
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+# =========================
+# Señales operativas
+# =========================
+@app.get("/signals")
+def signals_all(
+    window: int = Query(30)
+):
+    """
+    Devuelve señales consolidadas para todos los tickers
+    """
+    try:
+        data = compute_all_signals(window=window)
+        return {
+            "ok": True,
+            "window": window,
+            "signals": data
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+@app.get("/signals/{ticker}")
+def signal_one(
+    ticker: str,
+    window: int = Query(30)
+):
+    """
+    Devuelve señal consolidada para un ticker
+    """
+    try:
+        data = compute_signal(ticker, window=window)
+        return {
+            "ok": True,
+            "ticker": ticker,
+            "signal": data
+        }
     except Exception as e:
         return {
             "ok": False,
