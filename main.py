@@ -14,13 +14,14 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from model import run_model, format_report
+from evaluator import evaluate_all
 
 
 # =========================
 # App
 # =========================
 app = FastAPI(
-    title="SPY Prediction Service",
+    title="Prediction Service",
     description="Modelo predictivo PCA + Ridge + kNN caótico",
     version="1.0.0"
 )
@@ -33,7 +34,7 @@ app = FastAPI(
 def health():
     return {
         "status": "ok",
-        "service": "spy-2w-price-prediction",
+        "service": "price-prediction-service",
         "time": datetime.utcnow().isoformat()
     }
 
@@ -56,7 +57,6 @@ def predict(
     - predicción actual
     - recomendación
     """
-
     try:
         result = run_model(
             ticker=ticker,
@@ -72,6 +72,10 @@ def predict(
             content={
                 "ok": True,
                 "timestamp": datetime.utcnow().isoformat(),
+                "ticker": result["meta"]["ticker"],
+                "recommendation": result["prediction"]["recommendation"],
+                "ret_ens_pct": result["prediction"]["ret_ens_pct"],
+                "price_pred": result["prediction"]["price_pred"],
                 "result": result
             }
         )
@@ -90,13 +94,15 @@ def predict(
 # Endpoint texto (email/logs)
 # =========================
 @app.get("/predict/text")
-def predict_text():
+def predict_text(
+    ticker: str = Query("SPY")
+):
     """
     Devuelve el reporte en texto plano
     (ideal para email o logs)
     """
     try:
-        result = run_model()
+        result = run_model(ticker=ticker)
         report = format_report(result)
         return {"text": report}
 
@@ -105,57 +111,67 @@ def predict_text():
 
 
 # =========================
-# Guardado en disco (opcional, futuro)
+# Guardado en disco (cron)
 # =========================
 @app.get("/predict/save")
-def predict_and_save():
+def predict_and_save(
+    ticker: str = Query("SPY")
+):
     """
-    Guarda resultado en /data si existe disk montado
+    Ejecuta predicción y guarda resultado en:
+    /data/predictions/{ticker}/YYYY-MM-DD.json
     """
     try:
-        result = run_model()
-        report = format_report(result)
+        result = run_model(ticker=ticker)
 
         base_path = os.getenv("DATA_PATH", "/data")
-        os.makedirs(base_path, exist_ok=True)
+        pred_dir = os.path.join(base_path, "predictions", ticker)
+        os.makedirs(pred_dir, exist_ok=True)
 
-        filename = f"prediction_{datetime.utcnow().date()}.json"
-        path = os.path.join(base_path, filename)
+        filename = f"{datetime.utcnow().date()}.json"
+        path = os.path.join(pred_dir, filename)
 
         with open(path, "w") as f:
             json.dump(result, f, indent=2)
 
         return {
             "ok": True,
+            "ticker": ticker,
             "saved_to": path,
             "recommendation": result["prediction"]["recommendation"]
-        }
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-# =========================
-# Evaluación automática
-# =========================
-from evaluator import evaluate_all
-
-
-@app.get("/evaluate")
-def evaluate():
-    """
-    Evalúa automáticamente predicciones pasadas
-    y guarda resultados en /data
-    """
-    try:
-        result = evaluate_all()
-        return {
-            "ok": True,
-            "evaluated": result["evaluated"],
-            "skipped": result["skipped"],
-            "total_evaluated": len(result["evaluated"]),
         }
 
     except Exception as e:
         return {
             "ok": False,
             "error": str(e)
-}
+        }
+
+
+# =========================
+# Evaluación automática
+# =========================
+@app.get("/evaluate")
+def evaluate(
+    ticker: str = Query(None)
+):
+    """
+    Evalúa automáticamente predicciones pasadas
+    y guarda resultados en /data/evaluations/{ticker}
+    """
+    try:
+        result = evaluate_all(ticker=ticker)
+
+        return {
+            "ok": True,
+            "ticker": ticker,
+            "evaluated": result.get("evaluated", []),
+            "skipped": result.get("skipped", []),
+            "total_evaluated": len(result.get("evaluated", []))
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
