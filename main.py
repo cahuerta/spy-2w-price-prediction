@@ -12,6 +12,8 @@ from datetime import datetime
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 
 from model import run_model, format_report
 from evaluator import evaluate_all
@@ -26,6 +28,16 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# =========================
+# CORS (OBLIGATORIO PARA VERCEL)
+# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # luego lo restringimos
+    allow_credentials=True,
+    allow_methods=["*"],          # ← ESTO PERMITE OPTIONS
+    allow_headers=["*"],
+)
 
 # =========================
 # Healthcheck (OBLIGATORIO)
