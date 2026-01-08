@@ -9,6 +9,8 @@
 import os
 import json
 from datetime import datetime
+import glob
+import pandas as pd
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -226,6 +228,71 @@ def signal_one(
             "ticker": ticker,
             "signal": data
         }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+# =========================
+# Confianza del modelo
+# =========================
+@app.get("/confidence")
+def confidence(
+    ticker: str = Query("SPY")
+):
+    """
+    Resume el desempeño histórico del modelo
+    y entrega un nivel de confianza actual
+    """
+    try:
+        base_path = os.getenv("DATA_PATH", "/data")
+        eval_dir = os.path.join(base_path, "evaluations", ticker)
+
+        if not os.path.exists(eval_dir):
+            return {
+                "ok": False,
+                "ticker": ticker,
+                "message": "No evaluations available"
+            }
+
+        files = sorted(glob.glob(os.path.join(eval_dir, "*.json")))
+
+        if len(files) == 0:
+            return {
+                "ok": False,
+                "ticker": ticker,
+                "message": "No evaluations available"
+            }
+
+        records = []
+        for f in files[-50:]:  # últimas 50
+            with open(f, "r") as fh:
+                records.append(json.load(fh))
+
+        df = pd.DataFrame(records)
+
+        hit_sign_pct = round(df["hit_sign"].mean() * 100, 1)
+        decision_accuracy_pct = round(df["decision_correct"].mean() * 100, 1)
+        avg_error_pct = round(df["error_price_pct"].mean(), 2)
+
+        # Traducción humana
+        if hit_sign_pct >= 60 and decision_accuracy_pct >= 55:
+            confidence_level = "alta"
+        elif hit_sign_pct >= 52:
+            confidence_level = "moderada"
+        else:
+            confidence_level = "baja"
+
+        return {
+            "ok": True,
+            "ticker": ticker,
+            "n": len(df),
+            "hit_sign_pct": hit_sign_pct,
+            "decision_accuracy_pct": decision_accuracy_pct,
+            "avg_error_pct": avg_error_pct,
+            "confidence_level": confidence_level
+        }
+
     except Exception as e:
         return {
             "ok": False,
