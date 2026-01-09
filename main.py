@@ -332,3 +332,48 @@ def predict_fundamental(
             "ok": False,
             "error": str(e)
         }
+# =========================
+# Guardado masivo (cron)
+# =========================
+@app.get("/predict/save/all")
+def predict_and_save_all():
+    try:
+        with open("tickers.json", "r") as f:
+            tickers = json.load(f)
+
+        base_path = os.getenv("DATA_PATH", "/data")
+        results = []
+
+        for ticker in tickers:
+            try:
+                result = run_model(ticker=ticker)
+
+                pred_dir = os.path.join(base_path, "predictions", ticker)
+                os.makedirs(pred_dir, exist_ok=True)
+
+                filename = f"{datetime.utcnow().date()}.json"
+                path = os.path.join(pred_dir, filename)
+
+                with open(path, "w") as fh:
+                    json.dump(result, fh, indent=2)
+
+                results.append({"ticker": ticker, "ok": True})
+
+            except Exception as e:
+                results.append({
+                    "ticker": ticker,
+                    "ok": False,
+                    "error": str(e)
+                })
+
+        return {
+            "ok": True,
+            "n": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+    }
