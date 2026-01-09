@@ -30,6 +30,21 @@ def list_json_files(path):
     return sorted([f for f in os.listdir(path) if f.endswith(".json")])
 
 
+def load_universe():
+    """
+    Lee tickers.json desde la raíz del proyecto
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base_dir, "tickers.json")
+
+    if not os.path.exists(path):
+        return []
+
+    with open(path, "r") as f:
+        data = json.load(f)
+        return data.get("tickers", [])
+
+
 # =========================
 # Métricas rolling
 # =========================
@@ -147,16 +162,15 @@ def compute_signal(ticker: str, window: int = 30):
 # =========================
 def compute_all_signals(window: int = 30):
     """
-    Devuelve señales para todos los tickers disponibles
+    Devuelve señales para todos los tickers definidos en tickers.json
     """
 
-    pred_root = os.path.join(DATA_PATH, "predictions")
-
-    if not os.path.exists(pred_root):
+    tickers = load_universe()
+    if not tickers:
         return []
 
     signals = []
-    for ticker in sorted(os.listdir(pred_root)):
+    for ticker in tickers:
         sig = compute_signal(ticker, window=window)
         signals.append(sig)
 
