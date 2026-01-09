@@ -341,6 +341,13 @@ def predict_and_save_all():
         with open("tickers.json", "r") as f:
             tickers = json.load(f)
 
+        # ✅ ÚNICA MODIFICACIÓN:
+        # soporta tickers.json como {"tickers":[...]} o como lista directa [...]
+        if isinstance(tickers, dict):
+            tickers = tickers.get("tickers", [])
+        elif not isinstance(tickers, list):
+            tickers = []
+
         base_path = os.getenv("DATA_PATH", "/data")
         results = []
 
