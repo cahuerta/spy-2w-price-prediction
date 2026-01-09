@@ -15,7 +15,7 @@ import pandas as pd
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-
+from model2 import run_model_fundamental_dividend
 
 from model import run_model, format_report
 from evaluator import evaluate_all
@@ -291,6 +291,40 @@ def confidence(
             "decision_accuracy_pct": decision_accuracy_pct,
             "avg_error_pct": avg_error_pct,
             "confidence_level": confidence_level
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+# =========================
+# Modelo fundamental (dividendos)
+# =========================
+@app.get("/predict/fundamental")
+def predict_fundamental(
+    ticker: str = Query("SPY"),
+    r: float = Query(0.09),   # tasa descuento
+    g: float = Query(0.03)    # crecimiento dividendos
+):
+    """
+    Modelo fundamental por dividendos.
+    Entrega:
+    - precio mercado
+    - precio fundamental actual
+    - precio fundamental T+10
+    - mispricing
+    """
+    try:
+        result = run_model_fundamental_dividend(
+            ticker=ticker,
+            discount_rate=r,
+            growth_rate=g
+        )
+
+        return {
+            "ok": True,
+            **result
         }
 
     except Exception as e:
