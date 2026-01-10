@@ -33,6 +33,9 @@ def list_json_files(path):
 def load_universe():
     """
     Lee tickers.json desde la raíz del proyecto
+    Soporta:
+    - ["SPY", "JNJ", ...]
+    - {"tickers": ["SPY", "JNJ", ...]}
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(base_dir, "tickers.json")
@@ -42,7 +45,13 @@ def load_universe():
 
     with open(path, "r") as f:
         data = json.load(f)
+
+    if isinstance(data, dict):
         return data.get("tickers", [])
+    elif isinstance(data, list):
+        return data
+    else:
+        return []
 
 
 # =========================
