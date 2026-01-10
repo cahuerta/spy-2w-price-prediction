@@ -32,13 +32,12 @@ def list_json_files(path):
 
 def load_universe():
     """
-    Lee tickers.json desde la raíz del proyecto
+    Lee tickers.json desde el working directory del proyecto (Render-compatible)
     Soporta:
     - ["SPY", "JNJ", ...]
     - {"tickers": ["SPY", "JNJ", ...]}
     """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base_dir, "tickers.json")
+    path = "tickers.json"
 
     if not os.path.exists(path):
         return []
@@ -46,12 +45,12 @@ def load_universe():
     with open(path, "r") as f:
         data = json.load(f)
 
+    if isinstance(data, list):
+        return data
     if isinstance(data, dict):
         return data.get("tickers", [])
-    elif isinstance(data, list):
-        return data
-    else:
-        return []
+
+    return []
 
 
 # =========================
