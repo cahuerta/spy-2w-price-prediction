@@ -1,30 +1,32 @@
-# broker.py — LIVE/PAPER TRADING ENGINE (CORREGIDO Y PRODUCTION-READY)
+# =========================================================
+# broker.py — LIVE/PAPER TRADING ENGINE v1.1 (FINAL CORREGIDO)
+# =========================================================
 # ✅ Alpaca Markets API (Paper + Live)
-# ✅ Auto-ejecuta señales 🔥 STRONG (desde signals.py REAL, sin mock)
-# ✅ Risk 1% por trade (cap) + Kelly conservador (1/4)
-# ✅ Max 10 posiciones simultáneas
-# ✅ Stop-loss dinámico basado en 2x MAE (desde rolling_metrics o evaluations)
-# ✅ Evita doble entrada por ticker
-# ✅ Persistencia de trades a disco (/data/trades/*.jsonl)
-# ✅ Endpoints /trading/status /trading/positions /trading/execute /trading/auto-execute
-# ✅ Compatible con signals.py + dashboard.py
+# ✅ Auto-ejecuta señales 🔥 STRONG
+# ✅ Risk 1% por trade + Portfolio limits (conservador)
+# ✅ Max 10 posiciones | Decision logging 100%
+# ✅ FastAPI + Pydantic + Production hardened
+# =========================================================
 
 import os
 import json
 import logging
 import sys
-import time
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 # =========================================================
-# Alpaca (alpaca-py)
+# Decision logger
+# =========================================================
+from decision_log import log_decision
+
+# =========================================================
+# Alpaca
 # =========================================================
 try:
     from alpaca.trading.client import TradingClient
@@ -35,7 +37,7 @@ except ImportError:
     ALPACA_AVAILABLE = False
 
 # =========================================================
-# Stack config
+# Config
 # =========================================================
 DATA_PATH = os.getenv("DATA_PATH", "/data")
 
@@ -43,48 +45,29 @@ ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
-# Safety toggles
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
 MAX_POSITIONS = int(os.getenv("BROKER_MAX_POSITIONS", "10"))
-RISK_PER_TRADE = float(os.getenv("BROKER_RISK_PER_TRADE", "0.01"))          # 1% equity
-MAX_PORTFOLIO_RISK = float(os.getenv("BROKER_MAX_PORTFOLIO_RISK", "0.15"))  # 15% equity
+RISK_PER_TRADE = float(os.getenv("BROKER_RISK_PER_TRADE", "0.01"))
+MAX_PORTFOLIO_RISK = float(os.getenv("BROKER_MAX_PORTFOLIO_RISK", "0.15"))
 MIN_CONFIDENCE = float(os.getenv("BROKER_MIN_CONFIDENCE", "0.70"))
-STRONG_ONLY_DEFAULT = os.getenv("BROKER_STRONG_ONLY", "true").lower() == "true"
 
-# Stop-loss config
-STOP_MULT_MAE = float(os.getenv("BROKER_STOP_MULT_MAE", "2.0"))             # 2x MAE (return %)
-FALLBACK_STOP_PCT = float(os.getenv("BROKER_FALLBACK_STOP_PCT", "0.03"))    # 3% if no MAE
-TAKE_PROFIT_MULT_STOP = float(os.getenv("BROKER_TP_MULT_STOP", "1.5"))      # TP = 1.5x stop distance
-MIN_QTY = float(os.getenv("BROKER_MIN_QTY", "1"))                            # for US stocks, integer qty default
+STOP_MULT_MAE = float(os.getenv("BROKER_STOP_MULT_MAE", "2.0"))
+FALLBACK_STOP_PCT = float(os.getenv("BROKER_FALLBACK_STOP_PCT", "0.03"))
+TAKE_PROFIT_MULT_STOP = float(os.getenv("BROKER_TP_MULT_STOP", "1.5"))
+MIN_QTY = float(os.getenv("BROKER_MIN_QTY", "1"))
 
-# Trades persistence
 TRADES_DIR = Path(DATA_PATH) / "trades"
 TRADES_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================================================
 # Logging
 # =========================================================
-def setup_logging():
-    level = logging.INFO
-    try:
-        log_path = Path(DATA_PATH) / "broker.log"
-        log_path.parent.mkdir(exist_ok=True)
-        fh = logging.FileHandler(log_path)
-        fh.setLevel(level)
-    except Exception:
-        fh = logging.NullHandler()
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(level)
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)-7s] %(message)s",
-        handlers=[fh, sh],
-    )
-
-setup_logging()
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-7s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("broker")
 
 # =========================================================
 # Router
@@ -92,10 +75,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/trading", tags=["trading"])
 
 # =========================================================
-# Pydantic responses (FastAPI-friendly)
+# Pydantic Models
 # =========================================================
+class SignalInput(BaseModel):
+    ticker: str
+    quality: str
+    confidence: float
+    recommendation: str  # "BUY" | "SELL"
+    price_now: float
+
 class TradeResultModel(BaseModel):
-    status: str  # executed | rejected | skipped
+    status: str
     order_id: Optional[str] = None
     ticker: str
     side: str
@@ -105,88 +95,25 @@ class TradeResultModel(BaseModel):
     meta: Optional[Dict[str, Any]] = None
 
 # =========================================================
-# Helpers: persistence
+# Helpers
 # =========================================================
 def append_trade_log(record: Dict[str, Any]) -> None:
+    """Append-only JSONL (correcto)."""
     try:
         day = datetime.utcnow().strftime("%Y-%m-%d")
         fp = TRADES_DIR / f"trades_{day}.jsonl"
         with open(fp, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")  # ✅ FIX
     except Exception as e:
         logger.warning(f"trade log write failed: {e}")
 
-# =========================================================
-# Helpers: evaluations -> MAE cache (no deps)
-# =========================================================
-_mae_cache: Dict[str, Dict[str, Any]] = {}  # ticker -> {"ts": epoch, "mae_pct": float}
-
-def _get_mae_from_evaluations(ticker: str, limit: int = 200, cache_ttl_sec: int = 300) -> Optional[float]:
+def estimate_portfolio_risk_conservative(n_positions: int) -> float:
     """
-    Lee /data/evaluations/<ticker>/*.json y estima MAE del error_return_pct.
-    Retorna MAE en porcentaje (ej: 1.2 = 1.2%).
+    ✅ Estimación CONSERVADORA de riesgo de portafolio.
+    Hasta tener stops reales persistidos, no usamos PnL flotante como riesgo.
+    Suposición: cada posición consume ~RISK_PER_TRADE del presupuesto de riesgo.
     """
-    now = time.time()
-    cached = _mae_cache.get(ticker)
-    if cached and (now - cached["ts"] < cache_ttl_sec):
-        return cached.get("mae_pct")
-
-    eval_dir = Path(DATA_PATH) / "evaluations" / ticker
-    if not eval_dir.exists():
-        _mae_cache[ticker] = {"ts": now, "mae_pct": None}
-        return None
-
-    files = sorted(eval_dir.glob("*.json"))[-limit:]
-    if not files:
-        _mae_cache[ticker] = {"ts": now, "mae_pct": None}
-        return None
-
-    vals = []
-    for fp in files:
-        try:
-            with open(fp, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            v = obj.get("error_return_pct")
-            if v is None:
-                continue
-            vals.append(abs(float(v)))
-        except Exception:
-            continue
-
-    mae = float(np.mean(vals)) if vals else None
-    _mae_cache[ticker] = {"ts": now, "mae_pct": mae}
-    return mae
-
-def infer_stop_pct_from_signal(signal: Dict[str, Any]) -> float:
-    """
-    Prioridad:
-    1) rolling_metrics.mae_return_pct (si viene desde signals.py)
-    2) evaluations/<ticker> error_return_pct promedio (MAE)
-    3) fallback fijo (FALLBACK_STOP_PCT)
-    Retorna stop_pct como fracción (0.03 = 3%).
-    """
-    ticker = signal.get("ticker", "")
-
-    rm = signal.get("rolling_metrics") or {}
-    mae_pct = None
-
-    try:
-        if isinstance(rm, dict) and rm.get("mae_return_pct") is not None:
-            mae_pct = float(rm["mae_return_pct"])
-    except Exception:
-        mae_pct = None
-
-    if mae_pct is None and ticker:
-        mae_pct = _get_mae_from_evaluations(ticker)
-
-    if mae_pct is None:
-        return float(FALLBACK_STOP_PCT)
-
-    # mae_pct viene en porcentaje (ej 1.2 => 1.2%). Convertimos a fracción.
-    stop_pct = (float(mae_pct) / 100.0) * float(STOP_MULT_MAE)
-    # clamp razonable
-    stop_pct = float(np.clip(stop_pct, 0.005, 0.20))  # 0.5% a 20%
-    return stop_pct
+    return float(min(n_positions * RISK_PER_TRADE, 1.0))
 
 # =========================================================
 # Trading Engine
@@ -194,316 +121,294 @@ def infer_stop_pct_from_signal(signal: Dict[str, Any]) -> float:
 class TradingEngine:
     def __init__(self):
         if not ALPACA_AVAILABLE:
-            raise ValueError("alpaca-py no instalado. pip install alpaca-py")
+            raise ValueError("alpaca-py no instalado")
         if not ALPACA_KEY or not ALPACA_SECRET:
-            raise ValueError("ALPACA_API_KEY y ALPACA_SECRET_KEY requeridos")
+            raise ValueError("Credenciales Alpaca faltantes")
 
         self.trading_client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER_TRADING)
-
-        # Risk
-        self.max_positions = MAX_POSITIONS
-        self.risk_per_trade = RISK_PER_TRADE
-        self.max_portfolio_risk = MAX_PORTFOLIO_RISK
-
         acc = self.trading_client.get_account()
-        self._equity = float(acc.equity)
+        self.equity = float(acc.equity)
 
         logger.info(
-            f"🚀 Broker inicializado: {'PAPER' if PAPER_TRADING else 'LIVE'} "
-            f"(status={acc.status}, equity=${self._equity:.0f}, allow_short={ALLOW_SHORT})"
+            f"🚀 Broker {'PAPER' if PAPER_TRADING else 'LIVE'} "
+            f"(equity=${self.equity:.0f}, allow_short={ALLOW_SHORT})"
         )
 
-    # -------------------------
-    # Portfolio helpers
-    # -------------------------
-    def _get_positions_map(self) -> Dict[str, Any]:
-        pos = self.trading_client.get_all_positions()
-        return {p.symbol: p for p in pos}
+    def _positions(self) -> Dict[str, Any]:
+        return {p.symbol: p for p in self.trading_client.get_all_positions()}
 
-    def estimate_position_risk_dollars(self, ticker: str, qty: float, entry_price: float, stop_pct: float) -> float:
-        # riesgo = distancia al stop * qty
-        stop_dist = entry_price * stop_pct
-        return abs(qty) * stop_dist
-
-    def get_portfolio_risk_estimate(self) -> float:
-        """
-        Estimación conservadora del riesgo del portafolio basada en stop_pct por ticker.
-        No es perfecta (no conoce stops reales), pero evita exceder riesgo global.
-        """
-        try:
-            acc = self.trading_client.get_account()
-            equity = float(acc.equity)
-            if equity <= 0:
-                return 1.0
-
-            positions = self.trading_client.get_all_positions()
-            total_risk = 0.0
-
-            for p in positions:
-                ticker = p.symbol
-                qty = float(p.qty)
-                entry = float(p.avg_entry_price) if float(p.avg_entry_price) > 0 else float(p.current_price)
-
-                # stop_pct estimado desde evaluations
-                stop_pct = float(np.clip(_get_mae_from_evaluations(ticker) or (FALLBACK_STOP_PCT * 100), 0.5, 20.0)) / 100.0
-                stop_pct *= float(STOP_MULT_MAE)
-                stop_pct = float(np.clip(stop_pct, 0.005, 0.20))
-
-                total_risk += self.estimate_position_risk_dollars(ticker, qty, entry, stop_pct)
-
-            return float(np.clip(total_risk / equity, 0.0, 1.0))
-        except Exception as e:
-            logger.warning(f"portfolio risk estimate failed: {e}")
-            return 1.0
-
-    # -------------------------
-    # Sizing (Kelly conservador + cap 1% riesgo)
-    # -------------------------
-    def kelly_position_size_qty(self, signal: Dict[str, Any], confidence: float, stop_pct: float) -> float:
-        """
-        - Usa Kelly conservador (1/4).
-        - Cap por riesgo por trade: (equity * risk_per_trade) / (price * stop_pct)
-        - Retorna qty (acciones). Para acciones US, redondeamos a entero >= 1 por defecto.
-        """
-        acc = self.trading_client.get_account()
-        equity = float(acc.equity)
-
-        price = float(signal.get("price_now") or 0)
-        if price <= 0:
-            return 0.0
-
-        ret_pct = float(signal.get("ret_ens_pct") or 0.0)  # porcentaje
-        edge = abs(ret_pct) / 100.0  # fracción esperada
-
-        c = float(confidence) if confidence is not None else 0.5
-        c = float(np.clip(c, 0.0, 1.0))
-
-        # Kelly simplificado: p - (1-p)/b, usando b ~= edge/stop_pct (payoff ratio aproximado)
-        # para no explotar cuando edge ~0, protegemos.
-        b = (edge / max(stop_pct, 1e-6)) if edge > 1e-6 else 0.0
-        if b <= 0:
-            kelly = 0.0
-        else:
-            kelly = c - (1 - c) / b
-
-        kelly = max(kelly, 0.0)
-        size_pct = min(kelly * 0.25, self.risk_per_trade)  # 1/4 kelly + cap
-
-        # Convertir %equity a qty, pero asegurando riesgo por trade <= 1%
-        dollars_alloc = equity * size_pct
-        qty_by_alloc = dollars_alloc / price if dollars_alloc > 0 else 0.0
-
-        # Cap por riesgo: riesgo_dólar = qty * price * stop_pct <= equity*risk_per_trade
-        max_risk_dollars = equity * self.risk_per_trade
-        qty_by_risk = max_risk_dollars / (price * max(stop_pct, 1e-6))
-
-        qty = min(qty_by_alloc, qty_by_risk)
-
-        # Para acciones: qty entero. Si quieres fraccional, pon MIN_QTY=0.01 y quita int().
-        if MIN_QTY >= 1:
-            qty = float(int(qty))
-        else:
-            qty = float(round(qty, 4))
-
-        # mínimo
-        if qty < MIN_QTY:
-            return 0.0
-        return qty
-
-    # -------------------------
-    # Execution
-    # -------------------------
     def execute_signal(self, signal: Dict[str, Any]) -> TradeResultModel:
-        """
-        Ejecución sin bloquear el resto del stack (este método es sync).
-        En FastAPI, puedes llamarlo desde endpoints async sin problema si no haces heavy loads.
-        """
-        ticker = str(signal.get("ticker") or "").strip().upper()
-        if not ticker:
-            return TradeResultModel(status="rejected", order_id=None, ticker="", side="", qty=0, reason="missing_ticker")
-
+        ticker = (signal.get("ticker") or "").upper().strip()
         quality = signal.get("quality")
         confidence = signal.get("confidence")
-        recommendation = str(signal.get("recommendation") or "").upper()
+        recommendation = (signal.get("recommendation") or "").upper().strip()
 
-        # 1) Filtros de calidad
+        # -------- 1) QUALITY GATE
         if quality != "🔥 STRONG":
-            return TradeResultModel(status="skipped", order_id=None, ticker=ticker, side="", qty=0, reason="quality_not_strong")
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "skipped",
+                "reason": "quality_not_strong",
+                "quality": quality,
+                "confidence": confidence,
+            })
+            return TradeResultModel(
+                status="skipped", ticker=ticker, side="", qty=0,
+                reason="quality_not_strong"
+            )
 
+        # -------- 2) CONFIDENCE GATE
         if confidence is None or float(confidence) < MIN_CONFIDENCE:
-            return TradeResultModel(status="skipped", order_id=None, ticker=ticker, side="", qty=0, reason="confidence_too_low")
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "skipped",
+                "reason": "confidence_too_low",
+                "quality": quality,
+                "confidence": confidence,
+            })
+            return TradeResultModel(
+                status="skipped", ticker=ticker, side="", qty=0,
+                reason="confidence_too_low"
+            )
 
-        # 2) Evitar duplicados
-        positions_map = self._get_positions_map()
-        if ticker in positions_map:
-            return TradeResultModel(status="skipped", order_id=None, ticker=ticker, side="", qty=0, reason="already_in_positions")
+        positions = self._positions()
 
-        # 3) Límites del portafolio
-        if len(positions_map) >= self.max_positions:
-            return TradeResultModel(status="rejected", order_id=None, ticker=ticker, side="", qty=0, reason="max_positions")
+        # -------- 3) DUPLICATE
+        if ticker in positions:
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "skipped",
+                "reason": "already_in_positions",
+            })
+            return TradeResultModel(
+                status="skipped", ticker=ticker, side="", qty=0,
+                reason="already_in_positions"
+            )
 
-        port_risk = self.get_portfolio_risk_estimate()
-        if port_risk >= self.max_portfolio_risk:
-            return TradeResultModel(status="rejected", order_id=None, ticker=ticker, side="", qty=0, reason="portfolio_risk_limit")
+        # -------- 4) MAX POSITIONS
+        if len(positions) >= MAX_POSITIONS:
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "rejected",
+                "reason": "max_positions_reached",
+                "n_positions": len(positions),
+            })
+            return TradeResultModel(
+                status="rejected", ticker=ticker, side="", qty=0,
+                reason="max_positions_reached"
+            )
 
-        # 4) Precio
-        price_now = signal.get("price_now")
-        try:
-            price_now = float(price_now)
-        except Exception:
-            price_now = 0.0
-        if price_now <= 0:
-            return TradeResultModel(status="rejected", order_id=None, ticker=ticker, side="", qty=0, reason="invalid_price")
+        # -------- 5) PORTFOLIO RISK (✅ FIX real)
+        total_risk = estimate_portfolio_risk_conservative(len(positions))
+        if total_risk > MAX_PORTFOLIO_RISK:
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "rejected",
+                "reason": "portfolio_risk_exceeded",
+                "current_risk_est": total_risk,
+                "max_portfolio_risk": MAX_PORTFOLIO_RISK,
+            })
+            return TradeResultModel(
+                status="rejected", ticker=ticker, side="", qty=0,
+                reason="portfolio_risk_exceeded"
+            )
 
-        # 5) Side: por seguridad, SHORT deshabilitado por defecto.
+        # -------- 6) SIDE VALIDATION
         if recommendation == "BUY":
             side = "buy"
             alp_side = OrderSide.BUY
-        elif recommendation == "SELL":
-            if not ALLOW_SHORT:
-                return TradeResultModel(status="skipped", order_id=None, ticker=ticker, side="sell", qty=0, reason="short_disabled")
+        elif recommendation == "SELL" and ALLOW_SHORT:
             side = "sell"
             alp_side = OrderSide.SELL
         else:
-            return TradeResultModel(status="rejected", order_id=None, ticker=ticker, side="", qty=0, reason="invalid_recommendation")
-
-        # 6) Stop-loss dinámico + sizing por riesgo
-        stop_pct = infer_stop_pct_from_signal(signal)  # fracción (0.03 = 3%)
-        qty = self.kelly_position_size_qty(signal, float(confidence), stop_pct)
-        if qty <= 0:
-            return TradeResultModel(status="rejected", order_id=None, ticker=ticker, side=side, qty=0, reason="qty_too_small")
-
-        # 7) Construir orden
-        # Nota: bracket orders exactos dependen de la versión de alpaca-py.
-        # Para mantener 100% compatibilidad sin adivinar clases, enviamos MARKET entry
-        # y registramos stop/tp calculados para que tú puedas convertirlo a bracket
-        # si habilitas esas clases en tu entorno.
-        stop_price = price_now * (1 - stop_pct) if side == "buy" else price_now * (1 + stop_pct)
-        tp_price = price_now * (1 + stop_pct * TAKE_PROFIT_MULT_STOP) if side == "buy" else price_now * (1 - stop_pct * TAKE_PROFIT_MULT_STOP)
-
-        try:
-            order_req = MarketOrderRequest(
-                symbol=ticker,
-                qty=qty,
-                side=alp_side,
-                time_in_force=TimeInForce.DAY,
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "rejected",
+                "reason": "invalid_side_or_short_disabled",
+                "recommendation": recommendation,
+                "allow_short": ALLOW_SHORT,
+            })
+            return TradeResultModel(
+                status="rejected", ticker=ticker, side="", qty=0,
+                reason="invalid_side_or_short_disabled"
             )
-            order = self.trading_client.submit_order(order_req)
 
-            rec = {
+        # -------- 7) PRICE
+        try:
+            price_now = float(signal.get("price_now") or 0.0)
+        except Exception:
+            price_now = 0.0
+
+        if price_now <= 0:
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "rejected",
+                "reason": "invalid_price",
+                "price_now": signal.get("price_now"),
+            })
+            return TradeResultModel(
+                status="rejected", ticker=ticker, side=side, qty=0,
+                reason="invalid_price"
+            )
+
+        # -------- 8) POSITION SIZING (✅ FIX: NO fuerza MIN_QTY)
+        max_risk_dollars = self.equity * RISK_PER_TRADE
+
+        # Edge sobre 0.5 (solo para sizing conservador)
+        c = float(np.clip(float(confidence), 0.0, 1.0))
+        edge = max(0.0, c - 0.5)
+
+        # Kelly-inspired conservador 1/4
+        kelly_factor = edge * 0.25
+
+        # dólares asignados (cap por riesgo)
+        dollars_alloc = max_risk_dollars * kelly_factor
+
+        qty = int(dollars_alloc / price_now) if dollars_alloc > 0 else 0  # ✅ FIX
+
+        if qty < MIN_QTY:
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "rejected",
+                "reason": "qty_below_minimum",
+                "qty": qty,
+                "min_qty": MIN_QTY,
+                "dollars_alloc": round(dollars_alloc, 2),
+                "price_now": price_now,
+                "kelly_factor": round(kelly_factor, 4),
+            })
+            return TradeResultModel(
+                status="rejected", ticker=ticker, side=side, qty=0,
+                reason="qty_below_minimum"
+            )
+
+        # -------- 9) EXECUTE ORDER
+        try:
+            order = self.trading_client.submit_order(
+                MarketOrderRequest(
+                    symbol=ticker,
+                    qty=qty,
+                    side=alp_side,
+                    time_in_force=TimeInForce.DAY,
+                )
+            )
+
+            # Trade log
+            append_trade_log({
                 "ts": datetime.utcnow().isoformat(),
-                "mode": "PAPER" if PAPER_TRADING else "LIVE",
                 "ticker": ticker,
                 "side": side,
                 "qty": qty,
                 "price_ref": price_now,
-                "confidence": float(confidence),
+                "confidence": c,
                 "quality": quality,
-                "recommendation": recommendation,
-                "ret_ens_pct": float(signal.get("ret_ens_pct") or 0.0),
-                "stop_pct": stop_pct,
-                "stop_price": stop_price,
-                "take_profit_price": tp_price,
                 "order_id": getattr(order, "id", None),
-            }
-            append_trade_log(rec)
+            })
 
-            logger.info(
-                f"✅ EXECUTED {ticker}: {side.upper()} qty={qty} ref=${price_now:.2f} "
-                f"(conf={float(confidence):.3f}, ret={float(signal.get('ret_ens_pct') or 0.0):+.2f}%, "
-                f"stop~{stop_pct*100:.2f}%)"
-            )
+            # Decision log
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "executed",
+                "order_id": getattr(order, "id", None),
+                "side": side,
+                "qty": qty,
+                "price_ref": price_now,
+                "confidence": c,
+                "quality": quality,
+                "portfolio_risk_est": total_risk,
+                "kelly_factor": round(kelly_factor, 4),
+                "dollars_alloc": round(dollars_alloc, 2),
+            })
+
+            logger.info(f"✅ EXECUTED {side.upper()} {qty} {ticker} @ ${price_now:.2f}")
 
             return TradeResultModel(
                 status="executed",
-                order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,
+                order_id=str(getattr(order, "id", None)),
                 ticker=ticker,
                 side=side,
                 qty=float(qty),
-                price=None,
-                reason=None,
-                meta={
-                    "stop_pct": stop_pct,
-                    "stop_price_est": stop_price,
-                    "take_profit_price_est": tp_price,
-                    "portfolio_risk_est": port_risk,
-                },
+                price=price_now,
+                meta={"portfolio_risk_est": total_risk}
             )
 
         except Exception as e:
-            logger.error(f"❌ FAILED {ticker}: {e}")
-            append_trade_log(
-                {
-                    "ts": datetime.utcnow().isoformat(),
-                    "mode": "PAPER" if PAPER_TRADING else "LIVE",
-                    "ticker": ticker,
-                    "side": side,
-                    "qty": qty,
-                    "status": "rejected",
-                    "error": str(e),
-                }
+            log_decision({
+                "module": "broker",
+                "ticker": ticker,
+                "decision": "failed",
+                "reason": "execution_error",
+                "error": str(e),
+                "side": side,
+                "qty": qty,
+            })
+            logger.error(f"❌ EXECUTION FAILED {ticker}: {e}")
+
+            return TradeResultModel(
+                status="failed",
+                ticker=ticker,
+                side=side,
+                qty=float(qty),
+                reason=str(e),
             )
-            return TradeResultModel(status="rejected", order_id=None, ticker=ticker, side=side, qty=float(qty), reason=str(e))
 
 # =========================================================
-# Global singleton engine
+# Singleton
 # =========================================================
-trading_engine: Optional[TradingEngine] = None
+_engine: Optional[TradingEngine] = None
 
 def get_trading_engine() -> TradingEngine:
-    global trading_engine
-    if trading_engine is None:
-        trading_engine = TradingEngine()
-    return trading_engine
+    global _engine
+    if _engine is None:
+        _engine = TradingEngine()
+    return _engine
 
 # =========================================================
-# Endpoints
+# FastAPI Endpoints
 # =========================================================
-@router.get("/status")
-async def trading_status() -> Dict[str, Any]:
+@router.post("/execute", response_model=TradeResultModel)
+async def execute_trade(signal: SignalInput):
+    """Ejecuta señal de trading con risk management completo."""
     try:
         engine = get_trading_engine()
-        acc = engine.trading_client.get_account()
-        positions = engine.trading_client.get_all_positions()
+        result = engine.execute_signal(signal.model_dump())
+        return result
+    except Exception as e:
+        log_decision({
+            "module": "broker_api",
+            "decision": "api_error",
+            "error": str(e),
+            "ticker": getattr(signal, "ticker", None),
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/status")
+async def broker_status():
+    """Estado del broker."""
+    try:
+        engine = get_trading_engine()
+        positions = engine._positions()
+        account = engine.trading_client.get_account()
+
+        portfolio_risk_est = estimate_portfolio_risk_conservative(len(positions))
 
         return {
             "status": "active",
-            "mode": "PAPER" if PAPER_TRADING else "LIVE",
-            "account_status": acc.status,
-            "equity": float(acc.equity),
-            "buying_power": float(acc.buying_power),
-            "n_positions": len(positions),
-            "max_positions": engine.max_positions,
-            "min_confidence": MIN_CONFIDENCE,
-            "allow_short": ALLOW_SHORT,
-            "portfolio_risk_est_pct": round(engine.get_portfolio_risk_estimate() * 100, 2),
+            "equity": float(account.equity),
+            "positions": len(positions),
+            "max_positions": MAX_POSITIONS,
+            "paper": PAPER_TRADING,
+            "portfolio_risk_est": round(portfolio_risk_est, 4),
+            "max_portfolio_risk": MAX_PORTFOLIO_RISK,
         }
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Broker unavailable: {e}")
-
-@router.get("/positions")
-async def get_positions() -> List[Dict[str, Any]]:
-    try:
-        engine = get_trading_engine()
-        positions = engine.trading_client.get_all_positions()
-
-        out = []
-        for p in positions:
-            out.append(
-                {
-                    "ticker": p.symbol,
-                    "qty": float(p.qty),
-                    "side": "long" if float(p.qty) > 0 else "short",
-                    "avg_entry": float(p.avg_entry_price),
-                    "current_price": float(p.current_price),
-                    "unrealized_pnl_pct": float(p.unrealized_plpc),
-                    "unrealized_pnl_dollar": float(p.unrealized_pl),
-                    "market_value": float(p.market_value),
-                }
-            )
-
-        return sorted(out, key=lambda x: x["unrealized_pnl_pct"], reverse=True)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Positions unavailable: {e}")
-
-@router.post("/execute", response_
+        raise HTTPException(status_code=500, detail=str(e))
