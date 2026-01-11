@@ -5,7 +5,8 @@
 # ✔ Rate limiting memory-safe
 # ✔ CORS seguro
 # ✔ Signals NO tocado (solo eventos)
-# ✔ NUEVO: /assets expone tickers.json (universo)
+# ✔ /assets expone tickers.json (universo)
+# ✔ ✅ LEGACY RESTAURADO: /predict/save/all (CRON COMPATIBLE)
 
 import os
 import json
@@ -151,48 +152,77 @@ async def health(_: Any = Depends(rate_limiter)):
     }
 
 # =========================================================
-# 🆕 ASSETS / UNIVERSE (tickers.json)
+# ASSETS / UNIVERSE
 # =========================================================
 @app.get("/assets")
 async def get_assets(_: Any = Depends(rate_limiter)):
-    """
-    📦 Universo de activos (tickers.json)
-    - Fuente de verdad para Análisis
-    - NO depende de señales
-    - SOLO lectura
-    """
     tickers_path = Path("tickers.json")
 
     if not tickers_path.exists():
-        logger.warning("tickers.json missing")
         return {"ok": False, "assets": [], "count": 0}
 
-    try:
-        with open(tickers_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    with open(tickers_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-        raw = data.get("tickers", data) if isinstance(data, dict) else data
+    raw = data.get("tickers", data) if isinstance(data, dict) else data
+    assets = [{"ticker": t} if isinstance(t, str) else t for t in raw]
 
-        assets = []
-        for t in raw:
-            if isinstance(t, str):
-                assets.append({"ticker": t})
-            elif isinstance(t, dict) and "ticker" in t:
-                assets.append(t)
-
-        return {
-            "ok": True,
-            "assets": assets,
-            "count": len(assets),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-    except Exception as e:
-        logger.error(f"/assets failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "ok": True,
+        "assets": assets,
+        "count": len(assets),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 # =========================================================
-# Signals (EVENTOS – NO universo)
+# 🔁 LEGACY ENDPOINT — CRON COMPATIBLE
+# =========================================================
+@app.post("/predict/save/all")
+async def predict_save_all(_: Any = Depends(rate_limiter)):
+    """
+    🔁 ENDPOINT LEGACY (NO SE ELIMINA)
+    - Usado por CRON de Render
+    - Ejecuta run_model para TODO el universo
+    - Guarda JSON diarios en /data/predictions/<TICKER>/
+    """
+
+    if run_model is None:
+        raise HTTPException(status_code=503, detail="model not loaded")
+
+    tickers_path = Path("tickers.json")
+    if not tickers_path.exists():
+        raise HTTPException(status_code=404, detail="tickers.json missing")
+
+    with open(tickers_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    tickers = data.get("tickers", data) if isinstance(data, dict) else data
+
+    results = []
+    for ticker in tickers:
+        try:
+            result = run_model(ticker=ticker)
+
+            pred_dir = Path(DATA_PATH) / "predictions" / ticker
+            pred_dir.mkdir(parents=True, exist_ok=True)
+
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            fp = pred_dir / f"{ts}.json"
+            fp.write_text(json.dumps(result), encoding="utf-8")
+
+            results.append({"ticker": ticker, "status": "saved"})
+        except Exception as e:
+            results.append({"ticker": ticker, "status": "error", "error": str(e)})
+
+    return {
+        "ok": True,
+        "saved": len([r for r in results if r["status"] == "saved"]),
+        "results": results,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+# =========================================================
+# Signals (EVENTOS — NO universo)
 # =========================================================
 @app.get("/signals")
 async def signals(
@@ -204,10 +234,10 @@ async def signals(
     if compute_all_signals is None:
         return {"ok": False, "signals": [], "count": 0}
 
-    signals_raw = compute_all_signals(window)
+    raw = compute_all_signals(window)
 
     filtered = [
-        s for s in signals_raw
+        s for s in raw
         if (s.get("confidence") or 0) >= min_confidence
     ]
 
@@ -218,12 +248,10 @@ async def signals(
         )
     )
 
-    out = filtered[:limit]
-
     return {
         "ok": True,
-        "signals": out,
-        "count": len(out),
+        "signals": filtered[:limit],
+        "count": len(filtered),
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -237,6 +265,7 @@ async def root():
         "version": "2.0.1",
         "endpoints": {
             "assets": "/assets",
+            "predict_save_all": "/predict/save/all",
             "signals": "/signals",
             "health": "/health",
         },
