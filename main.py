@@ -532,18 +532,3 @@ async def shutdown():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-# =========================
-# AUTO-INIT tickers.json (solo si no existe)
-# =========================
-from pathlib import Path
-import json
-
-DATA_PATH = Path("/data")
-DATA_PATH.mkdir(exist_ok=True)
-
-tickers_file = DATA_PATH / "tickers.json"
-
-if not tickers_file.exists():
-    tickers_file.write_text(
-        json.dumps(["JNJ", "KO", "PG", "MCD", "SPY"], indent=2)
-    )
