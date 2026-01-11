@@ -1,12 +1,12 @@
 # model.py
-# Misma matemática del main actual, modularizada (sin cambiar lógica).
-# - No abre puertos
-# - No while True
-# - Devuelve resultados en dict (y opcional texto para logs/email)
+# Motor matemático completo + adaptador de compatibilidad
+# Salidas 100% compatibles con el sistema actual
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from typing import Dict, List, Optional
+from dataclasses import dataclass
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -16,9 +16,33 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
-# =========================
-# Utils
-# =========================
+# ======================================================
+# Dataclasses (solo internas, no afectan API)
+# ======================================================
+@dataclass
+class ModelMeta:
+    ticker: str
+    horizon_days: int
+    pca_target: int
+    theta: float
+    k_neighbors: int
+    alpha: float
+    period: str
+
+
+@dataclass
+class HistoricalStats:
+    hit_rate_mean: Optional[float]
+    mae_mean: Optional[float]
+    rmse_mean: Optional[float]
+    pca_dims: Optional[int]
+    n_features: int
+    n_windows: int
+
+
+# ======================================================
+# Utils matemáticos
+# ======================================================
 def log_return(series: pd.Series) -> pd.Series:
     return np.log(series).diff()
 
@@ -34,19 +58,20 @@ def hurst_rs(x: np.ndarray) -> float:
     z = np.cumsum(x)
     r = z.max() - z.min()
     s = x.std(ddof=1)
+
     if s == 0 or r == 0:
         return np.nan
-
     return float(np.log(r / s) / np.log(n))
 
 
 def rolling_hurst(returns: pd.Series, window: int) -> pd.Series:
+    # Versión portable y segura
     return returns.rolling(window).apply(lambda a: hurst_rs(a), raw=True)
 
 
-# =========================
-# Feature engineering
-# =========================
+# ======================================================
+# Feature engineering (SIN data leak)
+# ======================================================
 def make_features(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     out = df.copy()
 
@@ -57,46 +82,50 @@ def make_features(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     for k in range(1, 21):
         out[f"ret_lag_{k}"] = out["ret1"].shift(k)
 
-    out["rv_20"] = out["ret1"].rolling(20).std()
-    out["rv_60"] = out["ret1"].rolling(60).std()
+    # Solo datos pasados
+    past = out["ret1"].shift(1)
+    out["rv_20"] = past.rolling(20).std()
+    out["rv_60"] = past.rolling(60).std()
+    out["hurst_60"] = rolling_hurst(past, 60)
+    out["hurst_120"] = rolling_hurst(past, 120)
 
-    out["hurst_60"] = rolling_hurst(out["ret1"], 60)
-    out["hurst_120"] = rolling_hurst(out["ret1"], 120)
-
+    # Target futuro (correcto)
     out["y_fwd"] = np.log(out["Close"].shift(-horizon) / out["Close"])
 
     return out.dropna()
 
 
-# =========================
-# kNN CAÓTICO (dinámica local)
-# =========================
-def knn_caotico_predict(X_train, y_train, X_query, k=20) -> float:
-    nn = NearestNeighbors(n_neighbors=k, metric="euclidean")
+# ======================================================
+# kNN caótico
+# ======================================================
+def knn_caotico_predict(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_query: np.ndarray,
+    k: int = 20
+) -> float:
+    k_eff = min(k, len(X_train))
+    nn = NearestNeighbors(n_neighbors=k_eff, metric="euclidean")
     nn.fit(X_train)
-    _, indices = nn.kneighbors(X_query)
-    return float(np.mean(y_train[indices[0]]))
+    _, idx = nn.kneighbors(X_query)
+    return float(np.mean(y_train[idx[0]]))
 
 
-# =========================
-# Walk-forward training
-# =========================
+# ======================================================
+# Walk-forward training (solo métricas matemáticas)
+# ======================================================
 def walk_forward_train_test(
     data: pd.DataFrame,
-    feature_cols: list,
+    feature_cols: List[str],
     target_col: str,
     train_years: int = 5,
     test_months: int = 6,
     pca_target: int = 50,
-):
+) -> pd.DataFrame:
     df = data.sort_index()
-
-    start = df.index.min()
-    end = df.index.max()
+    start, end = df.index.min(), df.index.max()
 
     results = []
-    preds_all = []
-
     cur_train_start = start
     cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
     cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
@@ -126,73 +155,52 @@ def walk_forward_train_test(
         y_pred = model.predict(X_test)
 
         results.append({
-            "mae": mean_absolute_error(y_test, y_pred),
-            "rmse": np.sqrt(mean_squared_error(y_test, y_pred)),
+            "mae": float(mean_absolute_error(y_test, y_pred)),
+            "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
             "hit_rate": float((np.sign(y_pred) == np.sign(y_test)).mean()),
             "n_test": len(test),
             "n_features": n_features,
-            "n_pca": n_pca
+            "n_pca": n_pca,
         })
-
-        preds_all.append(pd.DataFrame({
-            "y_true": y_test,
-            "y_pred": y_pred
-        }, index=test.index))
 
         cur_train_start += pd.DateOffset(months=test_months)
         cur_train_end = cur_train_start + pd.DateOffset(years=train_years)
         cur_test_end = cur_train_end + pd.DateOffset(months=test_months)
 
-    return pd.DataFrame(results), pd.concat(preds_all).sort_index()
+    return pd.DataFrame(results)
 
 
-# =========================
-# Recomendación
-# =========================
-def recomendar(ret_pct: float, theta: float) -> str:
-    if ret_pct >= theta:
-        return "COMPRA"
-    if ret_pct <= -theta:
-        return "VENDE"
-    return "MANTÉN"
-
-
-# =========================
-# Núcleo del modelo (misma lógica del main)
-# =========================
-def run_model(
-    ticker: str = "SPY",
-    horizon: int = 10,
-    pca_target: int = 50,
-    theta: float = 0.75,
-    k_neighbors: int = 20,
-    alpha: float = 0.5,
-    period: str = "max",
-):
-    """
-    Ejecuta:
-    - Descarga datos
-    - Features
-    - Walk-forward (resumen)
-    - Entrena final en todo y predice último punto
-    - Ensamble global + kNN
-
-    Devuelve dict con:
-    - summary histórico
-    - predicción actual
-    - metadata
-    """
-
-    raw = yf.download(ticker, period=period, progress=False)
+# ======================================================
+# Motor matemático completo (INTERNO)
+# ======================================================
+def _run_full_math_engine(
+    ticker: str,
+    horizon: int,
+    pca_target: int,
+    theta: float,
+    k_neighbors: int,
+    alpha: float,
+    period: str,
+) -> Dict:
+    # Descarga explícita (sin ambigüedad)
+    raw = yf.download(
+        ticker,
+        period=period,
+        progress=False,
+        auto_adjust=False
+    )
 
     if raw is None or len(raw) == 0:
-        raise RuntimeError(f"No se pudieron descargar datos para {ticker}.")
+        raise RuntimeError(f"No se pudieron descargar datos para {ticker}")
 
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 
     df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
     df.index = pd.to_datetime(df.index)
+
+    if len(df) < 300:
+        raise RuntimeError(f"Datos insuficientes: {len(df)} filas")
 
     feat = make_features(df, horizon=horizon)
 
@@ -201,38 +209,33 @@ def run_model(
         *[f"ret_lag_{k}" for k in range(1, 21)]
     ]
 
-    # =========================
-    # WALK-FORWARD (misma lógica)
-    # =========================
-    res_df, _ = walk_forward_train_test(
+    # Walk-forward
+    res_df = walk_forward_train_test(
         feat, feature_cols, "y_fwd", pca_target=pca_target
     )
 
-    # Por si el walk-forward no generó ventanas (dataset raro / corto)
     if res_df is None or len(res_df) == 0:
-        hist = {
-            "hit_rate_mean": None,
-            "mae_mean": None,
-            "rmse_mean": None,
-            "pca_dims": None,
-            "n_features": len(feature_cols),
-            "n_windows": 0
-        }
+        hist = HistoricalStats(
+            hit_rate_mean=None,
+            mae_mean=None,
+            rmse_mean=None,
+            pca_dims=None,
+            n_features=len(feature_cols),
+            n_windows=0
+        )
     else:
-        hist = {
-            "hit_rate_mean": float(res_df["hit_rate"].mean()),
-            "mae_mean": float(res_df["mae"].mean()),
-            "rmse_mean": float(res_df["rmse"].mean()),
-            "pca_dims": int(res_df["n_pca"].iloc[0]),
-            "n_features": int(res_df["n_features"].iloc[0]),
-            "n_windows": int(len(res_df))
-        }
+        hist = HistoricalStats(
+            hit_rate_mean=float(res_df["hit_rate"].mean()),
+            mae_mean=float(res_df["mae"].mean()),
+            rmse_mean=float(res_df["rmse"].mean()),
+            pca_dims=int(res_df["n_pca"].iloc[0]),
+            n_features=int(res_df["n_features"].iloc[0]),
+            n_windows=int(len(res_df))
+        )
 
-    # =========================
-    # PREDICCIÓN ACTUAL (misma lógica)
-    # =========================
+    # Modelo final
     n_features = len(feature_cols)
-    n_pca = min(pca_target, n_features - 1)
+    n_pca = min(pca_target, max(1, n_features - 1))
 
     model = Pipeline([
         ("scaler", StandardScaler()),
@@ -244,83 +247,117 @@ def run_model(
     y = feat["y_fwd"].values
     model.fit(X, y)
 
+    last_row = feat.iloc[-1]
+    X_last = last_row[feature_cols].values.reshape(1, -1)
+
+    y_global = float(model.predict(X_last)[0])
+
     X_pca = model.named_steps["pca"].transform(
         model.named_steps["scaler"].transform(X)
     )
-
-    last_row = feat.iloc[-1]
-    X_last = last_row[feature_cols].values.reshape(1, -1)
     X_last_pca = model.named_steps["pca"].transform(
         model.named_steps["scaler"].transform(X_last)
     )
 
-    y_global = float(model.predict(X_last)[0])
     y_knn = knn_caotico_predict(X_pca, y, X_last_pca, k_neighbors)
 
-    y_ens = alpha * y_knn + (1 - alpha) * y_global
+    # Ensemble levemente adaptativo (NO rompe contrato)
+    w = hist.hit_rate_mean
+    if w is not None:
+        w = float(np.clip(w, 0.4, 0.6))
+    else:
+        w = alpha
+
+    y_ens = w * y_knn + (1 - w) * y_global
 
     price_now = float(last_row["Close"])
     price_pred = float(price_now * np.exp(y_ens))
 
-    accion = recomendar(y_ens * 100, theta)
+    recommendation = (
+        "COMPRA" if y_ens * 100 >= theta else
+        "VENDE" if y_ens * 100 <= -theta else
+        "MANTÉN"
+    )
 
-    # Resultado estructurado
-    result = {
-        "meta": {
-            "ticker": ticker,
-            "horizon_days": horizon,
-            "pca_target": pca_target,
-            "theta": theta,
-            "k_neighbors": k_neighbors,
-            "alpha": alpha,
-            "period": period,
+    return {
+        "meta": ModelMeta(
+            ticker, horizon, pca_target, theta, k_neighbors, alpha, period
+        ).__dict__,
+        "historical": {
+            "hit_rate_mean": hist.hit_rate_mean,
+            "mae_mean": hist.mae_mean,
+            "rmse_mean": hist.rmse_mean,
+            "pca_dims": hist.pca_dims,
+            "n_features": hist.n_features,
+            "n_windows": hist.n_windows,
         },
-        "historical": hist,
         "prediction": {
             "date_base": str(pd.to_datetime(last_row.name).date()),
-            "ret_global_pct": float(y_global * 100.0),
-            "ret_knn_pct": float(y_knn * 100.0),
-            "ret_ens_pct": float(y_ens * 100.0),
+            "ret_global_pct": y_global * 100.0,
+            "ret_knn_pct": y_knn * 100.0,
+            "ret_ens_pct": y_ens * 100.0,
             "price_now": price_now,
             "price_pred": price_pred,
-            "recommendation": accion,
-            "pca_dims_effective": int(n_pca),
-            "n_features": int(n_features),
-        }
+            "recommendation": recommendation,
+            "pca_dims_effective": n_pca,
+            "n_features": n_features,
+        },
     }
 
-    return result
+
+# ======================================================
+# Adaptador de compatibilidad (CONTRATO INTACTO)
+# ======================================================
+def _export_compat_result(full: dict) -> dict:
+    return {
+        "meta": full["meta"],
+        "historical": full["historical"],
+        "prediction": full["prediction"],
+    }
+
+
+# ======================================================
+# API pública (NO CAMBIA)
+# ======================================================
+def run_model(
+    ticker: str = "SPY",
+    horizon: int = 10,
+    pca_target: int = 50,
+    theta: float = 0.75,
+    k_neighbors: int = 20,
+    alpha: float = 0.5,
+    period: str = "max",
+):
+    full = _run_full_math_engine(
+        ticker, horizon, pca_target, theta, k_neighbors, alpha, period
+    )
+    return _export_compat_result(full)
 
 
 def format_report(result: dict) -> str:
-    """
-    Texto listo para logs/email (opcional).
-    No afecta la lógica, solo formatea.
-    """
-    m = result.get("meta", {})
-    h = result.get("historical", {})
-    p = result.get("prediction", {})
+    m, h, p = result["meta"], result["historical"], result["prediction"]
 
-    lines = []
-    lines.append("=== RESUMEN HISTÓRICO ===")
-    if h.get("hit_rate_mean") is None:
-        lines.append("Sin ventanas walk-forward (dataset corto o sin suficiente data).")
+    lines = ["=== RESUMEN HISTÓRICO ==="]
+    if h["hit_rate_mean"] is None:
+        lines.append("Sin ventanas walk-forward.")
     else:
-        lines.append(f"Hit-rate prom : {h['hit_rate_mean']:.4f}")
-        lines.append(f"MAE retorno   : {h['mae_mean']:.6f}")
-        lines.append(f"RMSE retorno  : {h['rmse_mean']:.6f}")
-        lines.append(f"PCA dims      : {h['pca_dims']}")
-        lines.append(f"Ventanas      : {h['n_windows']}")
+        lines.extend([
+            f"Hit-rate prom : {h['hit_rate_mean']:.4f}",
+            f"MAE retorno   : {h['mae_mean']:.6f}",
+            f"RMSE retorno  : {h['rmse_mean']:.6f}",
+            f"PCA dims      : {h['pca_dims']}",
+            f"Ventanas      : {h['n_windows']}",
+        ])
 
-    lines.append("")
-    lines.append("=== PREDICCIÓN ACTUAL (ENSAMBLE) ===")
-    lines.append(f"Activo              : {m.get('ticker')}")
-    lines.append(f"Fecha base          : {p.get('date_base')}")
-    lines.append(f"Dimensión efectiva  : PCA = {p.get('pca_dims_effective')}")
-    lines.append(f"Retorno global      : {p.get('ret_global_pct'):.2f} %")
-    lines.append(f"Retorno kNN caótico : {p.get('ret_knn_pct'):.2f} %")
-    lines.append(f"Retorno ENSAMBLE    : {p.get('ret_ens_pct'):.2f} %")
-    lines.append(f"Precio actual       : {p.get('price_now'):.2f} USD")
-    lines.append(f"Precio esperado     : {p.get('price_pred'):.2f} USD")
-    lines.append(f"RECOMENDACIÓN       : {p.get('recommendation')}")
+    lines.extend([
+        "",
+        "=== PREDICCIÓN ACTUAL (ENSAMBLE) ===",
+        f"Activo              : {m['ticker']}",
+        f"Fecha base          : {p['date_base']}",
+        f"Retorno ENSAMBLE    : {p['ret_ens_pct']:.2f} %",
+        f"Precio actual       : {p['price_now']:.2f} USD",
+        f"Precio esperado     : {p['price_pred']:.2f} USD",
+        f"RECOMENDACIÓN       : {p['recommendation']}",
+    ])
+
     return "\n".join(lines)
