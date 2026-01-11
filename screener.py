@@ -1,11 +1,11 @@
 # =========================================================
-# screener.py — ALPACA MARKET SCREENER (OBSERVADOR) v2.1 FINAL
+# screener.py — ALPACA MARKET SCREENER (OBSERVADOR) v2.2 FINAL
 # =========================================================
 # ✅ NO ejecuta trades  |  ✅ NO modifica tickers.json
 # ✅ Screener API nativa |  ✅ Rate-limit safe
-# ✅ RSI Wilder + Momentum continuo
+# ✅ RSI Wilder + Momentum continuo (MA20 + MA50)
 # ✅ Pipeline-ready JSON |  Dashboard / CSS ready
-# ✅ Production hardened
+# ✅ Production hardened v2.2
 # =========================================================
 
 import os
@@ -95,16 +95,21 @@ def compute_score_enhanced(
 ) -> Tuple[float, str]:
     """
     Score multifactorial continuo (0–1).
+    Momentum blend: MA20 (60%) + MA50 (40).
     """
     returns = pct_returns(closes)
     volatility = float(np.std(returns))
 
     trend = float((closes[-1] / closes[0]) - 1)
-    rsi = compute_rsi(closes, RSI_PERIOD)
 
-    ma5 = np.mean(closes[-5:])
     ma20 = np.mean(closes[-20:])
-    momentum = np.clip((closes[-1] - ma20) / ma20, 0, 1)
+    ma50 = np.mean(closes[-50:]) if len(closes) >= 50 else np.mean(closes)
+
+    momentum_short = np.clip((closes[-1] - ma20) / ma20, 0, 1)
+    momentum_long = np.clip((closes[-1] - ma50) / ma50, 0, 1)
+    momentum = 0.6 * momentum_short + 0.4 * momentum_long
+
+    rsi = compute_rsi(closes, RSI_PERIOD)
 
     vol_score = np.clip(
         (volatility - MIN_VOLATILITY) / (MAX_VOLATILITY - MIN_VOLATILITY), 0, 1
@@ -183,10 +188,13 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
                 if not bars or len(bars) < 60:
                     continue
 
-                closes = np.array([b.close for b in bars], float)
-                volumes = np.array([b.volume for b in bars], float)
-                dollar_volume = float(np.mean(closes * volumes))
+                closes = np.array([b.close for b in bars], dtype=float)
+                volumes = np.array([b.volume for b in bars], dtype=float)
 
+                if np.any(np.isnan(closes)) or np.any(np.isinf(closes)):
+                    continue
+
+                dollar_volume = float(np.mean(closes * volumes))
                 if dollar_volume < MIN_DOLLAR_VOLUME:
                     continue
 
@@ -209,6 +217,7 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
                         "signals_ready": False,
                         "reason": f"score={score:.3f} RSI={rsi:.0f}"
                     })
+                    logger.debug(f"{symbol} accepted | score={score:.3f}")
 
             except Exception as e:
                 logger.debug(f"{symbol} skipped: {e}")
@@ -233,7 +242,7 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     DATA_PATH.mkdir(exist_ok=True)
     OUTPUT_FILE.write_text(json.dumps(output, indent=2))
 
-    logger.info(f"✅ Screener FINAL | {len(output['candidates'])} candidatos")
+    logger.info(f"✅ Screener v2.2 FINAL | {len(output['candidates'])} candidatos")
     logger.info(f"📁 Output: {OUTPUT_FILE}")
 
     return output
@@ -253,4 +262,4 @@ if __name__ == "__main__":
 
     except Exception as e:
         logger.error(f"❌ Screener falló: {e}")
-        raise
+        exit(1)
