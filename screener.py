@@ -1,11 +1,11 @@
 # =========================================================
-# screener.py — ALPACA MARKET SCREENER (OBSERVADOR) v2.2 FINAL
+# screener.py — ALPACA MARKET SCREENER (OBSERVADOR) v2.3 FUNDAMENTAL
 # =========================================================
 # ✅ NO ejecuta trades  |  ✅ NO modifica tickers.json
-# ✅ Screener API nativa |  ✅ Rate-limit safe
+# ✅ Diseñado para ser llamado por ENDPOINT / CRON
 # ✅ RSI Wilder + Momentum continuo (MA20 + MA50)
-# ✅ Pipeline-ready JSON |  Dashboard / CSS ready
-# ✅ Production hardened v2.2
+# ✅ + CONTEXTO FUNDAMENTAL (model2_improved) SOLO como ETIQUETA
+# ✅ Pipeline-ready JSON | Production hardened
 # =========================================================
 
 import os
@@ -13,15 +13,27 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from itertools import islice
 
 import numpy as np
 
-# =========================
+# =========================================================
+# Fundamental (safe import)
+# =========================================================
+try:
+    from model2_improved import fundamental_signal_context
+    FUNDAMENTAL_AVAILABLE = True
+except Exception:
+    FUNDAMENTAL_AVAILABLE = False
+
+    def fundamental_signal_context(ticker: str) -> Dict[str, Any]:
+        return {"usable": False}
+
+# =========================================================
 # Alpaca imports (safe)
-# =========================
+# =========================================================
 try:
     from alpaca.trading.client import TradingClient
     from alpaca.trading.enums import AssetClass
@@ -33,9 +45,9 @@ try:
 except ImportError:
     ALPACA_AVAILABLE = False
 
-# =========================
+# =========================================================
 # Configuración
-# =========================
+# =========================================================
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 OUTPUT_FILE = DATA_PATH / "screener_candidates.json"
 
@@ -44,7 +56,7 @@ ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
-MIN_DOLLAR_VOLUME = float(os.getenv("SCREENER_MIN_DOLLAR_VOL", "50000000"))
+MIN_DOLLAR_VOLUME = float(os.getenv("SCREENER_MIN_DOLLAR_VOL", "50_000_000"))
 MIN_VOLATILITY = float(os.getenv("SCREENER_MIN_VOL", "0.015"))
 MAX_VOLATILITY = float(os.getenv("SCREENER_MAX_VOL", "0.06"))
 MIN_SCORE = float(os.getenv("SCREENER_MIN_SCORE", "0.6"))
@@ -52,26 +64,27 @@ MAX_ASSETS = int(os.getenv("SCREENER_MAX_ASSETS", "300"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 TOP_K = int(os.getenv("SCREENER_TOP_K", "50"))
 
-# =========================
+# Fundamental tags (solo etiqueta)
+FUNDAMENTAL_DEEP_VALUE = float(os.getenv("FUNDAMENTAL_DEEP_VALUE", "-30"))
+FUNDAMENTAL_OVERHEATED = float(os.getenv("FUNDAMENTAL_OVERHEATED", "30"))
+
+# =========================================================
 # Logging
-# =========================
+# =========================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)-7s] %(message)s"
 )
 logger = logging.getLogger("screener")
 
-# =========================
+# =========================================================
 # Utils matemáticos
-# =========================
+# =========================================================
 def pct_returns(prices: np.ndarray) -> np.ndarray:
-    """Retornos porcentuales diarios."""
     return np.diff(prices) / prices[:-1]
 
+
 def compute_rsi(prices: np.ndarray, period: int = 14) -> float:
-    """
-    RSI Wilder robusto.
-    """
     if len(prices) < period + 1:
         return 50.0
 
@@ -88,15 +101,12 @@ def compute_rsi(prices: np.ndarray, period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return float(100 - (100 / (1 + rs)))
 
+
 def compute_score_enhanced(
     closes: np.ndarray,
     volumes: np.ndarray,
     dollar_volume: float
 ) -> Tuple[float, str]:
-    """
-    Score multifactorial continuo (0–1).
-    Momentum blend: MA20 (60%) + MA50 (40).
-    """
     returns = pct_returns(closes)
     volatility = float(np.std(returns))
 
@@ -137,18 +147,50 @@ def compute_score_enhanced(
 
     return round(float(score), 3), quality
 
-# =========================
-# Rate limiting
-# =========================
-def batch_process(iterable, batch_size=50, delay=1.0):
-    iterator = iter(iterable)
-    while batch := list(islice(iterator, batch_size)):
+# =========================================================
+# Rate limiting helper
+# =========================================================
+def batch_process(iterable, batch_size: int = 50, delay: float = 1.0):
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, batch_size))
+        if not batch:
+            break
         yield batch
         time.sleep(delay)
 
-# =========================
-# Screener principal
-# =========================
+# =========================================================
+# Fundamental tagging (NO score)
+# =========================================================
+def fundamental_tag(symbol: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    if not FUNDAMENTAL_AVAILABLE:
+        return None, None
+
+    f = fundamental_signal_context(symbol) or {}
+    if not f.get("usable"):
+        return None, None
+
+    mp = f.get("mispricing_pct")
+    ms = f.get("margin_safety_pct")
+
+    flag = "⚪ FAIR"
+    if mp is not None and mp <= FUNDAMENTAL_DEEP_VALUE:
+        flag = "🟢 DEEP_VALUE"
+    elif mp is not None and mp >= FUNDAMENTAL_OVERHEATED:
+        flag = "🔴 OVERHEATED"
+    elif ms is not None and ms >= 25:
+        flag = "🟡 VALUE"
+
+    return flag, {
+        "mispricing_pct": f.get("mispricing_pct"),
+        "margin_safety_pct": f.get("margin_safety_pct"),
+        "fundamental_reco": f.get("fundamental_reco"),
+        "model": f.get("model"),
+    }
+
+# =========================================================
+# SCREENER PRINCIPAL (CALLABLE)
+# =========================================================
 def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     if not ALPACA_AVAILABLE:
         raise RuntimeError("alpaca-py no instalado")
@@ -159,20 +201,17 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER)
     data = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
+    # Universo
     try:
         screener = ScreenerClient(ALPACA_KEY, ALPACA_SECRET)
         actives = screener.get_most_actives()
         universe = [a["symbol"] for a in actives[:limit_assets]]
-        logger.info(f"🔍 Screener API: {len(universe)} activos")
-    except Exception as e:
-        logger.warning(f"Screener API falló ({e}). Fallback manual.")
+    except Exception:
         assets = trading.get_all_assets(asset_class=AssetClass.US_EQUITY)
         universe = [
             a.symbol for a in assets
             if a.tradable and a.exchange in ("NYSE", "NASDAQ")
         ][:limit_assets]
-
-    logger.info(f"🚀 Analizando {len(universe)} activos")
 
     candidates: List[Dict[str, Any]] = []
 
@@ -188,11 +227,8 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
                 if not bars or len(bars) < 60:
                     continue
 
-                closes = np.array([b.close for b in bars], dtype=float)
-                volumes = np.array([b.volume for b in bars], dtype=float)
-
-                if np.any(np.isnan(closes)) or np.any(np.isinf(closes)):
-                    continue
+                closes = np.array([b.close for b in bars], float)
+                volumes = np.array([b.volume for b in bars], float)
 
                 dollar_volume = float(np.mean(closes * volumes))
                 if dollar_volume < MIN_DOLLAR_VOLUME:
@@ -203,24 +239,26 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
                     continue
 
                 score, quality = compute_score_enhanced(closes, volumes, dollar_volume)
-                rsi = compute_rsi(closes, RSI_PERIOD)
+                if score < MIN_SCORE:
+                    continue
 
-                if score >= MIN_SCORE:
-                    candidates.append({
-                        "ticker": symbol,
-                        "score": score,
-                        "quality": quality,
-                        "trend_3m_pct": round((closes[-1] / closes[0] - 1) * 100, 2),
-                        "volatility": round(vol, 4),
-                        "rsi": round(rsi, 1),
-                        "avg_dollar_volume": int(dollar_volume),
-                        "signals_ready": False,
-                        "reason": f"score={score:.3f} RSI={rsi:.0f}"
-                    })
-                    logger.debug(f"{symbol} accepted | score={score:.3f}")
+                f_flag, f_ctx = fundamental_tag(symbol)
 
-            except Exception as e:
-                logger.debug(f"{symbol} skipped: {e}")
+                candidates.append({
+                    "ticker": symbol,
+                    "score": score,
+                    "quality": quality,
+                    "trend_3m_pct": round((closes[-1] / closes[0] - 1) * 100, 2),
+                    "volatility": round(vol, 4),
+                    "rsi": round(compute_rsi(closes), 1),
+                    "avg_dollar_volume": int(dollar_volume),
+                    "fundamental_flag": f_flag,
+                    "fundamental": f_ctx,
+                    "signals_ready": False,
+                })
+
+            except Exception:
+                continue
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
 
@@ -229,37 +267,19 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         "n_universe": len(universe),
         "n_candidates": len(candidates),
         "top_k": TOP_K,
-        "criteria": {
-            "lookback_days": LOOKBACK_DAYS,
-            "min_dollar_volume": MIN_DOLLAR_VOLUME,
-            "volatility_range": [MIN_VOLATILITY, MAX_VOLATILITY],
-            "min_score": MIN_SCORE,
-            "rsi_period": RSI_PERIOD
-        },
-        "candidates": candidates[:TOP_K]
+        "fundamental_available": FUNDAMENTAL_AVAILABLE,
+        "candidates": candidates[:TOP_K],
     }
 
-    DATA_PATH.mkdir(exist_ok=True)
-    OUTPUT_FILE.write_text(json.dumps(output, indent=2))
+    DATA_PATH.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FILE.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
-    logger.info(f"✅ Screener v2.2 FINAL | {len(output['candidates'])} candidatos")
-    logger.info(f"📁 Output: {OUTPUT_FILE}")
-
+    logger.info(f"✅ Screener v2.3 FUNDAMENTAL | {len(output['candidates'])} candidatos")
     return output
 
-# =========================
+# =========================================================
 # CLI
-# =========================
+# =========================================================
 if __name__ == "__main__":
-    try:
-        result = run_screener()
-
-        print("\n🎯 TOP 5 CANDIDATOS:")
-        print(json.dumps(result["candidates"][:5], indent=2))
-
-        print(f"\n📊 Total: {len(result['candidates'])} candidatos")
-        print(f"💾 JSON: {OUTPUT_FILE}")
-
-    except Exception as e:
-        logger.error(f"❌ Screener falló: {e}")
-        exit(1)
+    r = run_screener()
+    print(json.dumps(r["candidates"][:5], indent=2))
