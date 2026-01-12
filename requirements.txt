@@ -1,7 +1,8 @@
-pandas
+fastapi
+uvicorn
+httpx
 numpy
+pandas
 scikit-learn
 yfinance
 matplotlib
-fastapi
-uvicorn
