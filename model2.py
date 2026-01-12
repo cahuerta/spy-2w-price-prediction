@@ -1,4 +1,3 @@
-# model2_improved.py
 # ======================================================
 # MODELO FUNDAMENTAL MEJORADO (DIVIDEND STOCKS)
 # ------------------------------------------------------
@@ -7,6 +6,7 @@
 # ✔ Validaciones robustas
 # ✔ SOLO informativo (NO timing, NO señales)
 # ✔ Diseñado como ANCLA fundamental
+# ✔ COMPATIBLE con signals.py (safe + silent)
 # ======================================================
 
 import yfinance as yf
@@ -22,24 +22,21 @@ from scipy.optimize import newton
 # ======================================================
 @dataclass
 class ModelAssumptions:
-    discount_rate: float = 0.09        # fallback
-    growth_rate: float = 0.03          # crecimiento estable
-    growth_high: float = 0.06           # crecimiento fase inicial
+    discount_rate: float = 0.09
+    growth_rate: float = 0.03
+    growth_high: float = 0.06
     years_high_growth: int = 5
-    horizon_days: int = 252             # 1Y trading days
+    horizon_days: int = 252
 
 
 # ======================================================
 # Helpers financieros
 # ======================================================
 def get_risk_adjusted_discount_rate(info: Dict) -> float:
-    """CAPM simplificado y robusto"""
     beta = info.get("beta")
     beta = float(beta) if beta is not None else 1.0
-
-    risk_free = 0.035      # ~US 10Y
-    equity_premium = 0.055 # ERP conservador
-
+    risk_free = 0.035
+    equity_premium = 0.055
     return risk_free + beta * equity_premium
 
 
@@ -48,11 +45,9 @@ def validate_dividend_stock(
     dividends: pd.Series,
     min_years: int = 5
 ) -> bool:
-    """Chequeos mínimos de calidad"""
     payout = info.get("payoutRatio")
-    if payout is not None:
-        if payout < 0.25 or payout > 0.85:
-            return False
+    if payout is not None and (payout < 0.25 or payout > 0.85):
+        return False
 
     if dividends is None or len(dividends) < min_years * 4:
         return False
@@ -93,146 +88,139 @@ def two_stage_ddm(
     return pv_high + pv_terminal
 
 
-def implied_discount_rate(
+def implied_discount_rate_safe(
     price_market: float,
     dividend: float,
-    g: float
+    g: float,
+    fallback: float
 ) -> float:
-    def eq(r):
-        return dividend * (1 + g) / (r - g) - price_market
-
-    return float(newton(eq, 0.08, maxiter=50))
+    try:
+        def eq(r):
+            return dividend * (1 + g) / (r - g) - price_market
+        return float(newton(eq, 0.08, maxiter=50))
+    except Exception:
+        return fallback
 
 
 # ======================================================
-# MODELO PRINCIPAL
+# MODELO PRINCIPAL (SAFE + SILENT)
 # ======================================================
 def run_model_fundamental_dividend_improved(
     ticker: str,
     use_two_stage: bool = True,
-    assumptions: Optional[ModelAssumptions] = None
+    assumptions: Optional[ModelAssumptions] = None,
+    *,
+    silent: bool = True,
+    safe: bool = True
 ) -> Dict:
     """
     MODELO FUNDAMENTAL ROBUSTO
-    ------------------------------------
-    Retorna:
-    - Valor intrínseco
-    - Margen de seguridad
-    - Mispricing %
-    - TIR implícita
-    - Recomendación FUNDAMENTAL
+    - silent=True  → sin prints (signals-safe)
+    - safe=True    → NO lanza excepciones fatales
     """
 
     assumptions = assumptions or ModelAssumptions()
 
-    tk = yf.Ticker(ticker)
-    info = tk.info or {}
-    dividends = tk.dividends
-
-    # =========================
-    # Datos de mercado
-    # =========================
-    price_market = info.get("currentPrice")
-    dividend_rate = info.get("dividendRate", 0.0)
-    forward_dividend = info.get(
-        "forwardAnnualDividendRate",
-        dividend_rate
-    )
-
-    if price_market is None or price_market <= 0:
-        raise RuntimeError("Market price unavailable")
-
-    if dividend_rate is None or dividend_rate <= 0:
-        raise RuntimeError("No meaningful dividends")
-
-    # =========================
-    # CAPM dinámico
-    # =========================
-    r_capm = get_risk_adjusted_discount_rate(info)
-    assumptions.discount_rate = r_capm
-
-    # =========================
-    # Validaciones
-    # =========================
-    valid_dividend_stock = validate_dividend_stock(info, dividends)
-
-    # =========================
-    # Valor fundamental
-    # =========================
-    if use_two_stage and valid_dividend_stock:
-        intrinsic_price = two_stage_ddm(
-            dividend=forward_dividend,
-            r=r_capm,
-            g_high=assumptions.growth_high,
-            g_stable=assumptions.growth_rate,
-            years_high=assumptions.years_high_growth,
-        )
-        model_used = "Two-Stage DDM"
-    else:
-        intrinsic_price = gordon_growth_model(
-            dividend_rate,
-            r_capm,
-            assumptions.growth_rate,
-        )
-        model_used = "Gordon Growth"
-
-    # =========================
-    # Métricas
-    # =========================
-    yield_market = dividend_rate / price_market * 100
-    mispricing_pct = (price_market / intrinsic_price - 1) * 100
-    margin_safety_pct = max(0.0, 1 - price_market / intrinsic_price) * 100
-
     try:
-        tir_implicita = implied_discount_rate(
+        tk = yf.Ticker(ticker)
+        info = tk.info or {}
+        dividends = tk.dividends
+
+        price_market = info.get("currentPrice")
+        dividend_rate = info.get("dividendRate", 0.0)
+        forward_dividend = info.get(
+            "forwardAnnualDividendRate",
+            dividend_rate
+        )
+
+        if price_market is None or price_market <= 0:
+            raise RuntimeError("price_unavailable")
+
+        if dividend_rate is None or dividend_rate <= 0:
+            raise RuntimeError("no_dividends")
+
+        r_capm = get_risk_adjusted_discount_rate(info)
+        assumptions.discount_rate = r_capm
+
+        valid_dividend_stock = validate_dividend_stock(info, dividends)
+
+        if use_two_stage and valid_dividend_stock:
+            intrinsic_price = two_stage_ddm(
+                dividend=forward_dividend,
+                r=r_capm,
+                g_high=assumptions.growth_high,
+                g_stable=assumptions.growth_rate,
+                years_high=assumptions.years_high_growth,
+            )
+            model_used = "Two-Stage DDM"
+        else:
+            intrinsic_price = gordon_growth_model(
+                dividend_rate,
+                r_capm,
+                assumptions.growth_rate,
+            )
+            model_used = "Gordon Growth"
+
+        mispricing_pct = (price_market / intrinsic_price - 1) * 100
+        margin_safety_pct = max(0.0, 1 - price_market / intrinsic_price) * 100
+
+        tir_implicita = implied_discount_rate_safe(
             price_market,
             dividend_rate,
             assumptions.growth_rate,
+            fallback=r_capm
         )
-    except Exception:
-        tir_implicita = r_capm
 
-    price_1y_projection = intrinsic_price * (1 + assumptions.growth_rate)
+        if abs(mispricing_pct) < 15:
+            recommendation = "HOLD"
+        elif mispricing_pct < -15:
+            recommendation = "BUY"
+        else:
+            recommendation = "SELL"
 
-    # =========================
-    # Recomendación FUNDAMENTAL
-    # =========================
-    if abs(mispricing_pct) < 15:
-        recommendation = "HOLD"
-    elif mispricing_pct < -15:
-        recommendation = "BUY"
-    else:
-        recommendation = "SELL"
-
-    # =========================
-    # OUTPUT FINAL
-    # =========================
-    return {
-        "ticker": ticker,
-        "model_used": model_used,
-        "valid_dividend_stock": valid_dividend_stock,
-        "market_data": {
-            "price_market": round(price_market, 2),
-            "dividend_annual": round(dividend_rate, 3),
-            "dividend_forward": round(forward_dividend, 3),
-            "yield_market_pct": round(yield_market, 2),
-            "payout_ratio_pct": round((info.get("payoutRatio") or 0) * 100, 1),
-            "beta": round(info.get("beta") or 1.0, 2),
-        },
-        "fundamental_value": {
-            "price_intrinsic": round(intrinsic_price, 2),
-            "price_1y_projection": round(price_1y_projection, 2),
+        return {
+            "usable": True,
+            "ticker": ticker,
+            "model_used": model_used,
+            "valid_dividend_stock": valid_dividend_stock,
             "mispricing_pct": round(mispricing_pct, 2),
             "margin_safety_pct": round(margin_safety_pct, 1),
             "implied_market_return_pct": round(tir_implicita * 100, 1),
-        },
-        "assumptions": {
-            "discount_rate_capm": round(r_capm, 3),
-            "growth_short_term": assumptions.growth_high if use_two_stage else assumptions.growth_rate,
-            "growth_long_term": assumptions.growth_rate,
-            "two_stage_used": use_two_stage,
-        },
-        "recommendation": recommendation,
+            "recommendation": recommendation,
+        }
+
+    except Exception as e:
+        if safe:
+            return {
+                "usable": False,
+                "ticker": ticker,
+                "reason": str(e),
+            }
+        raise
+
+
+# ======================================================
+# CONTEXTO LIGERO PARA signals.py  ⭐ CLAVE ⭐
+# ======================================================
+def fundamental_signal_context(ticker: str) -> Dict:
+    """
+    Wrapper mínimo y rápido para signals.py
+    """
+    r = run_model_fundamental_dividend_improved(
+        ticker,
+        silent=True,
+        safe=True
+    )
+
+    if not r.get("usable"):
+        return {"usable": False}
+
+    return {
+        "usable": True,
+        "mispricing_pct": r["mispricing_pct"],
+        "margin_safety_pct": r["margin_safety_pct"],
+        "fundamental_reco": r["recommendation"],
+        "model": r["model_used"],
     }
 
 
@@ -240,22 +228,5 @@ def run_model_fundamental_dividend_improved(
 # USO LOCAL (TEST)
 # ======================================================
 if __name__ == "__main__":
-    tickers = ["KO", "JNJ", "PG", "MCD"]
-    rows = []
-
-    for t in tickers:
-        try:
-            r = run_model_fundamental_dividend_improved(t)
-            rows.append({
-                "Ticker": r["ticker"],
-                "Precio": r["market_data"]["price_market"],
-                "Intrínseco": r["fundamental_value"]["price_intrinsic"],
-                "Margen %": r["fundamental_value"]["margin_safety_pct"],
-                "Reco": r["recommendation"],
-            })
-        except Exception as e:
-            rows.append({"Ticker": t, "Error": str(e)})
-
-    df = pd.DataFrame(rows)
-    print("\n📊 RESUMEN FUNDAMENTAL\n")
-    print(df.to_string(index=False))
+    for t in ["KO", "JNJ", "PG", "MCD"]:
+        print(fundamental_signal_context(t))
