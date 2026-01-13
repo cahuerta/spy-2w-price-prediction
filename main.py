@@ -343,6 +343,47 @@ async def dashboard_latest(
     if not pred:
         raise HTTPException(404, f"No predictions found for {ticker}")
     return {"ticker": ticker, "latest": pred}
+@app.get("/dashboard/predictions/summary")
+async def dashboard_predictions_summary(
+    request: Request,
+    ticker: str = Query(...),
+    limit: int = Query(60, ge=1, le=500),
+    _=Depends(verify_rate_limit),
+):
+    pred_dir = Path(config.DATA_PATH) / "predictions" / ticker
+    if not pred_dir.exists():
+        raise HTTPException(404, f"No predictions for {ticker}")
+
+    files = sorted(pred_dir.glob("*.json"))
+    if not files:
+        raise HTTPException(404, f"No prediction files for {ticker}")
+
+    data = []
+    for fp in files[-limit:]:
+        obj = load_json(fp)
+        if not obj:
+            continue
+
+        p = obj.get("prediction", {})
+        if not p:
+            continue
+
+        data.append({
+            "date_base": p.get("date_base"),
+            "price_now": safe_float(p.get("price_now")),
+            "price_pred": safe_float(p.get("price_pred")),
+            "ret_ens_pct": safe_float(p.get("ret_ens_pct")),
+            "recommendation": p.get("recommendation"),
+        })
+
+    if not data:
+        raise HTTPException(404, f"No usable data for {ticker}")
+
+    return {
+        "ticker": ticker,
+        "count": len(data),
+        "data": data,
+    }
 
 # =========================================================
 # POSITION MANAGER ENDPOINT
