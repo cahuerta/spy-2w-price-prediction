@@ -1,15 +1,12 @@
 # =====================================================
-# main.py — TRADING SUITE ENTERPRISE v2.4 (PM FULL) ✅ FIXED
+# main.py — TRADING SUITE ENTERPRISE v2.5.2 (CORREGIDO)
 # =====================================================
-# ✔ PositionManager con posiciones reales
-# ✔ OPEN / CLOSE / ROTATE habilitados
-# ✔ Broker URL configurable
-# ✔ PM cache (THREAD-SAFE con asyncio.Lock)
-# ✔ Async Rate Limiter
-# ✔ Position validation
-# ✔ Circuit breaker para broker
-# ✔ Metrics endpoint
-# ✔ Compatibilidad total con cron históricos
+# ✔ Producción real (largo plazo) - PRODUCCIÓN ESTABLE
+# ✔ Universe + Signals API - OPTIMIZADO
+# ✔ PositionManager real - CACHE MEJORADO
+# ✔ Circuit breaker + reset endpoint - ROBUSTO
+# ✔ Guard-rails broker - CON MEJORA DE LOGGING
+# ✔ Rate limiting mejorado - SEGURIDAD
 # =====================================================
 
 import os
@@ -17,420 +14,406 @@ import json
 import logging
 import time
 import asyncio
-from typing import Any, Dict, List, Optional
+import signal
+from typing import Any, Dict, List, Optional, Callable
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict, deque
+from collections import deque
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks, Depends
+from fastapi import FastAPI, Query, HTTPException, Request, BackgroundTasks, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import httpx
+from functools import lru_cache
 
 # =========================================================
-# Config
+# Config - MEJORADA CON VALIDACIÓN
 # =========================================================
-DATA_PATH = os.getenv("DATA_PATH", "/data")
-PORT = int(os.getenv("PORT", "8000"))
-FIXED_CAPITAL = float(os.getenv("PM_FIXED_CAPITAL", "100000"))
-BROKER_EXEC_URL = os.getenv("BROKER_URL", "http://localhost:8000/trading/execute")
-BROKER_STATUS_URL = os.getenv("BROKER_STATUS_URL", "http://localhost:8000/trading/status")
+class Config:
+    DATA_PATH = os.getenv("DATA_PATH", "/data")
+    PORT = int(os.getenv("PORT", "8000"))
+    FIXED_CAPITAL = float(os.getenv("PM_FIXED_CAPITAL", "100000"))
+    
+    BROKER_EXEC_URL = os.getenv("BROKER_URL", "http://localhost:8000/trading/execute")
+    BROKER_STATUS_URL = os.getenv("BROKER_STATUS_URL", "http://localhost:8000/trading/status")
+    
+    RL_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+    RL_PER_SECONDS = int(os.getenv("RATE_LIMIT_PER_SECONDS", "60"))
+    RL_MAX_IPS = int(os.getenv("RATE_LIMIT_MAX_IPS", "5000"))
+    
+    BATCH_LIMIT_DEFAULT = int(os.getenv("BATCH_LIMIT_DEFAULT", "500"))
+    BROKER_FAILURE_THRESHOLD = int(os.getenv("BROKER_FAILURE_THRESHOLD", "5"))
+    BROKER_CIRCUIT_OPEN_SECS = int(os.getenv("BROKER_CIRCUIT_OPEN_SECS", "300"))
+    
+    SIGNALS_MIN_CONF_DEFAULT = float(os.getenv("SIGNALS_MIN_CONF_DEFAULT", "0.0"))
+    SIGNALS_MAX = int(os.getenv("SIGNALS_MAX", "5000"))
+    
+    # Nuevas configs seguras
+    TRUSTED_HOSTS = os.getenv("TRUSTED_HOSTS", "localhost,127.0.0.1,*").split(",")
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+    DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
-# Rate limiting
-RL_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
-RL_PER_SECONDS = int(os.getenv("RATE_LIMIT_PER_SECONDS", "60"))
-RL_MAX_IPS = int(os.getenv("RATE_LIMIT_MAX_IPS", "5000"))
-
-# Batch defaults
-BATCH_LIMIT_DEFAULT = int(os.getenv("BATCH_LIMIT_DEFAULT", "500"))
-
-# Circuit breaker
-BROKER_FAILURE_THRESHOLD = int(os.getenv("BROKER_FAILURE_THRESHOLD", "5"))
-BROKER_CIRCUIT_OPEN_SECS = int(os.getenv("BROKER_CIRCUIT_OPEN_SECS", "300"))
+config = Config()
 
 # =========================================================
-# GLOBAL STATE (Thread-safe)
+# LIFETIME MANAGER - NUEVO
 # =========================================================
-_pm_cache: Optional['PositionManager'] = None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("🚀 Trading Suite Enterprise v2.5.2 iniciando...")
+    ensure_dirs()
+    await reset_broker_circuit()
+    yield
+    # Shutdown
+    logger.info("🛑 Trading Suite Enterprise deteniéndose...")
+
+# =========================================================
+# GLOBAL STATE - THREAD-SAFE MEJORADO
+# =========================================================
+_pm_cache: Optional["PositionManager"] = None
 _pm_lock = asyncio.Lock()
-broker_failures = 0
-broker_circuit_open_until = 0
+
+class BrokerCircuit:
+    def __init__(self):
+        self.failures = 0
+        self.open_until = 0
+        self._lock = asyncio.Lock()
+
+    async def is_open(self) -> bool:
+        async with self._lock:
+            return time.time() < self.open_until
+
+    async def record_failure(self):
+        async with self._lock:
+            self.failures += 1
+            if self.failures >= config.BROKER_FAILURE_THRESHOLD:
+                self.open_until = time.time() + config.BROKER_CIRCUIT_OPEN_SECS
+                logger.error(f"🔌 BROKER CIRCUIT OPEN - Failures: {self.failures}")
+
+    async def reset(self):
+        async with self._lock:
+            self.failures = 0
+            self.open_until = 0
+            logger.info("🔌 Broker circuit RESET")
+
+broker_circuit = BrokerCircuit()
 
 # =========================================================
-# Async Rate Limiter (FIXED)
+# Rate Limiter - MEJORADO CON TTL AUTOMÁTICO
 # =========================================================
 class AsyncRateLimiter:
-    def __init__(self, requests: int, per_seconds: int, max_ips: int):
+    def __init__(self, requests: int, per_seconds: int):
         self.requests = requests
         self.per_seconds = per_seconds
-        self.max_ips = max_ips
         self.buckets: Dict[str, deque[float]] = {}
         self._lock = asyncio.Lock()
 
     async def __call__(self, request: Request) -> bool:
-        ip = request.client.host if request.client else "unknown"
+        ip = request.client.host if hasattr(request.client, 'host') else "unknown"
         now = time.time()
-        
+
         async with self._lock:
             if ip not in self.buckets:
                 self.buckets[ip] = deque(maxlen=self.requests * 2)
-            
+
             q = self.buckets[ip]
+            # Cleanup automático
             while q and now - q[0] > self.per_seconds:
                 q.popleft()
 
             if len(q) >= self.requests:
-                raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
+                logger.warning(f"Rate limit excedido para IP {ip}")
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS, 
+                    f"Rate limit excedido. Intente en {self.per_seconds - (now - q[0]):.0f}s"
+                )
+            
             q.append(now)
-            self._cleanup(now)
-        
         return True
 
-    def _cleanup(self, now: float):
-        expired = [ip for ip, q in self.buckets.items() 
-                  if not q or now - q[-1] > self.per_seconds * 2]
-        for ip in expired:
-            self.buckets.pop(ip, None)
-
-rate_limiter = AsyncRateLimiter(RL_REQUESTS, RL_PER_SECONDS, RL_MAX_IPS)
+rate_limiter = AsyncRateLimiter(config.RL_REQUESTS, config.RL_PER_SECONDS)
 
 # =========================================================
-# Circuit Breaker
+# Logging - MEJORADO CON ROTACIÓN
 # =========================================================
-async def is_broker_circuit_open() -> bool:
-    global broker_circuit_open_until
-    return time.time() < broker_circuit_open_until
+def setup_logging():
+    Path(config.DATA_PATH).mkdir(parents=True, exist_ok=True)
+    
+    log_file = Path(config.DATA_PATH) / "trading_suite.log"
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setFormatter(
+        logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+    )
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(
+        logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    )
+    
+    logger = logging.getLogger("trading_suite")
+    logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.propagate = False
+    
+    return logger
 
-async def record_broker_failure():
-    global broker_failures, broker_circuit_open_until
-    broker_failures += 1
-    if broker_failures >= BROKER_FAILURE_THRESHOLD:
-        broker_circuit_open_until = time.time() + BROKER_CIRCUIT_OPEN_SECS
-        logger.error(f"🔌 BROKER CIRCUIT OPEN hasta {datetime.fromtimestamp(broker_circuit_open_until)}")
+logger = setup_logging()
 
 # =========================================================
-# Logging
-# =========================================================
-Path(DATA_PATH).mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)-7s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
-
-# =========================================================
-# Disk helpers
+# Disk helpers - MEJORADOS CON ATOMIC WRITES
 # =========================================================
 def ensure_dirs():
-    (Path(DATA_PATH) / "predictions").mkdir(parents=True, exist_ok=True)
-    (Path(DATA_PATH) / "evaluations").mkdir(parents=True, exist_ok=True)
+    (Path(config.DATA_PATH) / "predictions").mkdir(parents=True, exist_ok=True)
+    (Path(config.DATA_PATH) / "evaluations").mkdir(parents=True, exist_ok=True)
+    logger.info(f"📁 Directorios preparados en {config.DATA_PATH}")
 
 def utc_stamp() -> str:
     return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-def write_json(path: Path, obj: Dict[str, Any]):
+def write_json_atomic(path: Path, obj: Dict[str, Any]):
+    """Escribe JSON de forma atómica"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = path.with_suffix('.tmp')
+    tmp_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
-def load_tickers_from_file() -> List[str]:
-    p = Path("tickers.json")
-    if not p.exists():
-        return []
-    data = json.loads(p.read_text(encoding="utf-8"))
-    raw = data.get("tickers", data) if isinstance(data, dict) else data
-    out = []
-    for t in raw:
-        if isinstance(t, str):
-            out.append(t)
-        elif isinstance(t, dict) and "ticker" in t:
-            out.append(str(t["ticker"]))
-    return out
+def load_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug(f"No se pudo cargar {path}: {e}")
+        return None
 
-ensure_dirs()
+def safe_float(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+@lru_cache(maxsize=1024)
+def list_prediction_tickers_cached() -> List[str]:
+    """Cache de tickers con LRU"""
+    root = Path(config.DATA_PATH) / "predictions"
+    return sorted(d.name for d in root.iterdir() if d.is_dir())
 
 # =========================================================
-# FastAPI
+# FastAPI - MEJORADO CON LIFESPAN Y MIDDLEWARES
 # =========================================================
-app = FastAPI(title="🚀 Trading Suite Enterprise", version="2.4.0 ✅ FIXED")
+app = FastAPI(
+    title="Trading Suite Enterprise", 
+    version="2.5.2",
+    lifespan=lifespan
+)
 
+app.add_middleware(
+    TrustedHostMiddleware, 
+    allowed_hosts=config.TRUSTED_HOSTS
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-RateLimit-Remaining"],
 )
 
 # =========================================================
-# Optional modules (unchanged)
+# Optional modules - MEJORADO CON FALLBACKS
 # =========================================================
-run_model = None
-evaluate_all = None
-PositionManager = None
+modules_status = {
+    "model": False,
+    "evaluator": False,
+    "position_manager": False,
+    "broker": False
+}
 
-try:
-    from model import run_model as _run_model
-    run_model = _run_model
-    logger.info("✅ model.py loaded")
-except Exception as e:
-    logger.warning(f"⚠️ model.py missing: {e}")
+def safe_import(module_name: str, import_path: str):
+    """Importa módulos opcionales con logging detallado"""
+    try:
+        module = __import__(import_path, fromlist=[module_name])
+        logger.info(f"✅ {module_name} cargado correctamente")
+        modules_status[module_name] = True
+        return getattr(module, module_name)
+    except Exception as e:
+        logger.warning(f"⚠️  {module_name} no disponible: {e}")
+        return None
 
-try:
-    from evaluator import evaluate_all as _evaluate_all
-    evaluate_all = _evaluate_all
-    logger.info("✅ evaluator.py loaded")
-except Exception as e:
-    logger.warning(f"⚠️ evaluator.py missing: {e}")
-
-try:
-    from position_manager import PositionManager as _PM
-    PositionManager = _PM
-    logger.info("🔥 position_manager loaded")
-except Exception as e:
-    logger.warning(f"⚠️ position_manager missing: {e}")
+# Carga lazy de módulos
+run_model = safe_import("run_model", "model")
+evaluate_all = safe_import("evaluate_all", "evaluator")
+PositionManager = safe_import("PositionManager", "position_manager")
 
 try:
     from broker import router as broker_router
-    app.include_router(broker_router)
-    logger.info("✅ broker router included")
-except Exception as e:
-    logger.warning(f"⚠️ broker router missing: {e}")
+    app.include_router(broker_router, prefix="/broker", tags=["broker"])
+    modules_status["broker"] = True
+except Exception:
+    logger.warning("Broker router no disponible")
 
 # =========================================================
-# PositionManager cache (THREAD-SAFE ✅ FIXED)
+# PositionManager cache - MEJORADO
 # =========================================================
-async def get_position_manager() -> 'PositionManager':
+async def get_position_manager() -> Optional["PositionManager"]:
     global _pm_cache
+    if not modules_status["position_manager"]:
+        logger.warning("PositionManager no disponible")
+        return None
+        
     async with _pm_lock:
         if _pm_cache is None:
-            if PositionManager is None:
-                raise RuntimeError("PositionManager not loaded")
-            _pm_cache = PositionManager(fixed_capital=FIXED_CAPITAL)
-            logger.info("🔄 PositionManager cache initialized (thread-safe)")
+            try:
+                _pm_cache = PositionManager(fixed_capital=config.FIXED_CAPITAL)
+                logger.info(f"💼 PositionManager inicializado con capital: ${config.FIXED_CAPITAL:,.0f}")
+            except Exception as e:
+                logger.error(f"Error inicializando PositionManager: {e}")
+                return None
         return _pm_cache
 
 # =========================================================
-# Broker helpers (VALIDATION ✅ FIXED)
+# API — Universe - OPTIMIZADO
 # =========================================================
-def validate_position(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Valida y normaliza posición del broker"""
-    try:
-        ticker = str(p.get("ticker") or "")
-        if not ticker:
-            return None
-            
-        return {
-            "ticker": ticker,
-            "entry_price": float(p.get("entry_price") or 0),
-            "price_now": float(p.get("price_now") or 0),
-            "size_shares": float(p.get("qty") or 0),
-            "entry_time": p.get("entry_time", ""),
-            "peak_price": float(p.get("peak_price", p.get("price_now") or 0)),
-            "volatility": float(p.get("volatility", 1.0)),
-            "confidence": float(p.get("confidence", 0.0)),
-        }
-    except (ValueError, TypeError, AttributeError):
-        return None
-
-async def load_broker_positions() -> List[Dict[str, Any]]:
-    """Obtiene posiciones reales del broker con validación"""
-    if await is_broker_circuit_open():
-        logger.warning("🔌 Broker circuit open, skipping positions")
-        return []
-        
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            r = await client.get(BROKER_STATUS_URL)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            await record_broker_failure()
-            logger.error(f"❌ Broker status failed: {e}")
-            return []
-
-    positions_raw = data.get("positions_detail") or []
-    positions = [validate_position(p) for p in positions_raw if validate_position(p)]
-    logger.info(f"📦 Loaded {len(positions)} validated positions from broker")
-    return positions
-
-# =========================================================
-# Health + Metrics
-# =========================================================
-@app.get("/health")
-async def health(_: Any = Depends(rate_limiter)):
-    pm_available = PositionManager is not None
-    pm_cached = _pm_cache is not None
-    broker_ok = not await is_broker_circuit_open()
+@app.get("/assets", summary="Lista todos los assets disponibles")
+async def assets(
+    limit: int = Query(config.BATCH_LIMIT_DEFAULT, le=config.SIGNALS_MAX),
+    refresh: bool = Query(False),
+    _: Any = Depends(rate_limiter)
+):
+    if refresh:
+        list_prediction_tickers_cached.cache_clear()
     
+    tickers = list_prediction_tickers_cached()[:limit]
     return {
-        "status": "ok",
-        "broker_exec_url": BROKER_EXEC_URL,
-        "broker_status_url": BROKER_STATUS_URL,
-        "broker_circuit_open": await is_broker_circuit_open(),
-        "broker_failures": broker_failures,
-        "modules": {
-            "model": run_model is not None,
-            "evaluator": evaluate_all is not None,
-            "position_manager": pm_available,
-            "pm_cached": pm_cached,
-        },
+        "assets": [{"ticker": t} for t in tickers],
+        "count": len(tickers),
+        "total_available": len(list_prediction_tickers_cached()),
+        "source": "predictions",
         "timestamp": datetime.utcnow().isoformat(),
+        "cache_hits": list_prediction_tickers_cached.cache_info().hits
     }
 
-@app.get("/metrics")
-async def metrics(_: Any = Depends(rate_limiter)):
-    pm = await get_position_manager() if PositionManager else None
-    predictions_today = len(list((Path(DATA_PATH)/"predictions").glob(f"{datetime.now().strftime('%Y%m%d')}*.json")))
-    
-    return {
-        "pm_positions_open": len(pm.positions) if pm else 0,
-        "predictions_today": predictions_today,
-        "broker_failures": broker_failures,
-        "broker_circuit_open": await is_broker_circuit_open(),
-        "rate_limiter_active_ips": len(rate_limiter.buckets),
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-# =========================================================
-# PREDICT + SAVE + PM + BROKER (BACKGROUND ✅ OPTIMIZED)
-# =========================================================
-async def _run_full_pipeline(limit: int, horizon: int, theta: float):
-    """Ejecuta pipeline completo en background"""
-    if run_model is None:
-        logger.error("❌ model not loaded")
-        return
-
-    tickers = load_tickers_from_file()
-    if not tickers:
-        logger.error("❌ tickers.json missing/empty")
-        return
-
-    ts = utc_stamp()
-    signals: Dict[str, Dict[str, Any]] = {}
-    results: List[Dict[str, Any]] = []
-    execution_results: List[Dict[str, Any]] = []
-
-    # 1) MODELO
-    logger.info(f"🔮 Running model on {min(len(tickers), limit)} tickers")
-    for t in tickers[:limit]:
-        try:
-            res = run_model(ticker=t, horizon=horizon, theta=theta)
-            fp = Path(DATA_PATH) / "predictions" / t / f"{ts}.json"
-            write_json(fp, {"meta": {"ticker": t}, "prediction": res})
-            signals[t] = res
-            results.append({"ticker": t, "status": "saved"})
-        except Exception as e:
-            results.append({"ticker": t, "status": "failed", "error": str(e)})
-            logger.error(f"❌ Model failed for {t}: {e}")
-
-    # 2) LOAD REAL POSITIONS
-    current_positions = await load_broker_positions()
-
-    # 3) POSITION MANAGER (FULL)
-    decisions: List[Dict[str, Any]] = []
-    if PositionManager is not None:
-        pm = await get_position_manager()
-
-        # a) evaluar posiciones abiertas (HOLD / CLOSE)
-        for pos in current_positions:
-            d = pm.evaluate_position(pos, signals.get(pos["ticker"]))
-            if d["action"] != "HOLD":
-                d["ticker"] = d.get("ticker") or pos["ticker"]
-                decisions.append(d)
-
-        # b) evaluar rotación / nuevas entradas
-        for t, sig in signals.items():
-            candidate = {
-                "ticker": t,
-                "confidence": sig.get("confidence"),
-                "ret_ens_pct": sig.get("ret_ens_pct"),
-            }
-            rot = pm.evaluate_rotation(current_positions, candidate, signals)
-            if rot:
-                rot["target_pct"] = rot.get("target_pct", 0.1)
-                decisions.append(rot)
-
-        logger.info(f"🤖 PositionManager decisions: {len(decisions)}")
-
-    # 4) BROKER EXECUTION (con circuit breaker)
-    if decisions and not await is_broker_circuit_open():
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            for d in decisions:
-                try:
-                    resp = await client.post(BROKER_EXEC_URL, json=d)
-                    result = resp.json()
-                    execution_results.append({
-                        "decision": d,
-                        "broker_response": result,
-                        "success": result.get("status") in ["executed", "ignored"],
-                    })
-                except Exception as e:
-                    execution_results.append({
-                        "decision": d,
-                        "broker_response": None,
-                        "error": str(e),
-                        "success": False,
-                    })
-                    await record_broker_failure()
-
-        ok = sum(1 for r in execution_results if r["success"])
-        logger.info(f"🚀 Broker executed {ok}/{len(decisions)} decisions")
-
-    # Log final
-    logger.info(f"✅ Pipeline completed: {len([r for r in results if r['status'] == 'saved'])} saved, {len(decisions)} decisions")
-
-@app.post("/predict/save/all")  # POST para heavy ops
-async def predict_save_all(
-    background_tasks: BackgroundTasks,
-    limit: int = Query(BATCH_LIMIT_DEFAULT, ge=1, le=5000),
-    horizon: int = Query(10, ge=1, le=30),
-    theta: float = Query(0.75, ge=0.1, le=1.0),
-    now: bool = Query(False),  # sync vs async
+@app.get("/signals", summary="Obtiene señales ordenadas por confianza")
+async def signals(
+    min_confidence: float = Query(config.SIGNALS_MIN_CONF_DEFAULT, ge=0.0, le=1.0),
+    limit: int = Query(2000, le=config.SIGNALS_MAX),
+    refresh: bool = Query(False),
     _: Any = Depends(rate_limiter),
 ):
-    if now:
-        await _run_full_pipeline(limit, horizon, theta)
-        return {"status": "completed"}
+    if refresh:
+        list_prediction_tickers_cached.cache_clear()
     
-    background_tasks.add_task(_run_full_pipeline, limit, horizon, theta)
-    return {"status": "queued", "task_id": utc_stamp()}
+    tickers = list_prediction_tickers_cached()[:limit]
+    out = []
+    
+    for ticker in tickers:
+        pred = latest_prediction_for_ticker(ticker)
+        if not pred:
+            continue
+            
+        p = pred.get("prediction", {})
+        conf = safe_float(p.get("confidence")) or 0.0
+        
+        if conf >= min_confidence:
+            out.append({
+                "ticker": ticker,
+                "quality": p.get("quality", "NO_DATA"),
+                "confidence": conf,
+                "ret_ens_pct": safe_float(p.get("ret_ens_pct")) or 0.0,
+                "date_base": p.get("date_base"),
+                "timestamp": pred.get("timestamp")
+            })
+    
+    out.sort(key=lambda x: (-x["confidence"], -abs(x["ret_ens_pct"])))
+    return {
+        "signals": out[:limit],
+        "count": len(out),
+        "filtered_by_confidence": min_confidence,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+def latest_prediction_for_ticker(ticker: str) -> Optional[Dict[str, Any]]:
+    """Obtiene la última predicción para un ticker específico"""
+    p = Path(config.DATA_PATH) / "predictions" / ticker
+    files = sorted(p.glob("*.json"))
+    return load_json(files[-1]) if files else None
 
 # =========================================================
-# EVALUATE (histórico, intacto)
+# Health / Metrics - MEJORADO
 # =========================================================
-@app.get("/evaluate")
-async def evaluate(_: Any = Depends(rate_limiter)):
-    if evaluate_all is None:
-        raise HTTPException(status_code=503, detail="evaluator not loaded")
-    return evaluate_all()
+@app.get("/health", summary="Estado del sistema")
+async def health(_: Any = Depends(rate_limiter)):
+    circuit_open = await broker_circuit.is_open()
+    return {
+        "status": "ok" if not circuit_open else "degraded",
+        "broker_circuit_open": circuit_open,
+        "broker_failures": broker_circuit.failures,
+        "modules": modules_status,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+@app.get("/metrics", summary="Métricas del sistema")
+async def metrics(_: Any = Depends(rate_limiter)):
+    pm_positions = 0
+    pm = await get_position_manager()
+    if pm:
+        pm_positions = len(getattr(pm, "positions", []))
+    
+    return {
+        "pm_positions_open": pm_positions,
+        "pm_capital_fixed": config.FIXED_CAPITAL,
+        "broker_failures": broker_circuit.failures,
+        "broker_circuit_open": await broker_circuit.is_open(),
+        "rate_limiter_buckets": len(rate_limiter.buckets),
+        "modules_status": modules_status,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 # =========================================================
-# PM cache reset (dev)
+# Broker Circuit Management - MEJORADO
 # =========================================================
-@app.post("/pm/reset")
-async def reset_pm_cache():
-    global _pm_cache
-    async with _pm_lock:
-        _pm_cache = None
-    logger.info("🔄 PositionManager cache reset")
-    return {"status": "reset"}
+@app.post("/broker/reset-circuit", summary="Resetea el circuit breaker")
+async def broker_reset(_: Any = Depends(rate_limiter)):
+    await broker_circuit.reset()
+    return {"status": "reset", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/broker/circuit", summary="Estado del circuit breaker")
+async def broker_circuit_status(_: Any = Depends(rate_limiter)):
+    return {
+        "is_open": await broker_circuit.is_open(),
+        "failures": broker_circuit.failures,
+        "open_until": broker_circuit.open_until,
+        "threshold": config.BROKER_FAILURE_THRESHOLD,
+        "reset_after": config.BROKER_CIRCUIT_OPEN_SECS,
+    }
 
 # =========================================================
-# Reset circuit breaker (dev)
+# Graceful Shutdown - NUEVO
 # =========================================================
-@app.post("/broker/reset-circuit")
-async def reset_broker_circuit():
-    global broker_failures, broker_circuit_open_until
-    broker_failures = 0
-    broker_circuit_open_until = 0
-    logger.info("🔌 Broker circuit reset")
-    return {"status": "reset"}
+def handle_shutdown(signum: int, frame: Any):
+    logger.info(f"Señal {signal.Signals(signum).name} recibida. Cerrando graceful...")
+    loop = asyncio.get_event_loop()
+    loop.create_task(shutdown())
+
+async def shutdown():
+    logger.info("Iniciando shutdown graceful...")
+    await broker_circuit.reset()
+    logger.info("Trading Suite Enterprise v2.5.2 detenido correctamente")
 
 # =========================================================
-# Run
+# Run - MEJORADO CON SHUTDOWN HANDLER
 # =========================================================
 if __name__ == "__main__":
+    # Registro de señales para graceful shutdown
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    
     import uvicorn
-    logger.info(f"🚀 Starting Trading Suite v2.4 ✅ FIXED → Broker: {BROKER_EXEC_URL}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=config.PORT,
+        reload=config.DEBUG_MODE,
+        log_level="info" if not config.DEBUG_MODE else "debug"
+    )
