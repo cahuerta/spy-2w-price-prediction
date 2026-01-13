@@ -8,7 +8,7 @@ import logging
 import time
 import asyncio
 import signal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Deque
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -166,7 +166,7 @@ class AsyncRateLimiter:
         self.requests = requests
         self.per_seconds = per_seconds
         self.max_ips = max_ips
-        self.buckets: Dict[str, deque[float]] = {}
+        self.buckets: Dict[str, Deque[float]] = {}
         self._lock = asyncio.Lock()
 
     async def __call__(self, request: Request) -> bool:
@@ -314,7 +314,6 @@ async def dashboard_predictions(
     request: Request,
     _=Depends(verify_rate_limit)
 ):
-    """Predicciones por ticker - ORDENADAS CRONOLOGICAMENTE"""
     pred_dir = Path(config.DATA_PATH) / "predictions" / ticker
     if not pred_dir.exists():
         return {"data": [], "ticker": ticker, "count": 0}
@@ -342,7 +341,6 @@ async def dashboard_evaluations(
     request: Request,
     _=Depends(verify_rate_limit)
 ):
-    """Evaluaciones por ticker - ORDENADAS CRONOLOGICAMENTE"""
     eval_dir = Path(config.DATA_PATH) / "evaluations" / ticker
     if not eval_dir.exists():
         return {"data": [], "ticker": ticker, "count": 0}
@@ -369,7 +367,6 @@ async def dashboard_tickers(
     request: Request,
     _=Depends(verify_rate_limit)
 ):
-    """Lista todos los tickers con predicciones"""
     tickers = list_prediction_tickers_cached()
     return {
         "tickers": tickers,
@@ -379,7 +376,6 @@ async def dashboard_tickers(
 
 @app.get("/dashboard/latest/{ticker}")
 async def dashboard_latest(ticker: str, request: Request, _=Depends(verify_rate_limit)):
-    """Última predicción para ticker específico"""
     pred = latest_prediction_for_ticker(ticker)
     if not pred:
         raise HTTPException(404, f"No predictions found for {ticker}")
@@ -409,7 +405,7 @@ async def shutdown():
 
 def signal_handler(signum: int, frame: Any):
     asyncio.create_task(shutdown())
-    time.sleep(2)  # Grace period
+    time.sleep(2)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_shutdown)
@@ -422,4 +418,4 @@ if __name__ == "__main__":
         port=config.PORT,
         reload=config.DEBUG_MODE,
         log_level="error" if not config.DEBUG_MODE else "debug",
-    )
+)
