@@ -22,7 +22,6 @@ from functools import lru_cache
 
 from fastapi import FastAPI, Query, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse   # <-- ÚNICO IMPORT AGREGADO
 
 # =========================================================
 # Config
@@ -219,43 +218,171 @@ app.add_middleware(
 )
 
 # =========================================================
-# DASHBOARD ENDPOINT (ÚNICO AGREGADO)
+# Optional modules - fallbacks
 # =========================================================
-@app.get("/dashboard", response_class=HTMLResponse, summary="Dashboard")
-async def dashboard():
-    return """
-<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<title>Trading Suite Dashboard</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<style>
-body{background:#020617;color:#e5e7eb;font-family:system-ui;padding:20px}
-h1{color:#38bdf8}
-table{width:100%;border-collapse:collapse}
-th,td{padding:8px;border-bottom:1px solid #1e293b}
-</style>
-</head>
-<body>
-<h1>📈 Trading Suite – Signals</h1>
-<table id="t"><thead><tr><th>Ticker</th><th>Conf</th><th>Ret%</th><th>Quality</th></tr></thead><tbody></tbody></table>
-<script>
-fetch('/signals?limit=50')
-.then(r=>r.json())
-.then(d=>{
- const b=document.querySelector('#t tbody');
- d.signals.forEach(s=>{
-  const tr=document.createElement('tr');
-  tr.innerHTML=`<td>${s.ticker}</td><td>${(s.confidence*100).toFixed(1)}%</td><td>${s.ret_ens_pct.toFixed(2)}</td><td>${s.quality}</td>`;
-  b.appendChild(tr);
- });
-});
-</script>
-</body>
-</html>
-"""
+modules_status = {
+    "model": False,
+    "evaluator": False,
+    "position_manager": False,
+    "broker": False,
+}
+
+try:
+    from model import run_model as run_model
+    modules_status["model"] = True
+    logger.info("✅ model.py loaded")
+except Exception as e:
+    run_model = None
+    logger.warning(f"⚠️ model.py missing: {e}")
+
+try:
+    from evaluator import evaluate_all as evaluate_all
+    modules_status["evaluator"] = True
+    logger.info("✅ evaluator.py loaded")
+except Exception as e:
+    evaluate_all = None
+    logger.warning(f"⚠️ evaluator.py missing: {e}")
+
+try:
+    from position_manager import PositionManager as PositionManager
+    modules_status["position_manager"] = True
+    logger.info("🔥 position_manager loaded")
+except Exception as e:
+    PositionManager = None
+    logger.warning(f"⚠️ position_manager missing: {e}")
+
+try:
+    from broker import router as broker_router
+    app.include_router(broker_router)
+    modules_status["broker"] = True
+    logger.info("✅ broker router included")
+except Exception as e:
+    logger.warning(f"⚠️ broker router missing: {e}")
+
+# =========================================================
+# PositionManager cache
+# =========================================================
+async def get_position_manager() -> Optional["PositionManager"]:
+    global _pm_cache
+    if PositionManager is None:
+        return None
+
+    async with _pm_lock:
+        if _pm_cache is None:
+            try:
+                _pm_cache = PositionManager(fixed_capital=config.FIXED_CAPITAL)
+                logger.info(f"💼 PositionManager inicializado con capital: ${config.FIXED_CAPITAL:,.0f}")
+            except Exception as e:
+                logger.error(f"Error inicializando PositionManager: {e}")
+                return None
+        return _pm_cache
+
+# =========================================================
+# Signals helpers (FIX ✅)
+# =========================================================
+def derive_confidence_from_ret(ret_ens_pct: float) -> float:
+    """
+    Convierte retorno esperado (en %) a confianza [0..1].
+    Regla simple y estable: 1.0% => 1.0 (cap).
+    """
+    try:
+        return min(1.0, abs(float(ret_ens_pct)) / 1.0)
+    except Exception:
+        return 0.0
+
+def derive_quality_from_ret(ret_ens_pct: float) -> str:
+    """
+    Calidad semántica desde magnitud de retorno esperado.
+    """
+    try:
+        r = abs(float(ret_ens_pct))
+    except Exception:
+        return "NO_DATA"
+
+    if r >= 1.0:
+        return "🔥 STRONG"
+    if r >= 0.5:
+        return "✅ GOOD"
+    if r > 0.0:
+        return "⚠️ WEAK"
+    return "❌ NOISE"
+
+# =========================================================
+# Universe API
+# =========================================================
+@app.get("/assets", summary="Lista todos los assets disponibles")
+async def assets(
+    limit: int = Query(config.BATCH_LIMIT_DEFAULT, ge=1, le=config.SIGNALS_MAX),
+    refresh: bool = Query(False),
+    _: Any = Depends(rate_limiter),
+):
+    if refresh:
+        list_prediction_tickers_cached.cache_clear()
+
+    all_tickers = list_prediction_tickers_cached()
+    tickers = all_tickers[:limit]
+    return {
+        "assets": [{"ticker": t} for t in tickers],
+        "count": len(tickers),
+        "total_available": len(all_tickers),
+        "source": "predictions",
+        "timestamp": datetime.utcnow().isoformat(),
+        "cache_hits": list_prediction_tickers_cached.cache_info().hits,
+    }
+
+@app.get("/signals", summary="Obtiene señales ordenadas por confianza")
+async def signals(
+    min_confidence: float = Query(config.SIGNALS_MIN_CONF_DEFAULT, ge=0.0, le=1.0),
+    limit: int = Query(2000, ge=1, le=config.SIGNALS_MAX),
+    refresh: bool = Query(False),
+    _: Any = Depends(rate_limiter),
+):
+    if refresh:
+        list_prediction_tickers_cached.cache_clear()
+
+    tickers = list_prediction_tickers_cached()
+    out: List[Dict[str, Any]] = []
+
+    for ticker in tickers:
+        pred = latest_prediction_for_ticker(ticker)
+        if not pred:
+            continue
+
+        p = pred.get("prediction", {}) or {}
+
+        # 🔑 tu JSON real trae ret_ens_pct
+        ret_ens = safe_float(p.get("ret_ens_pct")) or 0.0
+
+        # ✅ derivamos confianza + quality si no vienen
+        conf = safe_float(p.get("confidence"))
+        if conf is None:
+            conf = derive_confidence_from_ret(ret_ens)
+
+        quality = p.get("quality") or p.get("signal_quality")
+        if not quality:
+            quality = derive_quality_from_ret(ret_ens)
+
+        if conf < min_confidence:
+            continue
+
+        out.append({
+            "ticker": ticker,
+            "quality": quality,
+            "confidence": float(conf),
+            "ret_ens_pct": float(ret_ens),
+            "date_base": p.get("date_base") or p.get("date"),
+            "recommendation": p.get("recommendation"),
+            "price_now": safe_float(p.get("price_now")),
+            "price_pred": safe_float(p.get("price_pred")),
+        })
+
+    out.sort(key=lambda x: (-x["confidence"], -abs(x["ret_ens_pct"])))
+    return {
+        "signals": out[:limit],
+        "count": len(out[:limit]),
+        "filtered_by_confidence": min_confidence,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 # =========================================================
 # Health / Metrics
