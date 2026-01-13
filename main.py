@@ -114,7 +114,6 @@ _pm_cache: Optional["PositionManager"] = None
 _pm_lock = asyncio.Lock()
 
 async def get_position_manager() -> "PositionManager":
-    """Lazy init thread-safe PositionManager"""
     global _pm_cache
     if _pm_cache is None:
         async with _pm_lock:
@@ -249,45 +248,33 @@ modules_status = {
     "broker": False,
 }
 
-# Model (opcional)
 try:
     from model import run_model
     modules_status["model"] = True
-    logger.info("✅ Módulo MODEL cargado")
-except Exception as e:
-    logger.warning(f"⚠️ Módulo MODEL no disponible: {e}")
+except Exception:
     run_model = None
 
-# Evaluator (opcional)  
 try:
     from evaluator import evaluate_all
     modules_status["evaluator"] = True
-    logger.info("✅ Módulo EVALUATOR cargado")
-except Exception as e:
-    logger.warning(f"⚠️ Módulo EVALUATOR no disponible: {e}")
+except Exception:
     evaluate_all = None
 
-# PositionManager (lazy loaded)
 try:
     from position_manager import PositionManager
     modules_status["position_manager"] = True
-    logger.info("✅ PositionManager disponible")
-except Exception as e:
-    logger.warning(f"⚠️ PositionManager no disponible: {e}")
+except Exception:
+    pass
 
-# Broker Router (opcional)
 try:
     from broker import router as broker_router
     app.include_router(broker_router, prefix="/trading")
     modules_status["broker"] = True
-    logger.info("✅ Broker router cargado")
-except Exception as e:
-    logger.warning(f"⚠️ Broker router no disponible: {e}")
-
-logger.info(f"📊 Estado módulos: {modules_status}")
+except Exception:
+    pass
 
 # =========================================================
-# HEALTH CHECK - PRODUCTION READY
+# HEALTH CHECK
 # =========================================================
 @app.get("/health")
 async def health_check():
@@ -299,19 +286,13 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
-@app.get("/health/broker")
-async def broker_health():
-    if await broker_circuit.is_open():
-        raise HTTPException(503, "Broker circuit abierto")
-    return {"broker": "available"}
-
 # =========================================================
-# DASHBOARD ENDPOINTS - RATE LIMITED
+# DASHBOARD ENDPOINTS (FIXED PARAM ORDER)
 # =========================================================
 @app.get("/dashboard/predictions")
 async def dashboard_predictions(
-    ticker: str = Query(...),
     request: Request,
+    ticker: str = Query(...),
     _=Depends(verify_rate_limit)
 ):
     pred_dir = Path(config.DATA_PATH) / "predictions" / ticker
@@ -322,23 +303,14 @@ async def dashboard_predictions(
     for f in sorted(pred_dir.glob("*.json")):
         j = load_json(f)
         if j and "prediction" in j:
-            data.append({
-                **j,
-                "filename": f.name,
-                "timestamp": f.stat().st_mtime
-            })
+            data.append({**j, "filename": f.name, "timestamp": f.stat().st_mtime})
 
-    return {
-        "ticker": ticker, 
-        "count": len(data),
-        "latest": data[-1] if data else None,
-        "data": data
-    }
+    return {"ticker": ticker, "count": len(data), "latest": data[-1] if data else None, "data": data}
 
 @app.get("/dashboard/evaluations")
 async def dashboard_evaluations(
-    ticker: str = Query(...),
     request: Request,
+    ticker: str = Query(...),
     _=Depends(verify_rate_limit)
 ):
     eval_dir = Path(config.DATA_PATH) / "evaluations" / ticker
@@ -349,18 +321,9 @@ async def dashboard_evaluations(
     for f in sorted(eval_dir.glob("*.json")):
         j = load_json(f)
         if j:
-            data.append({
-                **j,
-                "filename": f.name,
-                "timestamp": f.stat().st_mtime
-            })
+            data.append({**j, "filename": f.name, "timestamp": f.stat().st_mtime})
 
-    return {
-        "ticker": ticker,
-        "count": len(data),
-        "latest": data[-1] if data else None,
-        "data": data
-    }
+    return {"ticker": ticker, "count": len(data), "latest": data[-1] if data else None, "data": data}
 
 @app.get("/dashboard/tickers")
 async def dashboard_tickers(
@@ -368,49 +331,34 @@ async def dashboard_tickers(
     _=Depends(verify_rate_limit)
 ):
     tickers = list_prediction_tickers_cached()
-    return {
-        "tickers": tickers,
-        "count": len(tickers),
-        "cache_hits": list_prediction_tickers_cached.cache_info()
-    }
+    return {"tickers": tickers, "count": len(tickers), "cache_hits": list_prediction_tickers_cached.cache_info()}
 
 @app.get("/dashboard/latest/{ticker}")
-async def dashboard_latest(ticker: str, request: Request, _=Depends(verify_rate_limit)):
+async def dashboard_latest(
+    request: Request,
+    ticker: str,
+    _=Depends(verify_rate_limit)
+):
     pred = latest_prediction_for_ticker(ticker)
     if not pred:
         raise HTTPException(404, f"No predictions found for {ticker}")
     return {"ticker": ticker, "latest": pred}
 
 # =========================================================
-# POSITION MANAGER ENDPOINTS
+# POSITION MANAGER ENDPOINT
 # =========================================================
 @app.get("/positions")
-async def get_positions(request: Request, _=Depends(verify_rate_limit)):
-    try:
-        pm = await get_position_manager()
-        return await pm.get_positions()
-    except Exception as e:
-        logger.error(f"Positions error: {e}")
-        raise HTTPException(503, "PositionManager no disponible")
+async def get_positions(
+    request: Request,
+    _=Depends(verify_rate_limit)
+):
+    pm = await get_position_manager()
+    return await pm.get_positions()
 
 # =========================================================
-# GRACEFUL SHUTDOWN - ENTERPRISE
+# MAIN
 # =========================================================
-def handle_shutdown(signum: int, frame: Any):
-    logger.info(f"🛑 Señal {signal.Signals(signum).name} recibida. Cerrando graceful...")
-
-async def shutdown():
-    await broker_circuit.reset()
-    logger.info("✅ Todos los recursos liberados")
-
-def signal_handler(signum: int, frame: Any):
-    asyncio.create_task(shutdown())
-    time.sleep(2)
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
-
     import uvicorn
     uvicorn.run(
         "main:app",
@@ -418,4 +366,4 @@ if __name__ == "__main__":
         port=config.PORT,
         reload=config.DEBUG_MODE,
         log_level="error" if not config.DEBUG_MODE else "debug",
-)
+            )
