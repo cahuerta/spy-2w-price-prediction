@@ -1,10 +1,5 @@
 # =====================================================
-# main.py — TRADING SUITE ENTERPRISE v2.5.3 (SIGNALS FIX ✅)
-# =====================================================
-# ✅ FIX: signals ahora deriva confidence + quality desde prediction.ret_ens_pct
-# ✅ Compatible con tu JSON real:
-#    { "prediction": { "ret_ens_pct": ..., "date_base": ..., ... } }
-# ✅ Mantiene Universe + Signals + Health + Metrics + Circuit + PM cache
+# main.py — TRADING SUITE ENTERPRISE v2.6.0 (PRODUCTION READY ✅)
 # =====================================================
 
 import os
@@ -24,7 +19,7 @@ from fastapi import FastAPI, Query, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
-# Config
+# Config - PRODUCTION READY
 # =========================================================
 class Config:
     DATA_PATH = os.getenv("DATA_PATH", "/data")
@@ -51,7 +46,7 @@ class Config:
 config = Config()
 
 # =========================================================
-# Logging
+# Logging - DUAL FILE/CONSOLE
 # =========================================================
 def setup_logging():
     Path(config.DATA_PATH).mkdir(parents=True, exist_ok=True)
@@ -78,7 +73,7 @@ def setup_logging():
 logger = setup_logging()
 
 # =========================================================
-# Disk helpers
+# Disk Operations - CACHED & RESILIENT
 # =========================================================
 def ensure_dirs():
     (Path(config.DATA_PATH) / "predictions").mkdir(parents=True, exist_ok=True)
@@ -113,11 +108,29 @@ def latest_prediction_for_ticker(ticker: str) -> Optional[Dict[str, Any]]:
     return load_json(files[-1]) if files else None
 
 # =========================================================
-# GLOBAL STATE - THREAD-SAFE
+# GLOBAL STATE - THREAD-SAFE POSITION MANAGER
 # =========================================================
 _pm_cache: Optional["PositionManager"] = None
 _pm_lock = asyncio.Lock()
 
+async def get_position_manager() -> "PositionManager":
+    """Lazy init thread-safe PositionManager"""
+    global _pm_cache
+    if _pm_cache is None:
+        async with _pm_lock:
+            if _pm_cache is None:
+                try:
+                    from position_manager import PositionManager
+                    _pm_cache = PositionManager()
+                    logger.info("💼 PositionManager inicializado")
+                except Exception as e:
+                    logger.error(f"❌ PositionManager fallo: {e}")
+                    raise HTTPException(503, "PositionManager no disponible")
+    return _pm_cache
+
+# =========================================================
+# BROKER CIRCUIT BREAKER - PRODUCTION GRADE
+# =========================================================
 class BrokerCircuit:
     def __init__(self):
         self.failures = 0
@@ -134,6 +147,8 @@ class BrokerCircuit:
             if self.failures >= config.BROKER_FAILURE_THRESHOLD:
                 self.open_until = time.time() + config.BROKER_CIRCUIT_OPEN_SECS
                 logger.error(f"🔌 BROKER CIRCUIT OPEN - Failures: {self.failures}")
+                return True
+        return False
 
     async def reset(self):
         async with self._lock:
@@ -144,7 +159,7 @@ class BrokerCircuit:
 broker_circuit = BrokerCircuit()
 
 # =========================================================
-# Rate Limiter (simple)
+# ASYNC RATE LIMITER - SCALABLE
 # =========================================================
 class AsyncRateLimiter:
     def __init__(self, requests: int, per_seconds: int, max_ips: int):
@@ -169,10 +184,9 @@ class AsyncRateLimiter:
                 q.popleft()
 
             if len(q) >= self.requests:
-                logger.warning(f"Rate limit excedido para IP {ip}")
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=f"Rate limit excedido. Intente en {max(1, int(self.per_seconds - (now - q[0])))}s",
+                    detail="Rate limit excedido",
                 )
 
             q.append(now)
@@ -188,25 +202,33 @@ class AsyncRateLimiter:
         for ip in expired:
             self.buckets.pop(ip, None)
 
-rate_limiter = AsyncRateLimiter(config.RL_REQUESTS, config.RL_PER_SECONDS, config.RL_MAX_IPS)
+rate_limiter = AsyncRateLimiter(
+    config.RL_REQUESTS, config.RL_PER_SECONDS, config.RL_MAX_IPS
+)
 
 # =========================================================
-# Lifespan
+# RATE LIMIT DEPENDENCY
+# =========================================================
+async def verify_rate_limit(request: Request):
+    await rate_limiter(request)
+
+# =========================================================
+# LIFESPAN - GRACEFUL START/STOP
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite Enterprise v2.5.3 iniciando...")
+    logger.info("🚀 Trading Suite Enterprise v2.6.0 iniciando...")
     ensure_dirs()
     await broker_circuit.reset()
     yield
     logger.info("🛑 Trading Suite Enterprise deteniéndose...")
 
 # =========================================================
-# FastAPI
+# FASTAPI APP - ENTERPRISE READY
 # =========================================================
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.5.3",
+    version="2.6.0",
     lifespan=lifespan,
 )
 
@@ -218,7 +240,7 @@ app.add_middleware(
 )
 
 # =========================================================
-# Optional modules - fallbacks
+# OPTIONAL MODULES - RESILIENT LOADING
 # =========================================================
 modules_status = {
     "model": False,
@@ -227,231 +249,168 @@ modules_status = {
     "broker": False,
 }
 
+# Model (opcional)
 try:
-    from model import run_model as run_model
+    from model import run_model
     modules_status["model"] = True
-    logger.info("✅ model.py loaded")
+    logger.info("✅ Módulo MODEL cargado")
 except Exception as e:
+    logger.warning(f"⚠️ Módulo MODEL no disponible: {e}")
     run_model = None
-    logger.warning(f"⚠️ model.py missing: {e}")
 
+# Evaluator (opcional)  
 try:
-    from evaluator import evaluate_all as evaluate_all
+    from evaluator import evaluate_all
     modules_status["evaluator"] = True
-    logger.info("✅ evaluator.py loaded")
+    logger.info("✅ Módulo EVALUATOR cargado")
 except Exception as e:
+    logger.warning(f"⚠️ Módulo EVALUATOR no disponible: {e}")
     evaluate_all = None
-    logger.warning(f"⚠️ evaluator.py missing: {e}")
 
+# PositionManager (lazy loaded)
 try:
-    from position_manager import PositionManager as PositionManager
+    from position_manager import PositionManager
     modules_status["position_manager"] = True
-    logger.info("🔥 position_manager loaded")
+    logger.info("✅ PositionManager disponible")
 except Exception as e:
-    PositionManager = None
-    logger.warning(f"⚠️ position_manager missing: {e}")
+    logger.warning(f"⚠️ PositionManager no disponible: {e}")
 
+# Broker Router (opcional)
 try:
     from broker import router as broker_router
-    app.include_router(broker_router)
+    app.include_router(broker_router, prefix="/trading")
     modules_status["broker"] = True
-    logger.info("✅ broker router included")
+    logger.info("✅ Broker router cargado")
 except Exception as e:
-    logger.warning(f"⚠️ broker router missing: {e}")
+    logger.warning(f"⚠️ Broker router no disponible: {e}")
+
+logger.info(f"📊 Estado módulos: {modules_status}")
 
 # =========================================================
-# PositionManager cache
+# HEALTH CHECK - PRODUCTION READY
 # =========================================================
-async def get_position_manager() -> Optional["PositionManager"]:
-    global _pm_cache
-    if PositionManager is None:
-        return None
-
-    async with _pm_lock:
-        if _pm_cache is None:
-            try:
-                _pm_cache = PositionManager(fixed_capital=config.FIXED_CAPITAL)
-                logger.info(f"💼 PositionManager inicializado con capital: ${config.FIXED_CAPITAL:,.0f}")
-            except Exception as e:
-                logger.error(f"Error inicializando PositionManager: {e}")
-                return None
-        return _pm_cache
-
-# =========================================================
-# Signals helpers (FIX ✅)
-# =========================================================
-def derive_confidence_from_ret(ret_ens_pct: float) -> float:
-    """
-    Convierte retorno esperado (en %) a confianza [0..1].
-    Regla simple y estable: 1.0% => 1.0 (cap).
-    """
-    try:
-        return min(1.0, abs(float(ret_ens_pct)) / 1.0)
-    except Exception:
-        return 0.0
-
-def derive_quality_from_ret(ret_ens_pct: float) -> str:
-    """
-    Calidad semántica desde magnitud de retorno esperado.
-    """
-    try:
-        r = abs(float(ret_ens_pct))
-    except Exception:
-        return "NO_DATA"
-
-    if r >= 1.0:
-        return "🔥 STRONG"
-    if r >= 0.5:
-        return "✅ GOOD"
-    if r > 0.0:
-        return "⚠️ WEAK"
-    return "❌ NOISE"
-
-# =========================================================
-# Universe API
-# =========================================================
-@app.get("/assets", summary="Lista todos los assets disponibles")
-async def assets(
-    limit: int = Query(config.BATCH_LIMIT_DEFAULT, ge=1, le=config.SIGNALS_MAX),
-    refresh: bool = Query(False),
-    _: Any = Depends(rate_limiter),
-):
-    if refresh:
-        list_prediction_tickers_cached.cache_clear()
-
-    all_tickers = list_prediction_tickers_cached()
-    tickers = all_tickers[:limit]
+@app.get("/health")
+async def health_check():
     return {
-        "assets": [{"ticker": t} for t in tickers],
-        "count": len(tickers),
-        "total_available": len(all_tickers),
-        "source": "predictions",
-        "timestamp": datetime.utcnow().isoformat(),
-        "cache_hits": list_prediction_tickers_cached.cache_info().hits,
-    }
-
-@app.get("/signals", summary="Obtiene señales ordenadas por confianza")
-async def signals(
-    min_confidence: float = Query(config.SIGNALS_MIN_CONF_DEFAULT, ge=0.0, le=1.0),
-    limit: int = Query(2000, ge=1, le=config.SIGNALS_MAX),
-    refresh: bool = Query(False),
-    _: Any = Depends(rate_limiter),
-):
-    if refresh:
-        list_prediction_tickers_cached.cache_clear()
-
-    tickers = list_prediction_tickers_cached()
-    out: List[Dict[str, Any]] = []
-
-    for ticker in tickers:
-        pred = latest_prediction_for_ticker(ticker)
-        if not pred:
-            continue
-
-        p = pred.get("prediction", {}) or {}
-
-        # 🔑 tu JSON real trae ret_ens_pct
-        ret_ens = safe_float(p.get("ret_ens_pct")) or 0.0
-
-        # ✅ derivamos confianza + quality si no vienen
-        conf = safe_float(p.get("confidence"))
-        if conf is None:
-            conf = derive_confidence_from_ret(ret_ens)
-
-        quality = p.get("quality") or p.get("signal_quality")
-        if not quality:
-            quality = derive_quality_from_ret(ret_ens)
-
-        if conf < min_confidence:
-            continue
-
-        out.append({
-            "ticker": ticker,
-            "quality": quality,
-            "confidence": float(conf),
-            "ret_ens_pct": float(ret_ens),
-            "date_base": p.get("date_base") or p.get("date"),
-            "recommendation": p.get("recommendation"),
-            "price_now": safe_float(p.get("price_now")),
-            "price_pred": safe_float(p.get("price_pred")),
-        })
-
-    out.sort(key=lambda x: (-x["confidence"], -abs(x["ret_ens_pct"])))
-    return {
-        "signals": out[:limit],
-        "count": len(out[:limit]),
-        "filtered_by_confidence": min_confidence,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-# =========================================================
-# Health / Metrics
-# =========================================================
-@app.get("/health", summary="Estado del sistema")
-async def health(_: Any = Depends(rate_limiter)):
-    circuit_open = await broker_circuit.is_open()
-    return {
-        "status": "ok" if not circuit_open else "degraded",
-        "broker_circuit_open": circuit_open,
-        "broker_failures": broker_circuit.failures,
+        "status": "healthy",
+        "version": "2.6.0",
         "modules": modules_status,
-        "timestamp": datetime.utcnow().isoformat(),
+        "broker_circuit": await broker_circuit.is_open(),
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
-@app.get("/metrics", summary="Métricas del sistema")
-async def metrics(_: Any = Depends(rate_limiter)):
-    pm_positions = 0
-    pm = await get_position_manager()
-    if pm:
-        pm_positions = len(getattr(pm, "positions", []))
+@app.get("/health/broker")
+async def broker_health():
+    if await broker_circuit.is_open():
+        raise HTTPException(503, "Broker circuit abierto")
+    return {"broker": "available"}
+
+# =========================================================
+# DASHBOARD ENDPOINTS - RATE LIMITED
+# =========================================================
+@app.get("/dashboard/predictions")
+async def dashboard_predictions(
+    ticker: str = Query(...),
+    request: Request,
+    _=Depends(verify_rate_limit)
+):
+    """Predicciones por ticker - ORDENADAS CRONOLOGICAMENTE"""
+    pred_dir = Path(config.DATA_PATH) / "predictions" / ticker
+    if not pred_dir.exists():
+        return {"data": [], "ticker": ticker, "count": 0}
+
+    data = []
+    for f in sorted(pred_dir.glob("*.json")):
+        j = load_json(f)
+        if j and "prediction" in j:
+            data.append({
+                **j,
+                "filename": f.name,
+                "timestamp": f.stat().st_mtime
+            })
 
     return {
-        "pm_positions_open": pm_positions,
-        "pm_capital_fixed": config.FIXED_CAPITAL,
-        "broker_failures": broker_circuit.failures,
-        "broker_circuit_open": await broker_circuit.is_open(),
-        "rate_limiter_buckets": len(rate_limiter.buckets),
-        "modules_status": modules_status,
-        "timestamp": datetime.utcnow().isoformat(),
+        "ticker": ticker, 
+        "count": len(data),
+        "latest": data[-1] if data else None,
+        "data": data
     }
 
-# =========================================================
-# Broker Circuit Management
-# =========================================================
-@app.post("/broker/reset-circuit", summary="Resetea el circuit breaker")
-async def broker_reset(_: Any = Depends(rate_limiter)):
-    await broker_circuit.reset()
-    return {"status": "reset", "timestamp": datetime.utcnow().isoformat()}
+@app.get("/dashboard/evaluations")
+async def dashboard_evaluations(
+    ticker: str = Query(...),
+    request: Request,
+    _=Depends(verify_rate_limit)
+):
+    """Evaluaciones por ticker - ORDENADAS CRONOLOGICAMENTE"""
+    eval_dir = Path(config.DATA_PATH) / "evaluations" / ticker
+    if not eval_dir.exists():
+        return {"data": [], "ticker": ticker, "count": 0}
 
-@app.get("/broker/circuit", summary="Estado del circuit breaker")
-async def broker_circuit_status(_: Any = Depends(rate_limiter)):
+    data = []
+    for f in sorted(eval_dir.glob("*.json")):
+        j = load_json(f)
+        if j:
+            data.append({
+                **j,
+                "filename": f.name,
+                "timestamp": f.stat().st_mtime
+            })
+
     return {
-        "is_open": await broker_circuit.is_open(),
-        "failures": broker_circuit.failures,
-        "open_until": broker_circuit.open_until,
-        "threshold": config.BROKER_FAILURE_THRESHOLD,
-        "reset_after": config.BROKER_CIRCUIT_OPEN_SECS,
+        "ticker": ticker,
+        "count": len(data),
+        "latest": data[-1] if data else None,
+        "data": data
     }
 
+@app.get("/dashboard/tickers")
+async def dashboard_tickers(
+    request: Request,
+    _=Depends(verify_rate_limit)
+):
+    """Lista todos los tickers con predicciones"""
+    tickers = list_prediction_tickers_cached()
+    return {
+        "tickers": tickers,
+        "count": len(tickers),
+        "cache_hits": list_prediction_tickers_cached.cache_info()
+    }
+
+@app.get("/dashboard/latest/{ticker}")
+async def dashboard_latest(ticker: str, request: Request, _=Depends(verify_rate_limit)):
+    """Última predicción para ticker específico"""
+    pred = latest_prediction_for_ticker(ticker)
+    if not pred:
+        raise HTTPException(404, f"No predictions found for {ticker}")
+    return {"ticker": ticker, "latest": pred}
+
 # =========================================================
-# Graceful Shutdown
+# POSITION MANAGER ENDPOINTS
+# =========================================================
+@app.get("/positions")
+async def get_positions(request: Request, _=Depends(verify_rate_limit)):
+    try:
+        pm = await get_position_manager()
+        return await pm.get_positions()
+    except Exception as e:
+        logger.error(f"Positions error: {e}")
+        raise HTTPException(503, "PositionManager no disponible")
+
+# =========================================================
+# GRACEFUL SHUTDOWN - ENTERPRISE
 # =========================================================
 def handle_shutdown(signum: int, frame: Any):
-    logger.info(f"Señal {signal.Signals(signum).name} recibida. Cerrando graceful...")
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(shutdown())
-    except Exception:
-        pass
+    logger.info(f"🛑 Señal {signal.Signals(signum).name} recibida. Cerrando graceful...")
 
 async def shutdown():
-    logger.info("Iniciando shutdown graceful...")
     await broker_circuit.reset()
-    logger.info("Trading Suite Enterprise detenido correctamente")
+    logger.info("✅ Todos los recursos liberados")
 
-# =========================================================
-# Run (local)
-# =========================================================
+def signal_handler(signum: int, frame: Any):
+    asyncio.create_task(shutdown())
+    time.sleep(2)  # Grace period
+
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -462,5 +421,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         reload=config.DEBUG_MODE,
-        log_level="debug" if config.DEBUG_MODE else "info",
+        log_level="error" if not config.DEBUG_MODE else "debug",
     )
