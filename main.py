@@ -1,8 +1,9 @@
 # =====================================================
-# main.py — TRADING SUITE ENTERPRISE v2.5.2 (RENDER FIXED ✅)
+# main.py — TRADING SUITE ENTERPRISE v2.5.3 (SIGNALS FIX ✅)
 # =====================================================
-# ✅ FIX 1: TrustedHostMiddleware removido (no acepta "*" y rompe startup en Render)
-# ✅ FIX 2: lifespan usa broker_circuit.reset() (no existía reset_broker_circuit)
+# ✅ FIX: signals ahora deriva confidence + quality desde prediction.ret_ens_pct
+# ✅ Compatible con tu JSON real:
+#    { "prediction": { "ret_ens_pct": ..., "date_base": ..., ... } }
 # ✅ Mantiene Universe + Signals + Health + Metrics + Circuit + PM cache
 # =====================================================
 
@@ -21,10 +22,9 @@ from functools import lru_cache
 
 from fastapi import FastAPI, Query, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
 
 # =========================================================
-# Config - MEJORADA CON VALIDACIÓN
+# Config
 # =========================================================
 class Config:
     DATA_PATH = os.getenv("DATA_PATH", "/data")
@@ -51,7 +51,7 @@ class Config:
 config = Config()
 
 # =========================================================
-# Logging - MEJORADO (file + console)
+# Logging
 # =========================================================
 def setup_logging():
     Path(config.DATA_PATH).mkdir(parents=True, exist_ok=True)
@@ -98,19 +98,14 @@ def safe_float(v: Any) -> Optional[float]:
     except (ValueError, TypeError):
         return None
 
-def utc_stamp() -> str:
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-
 @lru_cache(maxsize=1024)
 def list_prediction_tickers_cached() -> List[str]:
-    """Cache de tickers con LRU"""
     root = Path(config.DATA_PATH) / "predictions"
     if not root.exists():
         return []
     return sorted(d.name for d in root.iterdir() if d.is_dir())
 
 def latest_prediction_for_ticker(ticker: str) -> Optional[Dict[str, Any]]:
-    """Obtiene la última predicción para un ticker específico"""
     p = Path(config.DATA_PATH) / "predictions" / ticker
     if not p.exists():
         return None
@@ -165,7 +160,6 @@ class AsyncRateLimiter:
 
         async with self._lock:
             if ip not in self.buckets:
-                # soft bound
                 if len(self.buckets) >= self.max_ips:
                     self._cleanup(now)
                 self.buckets[ip] = deque(maxlen=self.requests * 2)
@@ -197,13 +191,13 @@ class AsyncRateLimiter:
 rate_limiter = AsyncRateLimiter(config.RL_REQUESTS, config.RL_PER_SECONDS, config.RL_MAX_IPS)
 
 # =========================================================
-# LIFESPAN (startup/shutdown) ✅ FIXED
+# Lifespan
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite Enterprise v2.5.2 iniciando...")
+    logger.info("🚀 Trading Suite Enterprise v2.5.3 iniciando...")
     ensure_dirs()
-    await broker_circuit.reset()   # ✅ FIX: existía broker_circuit.reset()
+    await broker_circuit.reset()
     yield
     logger.info("🛑 Trading Suite Enterprise deteniéndose...")
 
@@ -212,12 +206,9 @@ async def lifespan(app: FastAPI):
 # =========================================================
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.5.2",
+    version="2.5.3",
     lifespan=lifespan,
 )
-
-# ✅ FIX: NO TrustedHostMiddleware aquí (en Render rompe si pones '*')
-# Si luego quieres endurecer, agrega host exacto de tu app onrender.com
 
 app.add_middleware(
     CORSMiddleware,
@@ -236,18 +227,6 @@ modules_status = {
     "broker": False,
 }
 
-def safe_import(attr_name: str, module_path: str):
-    try:
-        module = __import__(module_path, fromlist=[attr_name])
-        fn = getattr(module, attr_name)
-        modules_status[module_path] = True  # solo informativo
-        logger.info(f"✅ {module_path}.{attr_name} cargado")
-        return fn
-    except Exception as e:
-        logger.warning(f"⚠️  {module_path}.{attr_name} no disponible: {e}")
-        return None
-
-# Mantengo tu idea, pero guardo flags correctos
 try:
     from model import run_model as run_model
     modules_status["model"] = True
@@ -274,9 +253,6 @@ except Exception as e:
 
 try:
     from broker import router as broker_router
-    # OJO: tu broker.py ya viene con prefix="/trading"
-    # Si acá pones prefix="/broker", quedaría /broker/trading/...
-    # Para NO romper, lo incluyo SIN prefix:
     app.include_router(broker_router)
     modules_status["broker"] = True
     logger.info("✅ broker router included")
@@ -300,6 +276,36 @@ async def get_position_manager() -> Optional["PositionManager"]:
                 logger.error(f"Error inicializando PositionManager: {e}")
                 return None
         return _pm_cache
+
+# =========================================================
+# Signals helpers (FIX ✅)
+# =========================================================
+def derive_confidence_from_ret(ret_ens_pct: float) -> float:
+    """
+    Convierte retorno esperado (en %) a confianza [0..1].
+    Regla simple y estable: 1.0% => 1.0 (cap).
+    """
+    try:
+        return min(1.0, abs(float(ret_ens_pct)) / 1.0)
+    except Exception:
+        return 0.0
+
+def derive_quality_from_ret(ret_ens_pct: float) -> str:
+    """
+    Calidad semántica desde magnitud de retorno esperado.
+    """
+    try:
+        r = abs(float(ret_ens_pct))
+    except Exception:
+        return "NO_DATA"
+
+    if r >= 1.0:
+        return "🔥 STRONG"
+    if r >= 0.5:
+        return "✅ GOOD"
+    if r > 0.0:
+        return "⚠️ WEAK"
+    return "❌ NOISE"
 
 # =========================================================
 # Universe API
@@ -343,16 +349,31 @@ async def signals(
             continue
 
         p = pred.get("prediction", {}) or {}
-        conf = safe_float(p.get("confidence")) or 0.0
+
+        # 🔑 tu JSON real trae ret_ens_pct
+        ret_ens = safe_float(p.get("ret_ens_pct")) or 0.0
+
+        # ✅ derivamos confianza + quality si no vienen
+        conf = safe_float(p.get("confidence"))
+        if conf is None:
+            conf = derive_confidence_from_ret(ret_ens)
+
+        quality = p.get("quality") or p.get("signal_quality")
+        if not quality:
+            quality = derive_quality_from_ret(ret_ens)
+
         if conf < min_confidence:
             continue
 
         out.append({
             "ticker": ticker,
-            "quality": p.get("quality", p.get("signal_quality", "NO_DATA")),
-            "confidence": conf,
-            "ret_ens_pct": safe_float(p.get("ret_ens_pct")) or 0.0,
+            "quality": quality,
+            "confidence": float(conf),
+            "ret_ens_pct": float(ret_ens),
             "date_base": p.get("date_base") or p.get("date"),
+            "recommendation": p.get("recommendation"),
+            "price_now": safe_float(p.get("price_now")),
+            "price_pred": safe_float(p.get("price_pred")),
         })
 
     out.sort(key=lambda x: (-x["confidence"], -abs(x["ret_ens_pct"])))
@@ -421,13 +442,12 @@ def handle_shutdown(signum: int, frame: Any):
         loop = asyncio.get_event_loop()
         loop.create_task(shutdown())
     except Exception:
-        # en algunos entornos no hay loop aquí
         pass
 
 async def shutdown():
     logger.info("Iniciando shutdown graceful...")
     await broker_circuit.reset()
-    logger.info("Trading Suite Enterprise v2.5.2 detenido correctamente")
+    logger.info("Trading Suite Enterprise detenido correctamente")
 
 # =========================================================
 # Run (local)
@@ -443,4 +463,4 @@ if __name__ == "__main__":
         port=config.PORT,
         reload=config.DEBUG_MODE,
         log_level="debug" if config.DEBUG_MODE else "info",
-                )
+    )
