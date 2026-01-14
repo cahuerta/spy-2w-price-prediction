@@ -272,6 +272,39 @@ try:
     modules_status["broker"] = True
 except Exception:
     pass
+try:
+    from signals import compute_all_signals
+    modules_status["signals"] = True
+except Exception as e:
+    compute_all_signals = None
+    modules_status["signals"] = False
+    
+# =========================================================
+# SIGNALS ENDPOINT (BACKEND ↔ FRONTEND)
+# =========================================================
+@app.get("/signals")
+async def signals_endpoint(
+    request: Request,
+    min_confidence: float = Query(config.SIGNALS_MIN_CONF_DEFAULT),
+    _=Depends(verify_rate_limit),
+):
+    if compute_all_signals is None:
+        raise HTTPException(503, "Signals module not available")
+
+    data = compute_all_signals()
+
+    if min_confidence > 0:
+        data = [
+            s for s in data
+            if (s.get("confidence") or 0) >= min_confidence
+        ]
+
+    return {
+        "signals": data,
+        "count": len(data),
+        "min_confidence": min_confidence,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
 
 # =========================================================
 # HEALTH CHECK
