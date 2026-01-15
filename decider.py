@@ -1,7 +1,7 @@
 # =========================================================
-# decider.py — SCREENER → TICKERS MEMORY DECIDER (AUTO-ADD) v2.1
+# decider.py — SCREENER → TICKERS MEMORY DECIDER (AUTO-ADD) v2.2
 # =========================================================
-# ✅ Lee screener DESDE BACKEND (HTTP)
+# ✅ Lee screener_candidates.json DESDE DISCO
 # ✅ AGREGA automáticamente a tickers.json
 # ✅ CONCURRENCIA: Atomic write + backup
 # ❌ NUNCA borra tickers
@@ -11,7 +11,6 @@
 import json
 import logging
 import os
-import requests
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
@@ -19,13 +18,10 @@ from typing import Dict, Any, List
 # =========================
 # Configuración
 # =========================
-DATA_PATH = Path("/data")
-TICKERS_FILE = DATA_PATH / "tickers.json"
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 
-BACKEND_URL = os.getenv(
-    "BACKEND_URL",
-    "https://spy-2w-price-prediction.onrender.com"
-)
+SCREENER_FILE = DATA_PATH / "screener_candidates.json"
+TICKERS_FILE = DATA_PATH / "tickers.json"
 
 # Criterios conservadores
 MIN_SCORE = 0.75
@@ -45,7 +41,7 @@ logger = logging.getLogger("decider")
 # =========================
 def load_json(path: Path) -> Dict[str, Any]:
     if not path.exists():
-        return {}
+        raise RuntimeError(f"Archivo requerido no existe: {path}")
     try:
         return json.loads(path.read_text())
     except Exception:
@@ -71,36 +67,18 @@ def normalize_tickers(data: Any) -> List[str]:
         return data["tickers"]
     raise RuntimeError("Formato inválido en tickers.json")
 
-
-# =========================
-# Fetch screener (HTTP)
-# =========================
-def fetch_screener_candidates() -> List[Dict[str, Any]]:
-    r = requests.get(
-        f"{BACKEND_URL}/dashboard/screener",
-        timeout=30,
-    )
-    r.raise_for_status()
-
-    payload = r.json()
-    if not payload.get("exists"):
-        raise RuntimeError("Screener aún no disponible en backend")
-
-    candidates = payload.get("candidates", [])
-    if not isinstance(candidates, list):
-        raise RuntimeError("Formato inválido en screener payload")
-
-    return candidates
-
-
 # =========================
 # Core logic
 # =========================
 def run_decider() -> Dict[str, Any]:
     # -------------------------
-    # Leer screener desde backend
+    # Leer screener DESDE DISCO
     # -------------------------
-    candidates = fetch_screener_candidates()
+    screener = load_json(SCREENER_FILE)
+    candidates = screener.get("candidates", [])
+
+    if not isinstance(candidates, list):
+        raise RuntimeError("Formato inválido en screener_candidates.json")
 
     # -------------------------
     # Cargar tickers.json existente
@@ -117,7 +95,7 @@ def run_decider() -> Dict[str, Any]:
     added: List[str] = []
 
     # -------------------------
-    # Evaluar candidatos (conservador)
+    # Evaluar candidatos (MISMA LÓGICA)
     # -------------------------
     for c in candidates:
         try:
@@ -145,7 +123,7 @@ def run_decider() -> Dict[str, Any]:
     # -------------------------
     output = {
         "generated_at": datetime.utcnow().isoformat(),
-        "source": "screener_decider_v2.1",
+        "source": "screener_decider_v2.2",
         "total_tickers": len(tickers_set),
         "added_today": len(added),
         "tickers": sorted(tickers_set),
@@ -154,7 +132,7 @@ def run_decider() -> Dict[str, Any]:
     save_json_atomic(TICKERS_FILE, output)
 
     logger.info(
-        f"✅ Decider v2.1 | nuevos={len(added)} | total={len(tickers_set)}"
+        f"✅ Decider v2.2 | nuevos={len(added)} | total={len(tickers_set)}"
     )
 
     return {
@@ -164,9 +142,8 @@ def run_decider() -> Dict[str, Any]:
         "file": str(TICKERS_FILE),
     }
 
-
 # =========================
-# CLI
+# CLI (debug manual)
 # =========================
 if __name__ == "__main__":
     try:
