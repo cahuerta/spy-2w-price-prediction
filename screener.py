@@ -344,8 +344,9 @@ async def fetch_symbol_data(
 # MAIN ASYNC SCREENER v3.1
 # =========================================================
 async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
-if not ALPACA_AVAILABLE:
-    raise RuntimeError(f"alpaca-py core no disponible: {_ALPACA_IMPORT_ERROR}")
+    if not ALPACA_AVAILABLE:
+        raise RuntimeError(f"alpaca-py core no disponible: {_ALPACA_IMPORT_ERROR}")
+
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise RuntimeError("Credenciales Alpaca no configuradas")
 
@@ -358,16 +359,13 @@ if not ALPACA_AVAILABLE:
 
     logger.info("🔍 Fetching universe...")
     try:
-       if SCREENER_AVAILABLE:
-    screener = ScreenerClient(ALPACA_KEY, ALPACA_SECRET)
-    actives = screener.get_most_actives()
-    universe = [a["symbol"] for a in actives[:limit_assets]]
-    logger.info(f"Universe: {len(universe)} most actives")
-else:
-    raise RuntimeError("ScreenerClient no disponible")
-
-        universe = [a["symbol"] for a in actives[:limit_assets]]
-        logger.info(f"Universe: {len(universe)} most actives")
+        if SCREENER_AVAILABLE:
+            screener = ScreenerClient(ALPACA_KEY, ALPACA_SECRET)
+            actives = screener.get_most_actives()
+            universe = [a["symbol"] for a in actives[:limit_assets]]
+            logger.info(f"Universe: {len(universe)} most actives")
+        else:
+            raise RuntimeError("ScreenerClient no disponible")
     except Exception as e:
         logger.warning(f"Screener API failed: {e} → fallback assets list")
         assets = trading.get_all_assets(asset_class=AssetClass.US_EQUITY)
@@ -383,10 +381,16 @@ else:
     total_batches = (len(universe) + BATCH_SIZE - 1) // BATCH_SIZE
     for i in range(0, len(universe), BATCH_SIZE):
         batch = universe[i:i + BATCH_SIZE]
-        logger.info(f"Processing batch {i//BATCH_SIZE + 1}/{total_batches} ({len(batch)} symbols)")
+        logger.info(
+            f"Processing batch {i//BATCH_SIZE + 1}/{total_batches} "
+            f"({len(batch)} symbols)"
+        )
 
         results = await asyncio.gather(
-            *[fetch_symbol_data(s, data, semaphore, benchmark_returns) for s in batch],
+            *[
+                fetch_symbol_data(s, data, semaphore, benchmark_returns)
+                for s in batch
+            ],
             return_exceptions=True,
         )
         candidates.extend([r for r in results if isinstance(r, dict)])
@@ -399,15 +403,17 @@ else:
     if IA_AVAILABLE and candidates:
         try:
             candidates = await enrich_screener_candidates_batch(candidates)
-            # IA contract: usamos SOLO context_score y event_risk (estables)
             candidates.sort(
                 key=lambda x: (
-                    (IA_W_QUANT * x["score"] + IA_W_CONTEXT * float(x.get("ia", {}).get("context_score", 0.5)))
-                    * (1 - float(x.get("ia", {}).get("event_risk", 0.0)))
-                ),
+                    IA_W_QUANT * x["score"]
+                    + IA_W_CONTEXT * float(
+                        x.get("ia", {}).get("context_score", 0.5)
+                    )
+                )
+                * (1 - float(x.get("ia", {}).get("event_risk", 0.0))),
                 reverse=True,
             )
-            logger.info("🧠 IA re-ranking aplicado (contract stable: context_score/event_risk)")
+            logger.info("🧠 IA re-ranking aplicado")
         except Exception as e:
             logger.error(f"IA enrichment failed: {e}")
 
@@ -434,10 +440,11 @@ else:
 
     if candidates:
         logger.info(
-            f"✅ Screener v3.1 | {len(candidates)} candidatos | TOP: {candidates[0]['ticker']} ({candidates[0]['score']:.3f})"
+            f"✅ Screener v3.1 | {len(candidates)} candidatos | "
+            f"TOP: {candidates[0]['ticker']} ({candidates[0]['score']:.3f})"
         )
     else:
-        logger.info("✅ Screener v3.1 | 0 candidatos (filtros muy estrictos o universo vacío)")
+        logger.info("✅ Screener v3.1 | 0 candidatos")
 
     return output
 
