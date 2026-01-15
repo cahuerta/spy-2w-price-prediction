@@ -306,26 +306,54 @@ async def signals_endpoint(
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 # =====================================================
-# Screener candidates endpoint (READ ONLY)
+# Screener candidates endpoint (READ ONLY | DEBUG + FRONTEND)
 # =====================================================
-from fastapi import HTTPException
-from pathlib import Path
-import json
-
-DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
-SCREENER_FILE = DATA_PATH / "screener_candidates.json"
-
 @app.get("/dashboard/screener")
 def get_screener_candidates():
-    if not SCREENER_FILE.exists():
-        raise HTTPException(status_code=404, detail="Screener not generated yet")
+    path = SCREENER_FILE  # /data/screener_candidates.json
 
+    # Caso 1: archivo aún no generado
+    if not path.exists():
+        return {
+            "exists": False,
+            "path": str(path),
+            "generated_at": None,
+            "n_candidates": 0,
+            "candidates": [],
+            "message": "screener_candidates.json no existe aún"
+        }
+
+    # Caso 2: archivo existe → leerlo
     try:
-        data = json.loads(SCREENER_FILE.read_text(encoding="utf-8"))
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
 
+        stat = path.stat()
+
+        return {
+            "exists": True,
+            "path": str(path),
+            "size_bytes": stat.st_size,
+            "modified_at": stat.st_mtime,
+            # Payload esperado por frontend
+            "generated_at": data.get("generated_at"),
+            "version": data.get("version"),
+            "n_universe": data.get("n_universe"),
+            "n_candidates": data.get("n_candidates"),
+            "candidates": data.get("candidates", []),
+            # Debug útil (no rompe UI)
+            "meta": {
+                "ia_available": data.get("ia_available"),
+                "fundamental_available": data.get("fundamental_available"),
+                "params": data.get("params"),
+            },
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error leyendo screener_candidates.json: {e}"
+        )
 # =========================================================
 # HEALTH CHECK
 # =========================================================
