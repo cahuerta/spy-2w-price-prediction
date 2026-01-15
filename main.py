@@ -305,7 +305,8 @@ async def signals_endpoint(
         "min_confidence": min_confidence,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
-    # =====================================================
+
+# =====================================================
 # Screener disk path (SINGLE SOURCE OF TRUTH)
 # =====================================================
 DATA_PATH = Path(os.getenv("DATA_PATH", config.DATA_PATH))
@@ -359,6 +360,22 @@ def get_screener_candidates():
             status_code=500,
             detail=f"Error leyendo screener_candidates.json: {e}"
         )
+
+@app.post("/internal/screener/result")
+async def receive_screener_result(
+    payload: Dict[str, Any],
+    request: Request,
+):
+    if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
+        raise HTTPException(403, "Forbidden")
+
+    path = Path(config.DATA_PATH) / "screener_candidates.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    logger.info("📁 Screener JSON recibido y guardado")
+
+    return {"status": "ok"}
+
 # =========================================================
 # HEALTH CHECK
 # =========================================================
