@@ -75,7 +75,7 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 OUTPUT_FILE = DATA_PATH / "screener_candidates.json"
 
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
+ALPACA_SECRET = os.getenv("ALPACA_API_SECRET")
 PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
