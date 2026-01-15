@@ -305,6 +305,11 @@ async def signals_endpoint(
         "min_confidence": min_confidence,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
+    # =====================================================
+# Screener disk path (SINGLE SOURCE OF TRUTH)
+# =====================================================
+DATA_PATH = Path(os.getenv("DATA_PATH", config.DATA_PATH))
+SCREENER_FILE = DATA_PATH / "screener_candidates.json"
 # =====================================================
 # Screener candidates endpoint (READ ONLY | DEBUG + FRONTEND)
 # =====================================================
