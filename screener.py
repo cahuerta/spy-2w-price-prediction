@@ -56,18 +56,28 @@ except Exception:
         return {"usable": False}
 
 # =========================================================
-# Alpaca imports (safe)
+# Alpaca imports (robusto)
 # =========================================================
+ALPACA_AVAILABLE = True
+
 try:
     from alpaca.trading.client import TradingClient
     from alpaca.trading.enums import AssetClass
     from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.screener import ScreenerClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
-    ALPACA_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     ALPACA_AVAILABLE = False
+    _ALPACA_IMPORT_ERROR = e
+
+# Opcional (NO bloqueante)
+try:
+    from alpaca.data.screener import ScreenerClient
+    SCREENER_AVAILABLE = True
+except ImportError:
+    ScreenerClient = None
+    SCREENER_AVAILABLE = False
+
 
 # =========================================================
 # Configuración
@@ -334,8 +344,8 @@ async def fetch_symbol_data(
 # MAIN ASYNC SCREENER v3.1
 # =========================================================
 async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
-    if not ALPACA_AVAILABLE:
-        raise RuntimeError("alpaca-py no instalado")
+if not ALPACA_AVAILABLE:
+    raise RuntimeError(f"alpaca-py core no disponible: {_ALPACA_IMPORT_ERROR}")
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise RuntimeError("Credenciales Alpaca no configuradas")
 
@@ -348,8 +358,14 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
 
     logger.info("🔍 Fetching universe...")
     try:
-        screener = ScreenerClient(ALPACA_KEY, ALPACA_SECRET)
-        actives = screener.get_most_actives()
+       if SCREENER_AVAILABLE:
+    screener = ScreenerClient(ALPACA_KEY, ALPACA_SECRET)
+    actives = screener.get_most_actives()
+    universe = [a["symbol"] for a in actives[:limit_assets]]
+    logger.info(f"Universe: {len(universe)} most actives")
+else:
+    raise RuntimeError("ScreenerClient no disponible")
+
         universe = [a["symbol"] for a in actives[:limit_assets]]
         logger.info(f"Universe: {len(universe)} most actives")
     except Exception as e:
