@@ -441,7 +441,7 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         "candidates": candidates,
     }
 
-    OUTPUT_FILE.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    return output
 
     if candidates:
         logger.info(
