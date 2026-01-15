@@ -367,18 +367,19 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         else:
             raise RuntimeError("ScreenerClient no disponible")
     except Exception as e:
-        logger.warning(f"Screener API failed: {e} → fallback assets list")
-        assets = trading.get_all_assets()
+    logger.warning(f"Screener API failed: {e} → fallback assets list")
 
-universe = [
-    a.symbol
-    for a in assets
-    if a.tradable
-    and a.asset_class == AssetClass.US_EQUITY
-    and a.exchange in ("NYSE", "NASDAQ")
-][:limit_assets]
+    assets = trading.get_all_assets()
 
-logger.info(f"Universe fallback: {len(universe)} assets")
+    universe = [
+        a.symbol
+        for a in assets
+        if a.tradable
+        and a.asset_class == AssetClass.US_EQUITY
+        and a.exchange in ("NYSE", "NASDAQ")
+    ][:limit_assets]
+
+    logger.info(f"Universe fallback: {len(universe)} assets")
 
 
     semaphore = asyncio.Semaphore(ALPACA_CONCURRENT)
