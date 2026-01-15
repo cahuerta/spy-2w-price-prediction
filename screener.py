@@ -9,7 +9,8 @@
 # ✅ Wrapper sync seguro (solo CLI)
 # ✅ Production hardened v3.1
 # =========================================================
-
+import alpaca
+print("ALPACA VERSION:", alpaca.__version__)
 import os
 import json
 import logging
