@@ -1,16 +1,17 @@
 # =========================================================
-# decider.py — SCREENER → TICKERS MEMORY DECIDER (AUTO-ADD) v2.0
+# decider.py — SCREENER → TICKERS MEMORY DECIDER (AUTO-ADD) v2.1
 # =========================================================
-# ✅ Lee screener_candidates.json
+# ✅ Lee screener DESDE BACKEND (HTTP)
 # ✅ AGREGA automáticamente a tickers.json
 # ✅ CONCURRENCIA: Atomic write + backup
 # ❌ NUNCA borra tickers
 # ❌ NO decide trades | NO toca señales ni broker
-# ✅ Construye memoria acumulativa del sistema
 # =========================================================
 
 import json
 import logging
+import os
+import requests
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
@@ -19,9 +20,12 @@ from typing import Dict, Any, List
 # Configuración
 # =========================
 DATA_PATH = Path("/data")
+TICKERS_FILE = DATA_PATH / "tickers.json"
 
-SCREENER_FILE = DATA_PATH / "screener_candidates.json"
-TICKERS_FILE = DATA_PATH / "tickers.json"  # Path consistente
+BACKEND_URL = os.getenv(
+    "BACKEND_URL",
+    "https://spy-2w-price-prediction.onrender.com"
+)
 
 # Criterios conservadores
 MIN_SCORE = 0.75
@@ -40,7 +44,6 @@ logger = logging.getLogger("decider")
 # Helpers CONCURRENCIA
 # =========================
 def load_json(path: Path) -> Dict[str, Any]:
-    """Carga JSON con manejo robusto."""
     if not path.exists():
         return {}
     try:
@@ -49,12 +52,8 @@ def load_json(path: Path) -> Dict[str, Any]:
         logger.error(f"❌ JSON corrupto: {path}")
         raise
 
+
 def save_json_atomic(path: Path, data: Dict[str, Any]):
-    """
-    ✅ Atomic write (temp → rename)
-    ✅ Backup automático
-    ✅ Concurrencia-safe
-    """
     if path.exists():
         backup = path.with_suffix(".backup")
         backup.write_text(path.read_text())
@@ -62,33 +61,46 @@ def save_json_atomic(path: Path, data: Dict[str, Any]):
 
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(path)  # operación atómica
-    logger.debug(f"💾 Escrito atómicamente: {path}")
+    tmp.replace(path)
+
 
 def normalize_tickers(data: Any) -> List[str]:
-    """
-    Acepta formatos:
-    - ["AAPL", "MSFT"]
-    - {"tickers": ["AAPL", "MSFT"]}
-    """
     if isinstance(data, list):
         return data
     if isinstance(data, dict) and "tickers" in data and isinstance(data["tickers"], list):
         return data["tickers"]
     raise RuntimeError("Formato inválido en tickers.json")
 
+
+# =========================
+# Fetch screener (HTTP)
+# =========================
+def fetch_screener_candidates() -> List[Dict[str, Any]]:
+    r = requests.get(
+        f"{BACKEND_URL}/dashboard/screener",
+        timeout=30,
+    )
+    r.raise_for_status()
+
+    payload = r.json()
+    if not payload.get("exists"):
+        raise RuntimeError("Screener aún no disponible en backend")
+
+    candidates = payload.get("candidates", [])
+    if not isinstance(candidates, list):
+        raise RuntimeError("Formato inválido en screener payload")
+
+    return candidates
+
+
 # =========================
 # Core logic
 # =========================
 def run_decider() -> Dict[str, Any]:
-    if not SCREENER_FILE.exists():
-        raise RuntimeError("screener_candidates.json no encontrado")
-
-    screener = load_json(SCREENER_FILE)
-    candidates = screener.get("candidates", [])
-
-    if not isinstance(candidates, list):
-        raise RuntimeError("Formato inválido en screener_candidates.json")
+    # -------------------------
+    # Leer screener desde backend
+    # -------------------------
+    candidates = fetch_screener_candidates()
 
     # -------------------------
     # Cargar tickers.json existente
@@ -129,20 +141,20 @@ def run_decider() -> Dict[str, Any]:
             logger.debug(f"Skip candidato: {e}")
 
     # -------------------------
-    # Guardar ATÓMICAMENTE (nunca borra)
+    # Guardar ATÓMICAMENTE
     # -------------------------
     output = {
         "generated_at": datetime.utcnow().isoformat(),
-        "source": "screener_decider_v2",
+        "source": "screener_decider_v2.1",
         "total_tickers": len(tickers_set),
         "added_today": len(added),
-        "tickers": sorted(tickers_set)
+        "tickers": sorted(tickers_set),
     }
 
     save_json_atomic(TICKERS_FILE, output)
 
     logger.info(
-        f"✅ Decider v2.0 | nuevos={len(added)} | total={len(tickers_set)}"
+        f"✅ Decider v2.1 | nuevos={len(added)} | total={len(tickers_set)}"
     )
 
     return {
@@ -152,13 +164,13 @@ def run_decider() -> Dict[str, Any]:
         "file": str(TICKERS_FILE),
     }
 
+
 # =========================
-# CLI Production-ready
+# CLI
 # =========================
 if __name__ == "__main__":
     try:
         result = run_decider()
-
         print("\n🧠 TICKERS NUEVOS AGREGADOS:")
         if result["added"]:
             for t in result["added"]:
