@@ -366,15 +366,33 @@ async def receive_screener_result(
     payload: Dict[str, Any],
     request: Request,
 ):
+    # Seguridad
     if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
         raise HTTPException(403, "Forbidden")
 
+    # 1️⃣ Guardar screener_candidates.json
     path = Path(config.DATA_PATH) / "screener_candidates.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
     logger.info("📁 Screener JSON recibido y guardado")
 
-    return {"status": "ok"}
+    # 2️⃣ Ejecutar DECIDER inmediatamente
+    try:
+        from decider import run_decider
+        result = run_decider()
+
+        logger.info(
+            f"🧠 Decider ejecutado | added={len(result.get('added', []))} | total={result.get('total')}"
+        )
+    except Exception as e:
+        logger.error(f"❌ Decider falló tras screener: {e}")
+        raise HTTPException(500, f"Decider error: {e}")
+
+    # 3️⃣ Respuesta
+    return {
+        "status": "ok",
+        "decider": result,
+    }
+
 
 # =========================================================
 # HEALTH CHECK
