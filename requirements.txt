@@ -6,3 +6,4 @@ pandas
 scikit-learn
 yfinance
 matplotlib
+alpaca-py>=0.20.0
