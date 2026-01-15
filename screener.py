@@ -381,7 +381,6 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
 
     logger.info(f"Universe fallback: {len(universe)} assets")
 
-
     semaphore = asyncio.Semaphore(ALPACA_CONCURRENT)
     candidates: List[Dict[str, Any]] = []
 
