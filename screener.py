@@ -441,7 +441,6 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         "candidates": candidates,
     }
 
-    DATA_PATH.mkdir(parents=True, exist_ok=True)
     OUTPUT_FILE.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
     if candidates:
