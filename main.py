@@ -305,6 +305,26 @@ async def signals_endpoint(
         "min_confidence": min_confidence,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
+# =====================================================
+# Screener candidates endpoint (READ ONLY)
+# =====================================================
+from fastapi import HTTPException
+from pathlib import Path
+import json
+
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+SCREENER_FILE = DATA_PATH / "screener_candidates.json"
+
+@app.get("/dashboard/screener")
+def get_screener_candidates():
+    if not SCREENER_FILE.exists():
+        raise HTTPException(status_code=404, detail="Screener not generated yet")
+
+    try:
+        data = json.loads(SCREENER_FILE.read_text(encoding="utf-8"))
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =========================================================
 # HEALTH CHECK
