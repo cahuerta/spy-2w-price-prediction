@@ -17,6 +17,8 @@ import traceback
 # Importaciones del pipeline
 from screener import run_screener
 from decider import run_decider
+import os
+import requests
 
 
 def main():
@@ -24,6 +26,27 @@ def main():
     print("=" * 60)
     print(f"🚀 PIPELINE START | {start_ts}")
     print("=" * 60)
+ # -------------------------
+    # 1) HELPERS
+    # -------------------------
+    BACKEND_URL = os.getenv(
+    "BACKEND_URL",
+    "https://spy-2w-price-prediction.onrender.com"
+)
+
+PIPELINE_KEY = os.getenv("PIPELINE_KEY", "")
+
+
+def push_screener_to_backend(result: dict):
+    r = requests.post(
+        f"{BACKEND_URL}/internal/screener/result",
+        json=result,
+        timeout=30,
+        headers={
+            "X-PIPELINE-KEY": PIPELINE_KEY
+        },
+    )
+    r.raise_for_status()
 
     # -------------------------
     # 1) SCREENER
@@ -32,8 +55,12 @@ def main():
         print("🔍 [1/2] Running SCREENER...")
         screener_out = run_screener()
 
-        n_candidates = screener_out.get("n_candidates")
-        print(f"✅ Screener OK | candidates={n_candidates}")
+n_candidates = screener_out.get("n_candidates")
+print(f"✅ Screener OK | candidates={n_candidates}")
+
+push_screener_to_backend(screener_out)
+print("📤 Screener enviado al backend")
+
 
     except Exception as e:
         print("❌ Screener FAILED")
