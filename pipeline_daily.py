@@ -18,8 +18,6 @@ import requests
 
 # Importaciones del pipeline
 from screener import run_screener
-from decider import run_decider
-
 
 # =========================================================
 # CONFIG PIPELINE → BACKEND
@@ -71,31 +69,7 @@ def main():
         traceback.print_exc()
         return  # sin screener no seguimos
 
-    # -------------------------
-    # 2) DECIDER
-    # -------------------------
-    try:
-        print("🧠 [2/2] Running DECIDER...")
-        decider_out = run_decider()
-
-        added = decider_out.get("added", [])
-        total = decider_out.get("total")
-
-        print(f"✅ Decider OK | added_today={len(added)} | total_tickers={total}")
-
-        if added:
-            print("➕ Nuevos tickers agregados:")
-            for t in added:
-                print(f"   • {t}")
-        else:
-            print("ℹ️  Ningún ticker nuevo agregado hoy")
-
-    except Exception as e:
-        print("❌ Decider FAILED")
-        print(str(e))
-        traceback.print_exc()
-        return
-
+  
     # -------------------------
     # FIN
     # -------------------------
