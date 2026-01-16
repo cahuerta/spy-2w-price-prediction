@@ -475,7 +475,7 @@ async def daily_system_run(request: Request):
     # -------------------------
     # Ejecutar decisiones vía BROKER (PAPER)
     # -------------------------
-       executed = []
+    executed = []
 
     for d in decisions:
         action = d.get("action")
