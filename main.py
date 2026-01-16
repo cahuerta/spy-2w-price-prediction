@@ -8,6 +8,8 @@ import logging
 import time
 import asyncio
 import signal
+import requests
+
 from typing import Any, Dict, List, Optional, Deque
 from pathlib import Path
 from datetime import datetime
@@ -443,8 +445,9 @@ async def daily_system_run(request: Request):
     # Cargar posiciones actuales (si existen)
     # -------------------------
 
-   positions_path = Path(config.DATA_PATH) / "positions.json"
-   positions = load_positions(positions_path)
+    positions_path = Path(config.DATA_PATH) / "positions.json"
+    positions = load_positions(positions_path)
+
     decisions = []
 
     # -------------------------
@@ -474,7 +477,7 @@ async def daily_system_run(request: Request):
     # -------------------------
     executed = []
 
-for d in decisions:
+    for d in decisions:
     action = d.get("action")
 
     if action in {"OPEN", "CLOSE", "ROTATE"}:
