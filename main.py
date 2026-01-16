@@ -393,6 +393,101 @@ async def receive_screener_result(
         "decider": result,
     }
 
+# =========================================================
+# DAILY SYSTEM ORCHESTRATOR (INTERNAL)
+# =========================================================
+@app.post("/internal/system/daily-run")
+async def daily_system_run(request: Request):
+    # -------------------------
+    # Seguridad
+    # -------------------------
+    if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
+        raise HTTPException(403, "Forbidden")
+
+    logger.info("🧠 DAILY RUN STARTED")
+
+    # -------------------------
+    # Cargar PositionManager
+    # -------------------------
+    try:
+        pm = await get_position_manager()
+    except Exception as e:
+        logger.error(f"PM no disponible: {e}")
+        raise HTTPException(503, "PositionManager not available")
+
+    # -------------------------
+    # Cargar señales
+    # -------------------------
+    if compute_all_signals is None:
+        raise HTTPException(503, "Signals module not available")
+
+    signals = compute_all_signals()
+    signals_by_ticker = {
+        s["ticker"].upper(): s for s in signals if s.get("ticker")
+    }
+
+    # -------------------------
+    # Cargar posiciones actuales (si existen)
+    # -------------------------
+    positions_path = Path(config.DATA_PATH) / "positions.json"
+    positions = load_json(positions_path) or []
+
+    decisions = []
+
+    # -------------------------
+    # Evaluar posiciones existentes
+    # -------------------------
+    for pos in positions:
+        ticker = pos.get("ticker")
+        signal = signals_by_ticker.get(ticker)
+        decision = pm.evaluate_position(pos, signal)
+        decisions.append(decision)
+
+    # -------------------------
+    # Evaluar ROTATION / OPEN
+    # -------------------------
+    if pm.can_add_positions(positions):
+        screener = load_json(SCREENER_FILE)
+        candidates = screener.get("candidates", []) if screener else []
+
+        for c in candidates:
+            rot = pm.evaluate_rotation(positions, c, signals_by_ticker)
+            if rot:
+                decisions.append(rot)
+                break  # solo una rotación por día
+
+    # -------------------------
+    # Ejecutar decisiones vía BROKER (PAPER)
+    # -------------------------
+    executed = []
+
+    for d in decisions:
+        action = d.get("action")
+        if action in {"OPEN", "CLOSE", "ROTATE"}:
+            try:
+                import requests
+
+                r = requests.post(
+                    config.BROKER_EXEC_URL,
+                    json=d,
+                    timeout=20,
+                )
+                r.raise_for_status()
+                executed.append(d)
+            except Exception as e:
+                logger.error(f"Broker execution failed: {e}")
+
+    logger.info(
+        f"🏁 DAILY RUN END | decisions={len(decisions)} | executed={len(executed)}"
+    )
+
+    return {
+        "status": "ok",
+        "decisions": decisions,
+        "executed": executed,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
 
 # =========================================================
 # HEALTH CHECK
