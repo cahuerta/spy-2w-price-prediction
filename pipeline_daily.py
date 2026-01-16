@@ -1,159 +1,105 @@
 # =========================================================
 # pipeline_daily.py — ORQUESTADOR DIARIO DEL SISTEMA (FINAL)
 # =========================================================
-# Ejecuta TODO el pipeline en orden:
+# Flujo completo diario:
 # 1) Screener
-# 2) Decider (vía backend)
-# 3) Save All (model / predictions)
-# 4) Evaluator / Signals
-# 5) PositionManager (decisiones)
+# 2) Persistir screener
+# 3) Decider (memoria de tickers)
+# 4) Save All (prices + signals)
+# 5) Evaluador de portafolio (PositionManager)
 #
-# ✔ UN SOLO CRON JOB
-# ✔ Post-market
-# ✔ NO ejecuta trades
-# ✔ Broker queda en DRY / manual
+# ✔ Un solo cron job
+# ✔ NO ejecuta trades (todavía)
+# ✔ Broker queda listo para PAPER
 # =========================================================
 
-from datetime import datetime, timezone
+from datetime import datetime
 import os
-import sys
 import traceback
 import requests
 
 from screener import run_screener
+from decider import run_decider
 
-# =========================================================
-# CONFIG
-# =========================================================
-BACKEND_URL = os.getenv(
-    "BACKEND_URL",
-    "https://spy-2w-price-prediction.onrender.com"
-)
+BACKEND_URL = os.getenv("BACKEND_URL")
+PIPELINE_KEY = os.getenv("PIPELINE_KEY")
 
-PIPELINE_KEY = os.getenv("PIPELINE_KEY", "")
+HEADERS = {"X-PIPELINE-KEY": PIPELINE_KEY}
 
-TIMEOUT = 120  # segundos por etapa
 
-# =========================================================
-# HELPERS
-# =========================================================
-def now_utc():
-    return datetime.now(timezone.utc).isoformat()
-
-def call_backend(method: str, path: str, payload: dict | None = None):
+# ---------------------------------------------------------
+# Helpers backend
+# ---------------------------------------------------------
+def post(path: str, payload: dict | None = None):
     url = f"{BACKEND_URL}{path}"
-    headers = {
-        "X-PIPELINE-KEY": PIPELINE_KEY,
-        "Content-Type": "application/json",
-    }
-
-    r = requests.request(
-        method=method,
-        url=url,
-        json=payload,
-        headers=headers,
-        timeout=TIMEOUT,
-    )
+    r = requests.post(url, json=payload, headers=HEADERS, timeout=60)
     r.raise_for_status()
     return r.json()
 
-# =========================================================
-# PIPELINE
-# =========================================================
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
 def main():
-    print("=" * 70)
-    print(f"🚀 DAILY PIPELINE START | {now_utc()}")
-    print("=" * 70)
+    start_ts = datetime.utcnow().isoformat()
+    print("=" * 60)
+    print(f"🚀 PIPELINE DAILY START | {start_ts}")
+    print("=" * 60)
 
-    # -----------------------------------------------------
-    # 1) SCREENER (LOCAL)
-    # -----------------------------------------------------
     try:
-        print("\n🔍 [1/5] Running SCREENER...")
+        # -------------------------
+        # 1) SCREENER
+        # -------------------------
+        print("🔍 [1/5] Running SCREENER...")
         screener_out = run_screener()
+        print(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
 
-        n = screener_out.get("n_candidates", 0)
-        print(f"✅ Screener OK | candidates={n}")
+        post("/internal/screener/result", screener_out)
+        print("📤 Screener persistido")
 
-    except Exception as e:
-        print("❌ SCREENER FAILED")
-        traceback.print_exc()
-        sys.exit(1)
-
-    # -----------------------------------------------------
-    # 2) PUSH SCREENER → BACKEND (DECIDER AUTO)
-    # -----------------------------------------------------
-    try:
-        print("\n📤 [2/5] Sending screener to backend (DECIDER)...")
-        res = call_backend(
-            "POST",
-            "/internal/screener/result",
-            screener_out,
-        )
-
-        added = len(res.get("decider", {}).get("added", []))
-        total = res.get("decider", {}).get("total")
-
-        print(f"🧠 Decider OK | added={added} | total={total}")
-
-    except Exception as e:
-        print("❌ DECIDER FAILED")
-        traceback.print_exc()
-        sys.exit(1)
-
-    # -----------------------------------------------------
-    # 3) SAVE ALL (MODELS / PREDICTIONS)
-    # -----------------------------------------------------
-    try:
-        print("\n🧮 [3/5] Running SAVE-ALL (models / predictions)...")
-        res = call_backend("POST", "/internal/run/save_all")
-        print(f"✅ Save-all OK | tickers={res.get('tickers')}")
-
-    except Exception as e:
-        print("❌ SAVE-ALL FAILED")
-        traceback.print_exc()
-        sys.exit(1)
-
-    # -----------------------------------------------------
-    # 4) EVALUATOR / SIGNALS
-    # -----------------------------------------------------
-    try:
-        print("\n📊 [4/5] Running EVALUATOR / SIGNALS...")
-        res = call_backend("POST", "/internal/run/evaluator")
-        print(f"✅ Evaluator OK | signals={res.get('count')}")
-
-    except Exception as e:
-        print("❌ EVALUATOR FAILED")
-        traceback.print_exc()
-        sys.exit(1)
-
-    # -----------------------------------------------------
-    # 5) POSITION MANAGER (DECISIONS ONLY)
-    # -----------------------------------------------------
-    try:
-        print("\n🧠 [5/5] Running POSITION MANAGER...")
-        res = call_backend("POST", "/internal/run/position_manager")
-
+        # -------------------------
+        # 2) DECIDER
+        # -------------------------
+        print("🧠 [2/5] Running DECIDER...")
+        decider_out = run_decider()
         print(
-            f"✅ PM OK | actions={res.get('actions')} | "
-            f"health={res.get('health')}"
+            f"✅ Decider OK | added={len(decider_out.get('added', []))} | "
+            f"total={decider_out.get('total')}"
         )
 
+        # -------------------------
+        # 3) SAVE ALL (prices + signals)
+        # -------------------------
+        print("💾 [3/5] Saving ALL market data...")
+        post("/internal/save_all")
+        print("✅ Save all OK")
+
+        # -------------------------
+        # 4) EVALUADOR PORTAFOLIO
+        # -------------------------
+        print("📊 [4/5] Evaluating portfolio...")
+        eval_out = post("/internal/portfolio/evaluate")
+        print(
+            f"✅ Portfolio evaluated | action={eval_out.get('next_action')}"
+        )
+
+        # -------------------------
+        # 5) (FUTURO) BROKER
+        # -------------------------
+        print("🤖 [5/5] Broker: NO EXECUTION (paper disabled)")
+        print("ℹ️  Broker listo pero desactivado por diseño")
+
     except Exception as e:
-        print("❌ POSITION MANAGER FAILED")
+        print("❌ PIPELINE FAILED")
+        print(str(e))
         traceback.print_exc()
-        sys.exit(1)
+        return
 
-    # -----------------------------------------------------
-    # END
-    # -----------------------------------------------------
-    print("=" * 70)
-    print(f"🏁 DAILY PIPELINE END | {now_utc()}")
-    print("=" * 70)
+    end_ts = datetime.utcnow().isoformat()
+    print("=" * 60)
+    print(f"🏁 PIPELINE DAILY END | {end_ts}")
+    print("=" * 60)
 
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
 if __name__ == "__main__":
     main()
