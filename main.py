@@ -475,43 +475,42 @@ async def daily_system_run(request: Request):
     # -------------------------
     # Ejecutar decisiones vía BROKER (PAPER)
     # -------------------------
-    executed = []
+       executed = []
 
     for d in decisions:
-    action = d.get("action")
+        action = d.get("action")
 
-    if action in {"OPEN", "CLOSE", "ROTATE"}:
-        try:
-            r = requests.post(
-                config.BROKER_EXEC_URL,
-                json=d,
-                timeout=20,
-            )
-            r.raise_for_status()
+        if action in {"OPEN", "CLOSE", "ROTATE"}:
+            try:
+                r = requests.post(
+                    config.BROKER_EXEC_URL,
+                    json=d,
+                    timeout=20,
+                )
+                r.raise_for_status()
 
-            # 🧠 ACTUALIZAR MEMORIA DE POSICIONES
-            if action == "OPEN":
-                positions.append(d)
+                # 🧠 ACTUALIZAR MEMORIA DE POSICIONES
+                if action == "OPEN":
+                    positions.append(d)
 
-            elif action == "CLOSE":
-                positions = [
-                    p for p in positions
-                    if p.get("ticker") != d.get("ticker")
-                ]
+                elif action == "CLOSE":
+                    positions = [
+                        p for p in positions
+                        if p.get("ticker") != d.get("ticker")
+                    ]
 
-            elif action == "ROTATE":
-                positions = [
-                    p for p in positions
-                    if p.get("ticker") != d.get("close_ticker")
-                ]
-                positions.append(d)
+                elif action == "ROTATE":
+                    positions = [
+                        p for p in positions
+                        if p.get("ticker") != d.get("close_ticker")
+                    ]
+                    positions.append(d)
 
-            save_positions(positions_path, positions)
-            executed.append(d)
+                save_positions(positions_path, positions)
+                executed.append(d)
 
-        except Exception as e:
-            logger.error(f"Broker execution failed: {e}")
-
+            except Exception as e:
+                logger.error(f"Broker execution failed: {e}")
 
     logger.info(
         f"🏁 DAILY RUN END | decisions={len(decisions)} | executed={len(executed)}"
