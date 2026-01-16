@@ -311,6 +311,8 @@ async def signals_endpoint(
 # =====================================================
 DATA_PATH = Path(os.getenv("DATA_PATH", config.DATA_PATH))
 SCREENER_FILE = DATA_PATH / "screener_candidates.json"
+
+
 # =====================================================
 # Screener candidates endpoint (READ ONLY | DEBUG + FRONTEND)
 # =====================================================
@@ -392,6 +394,17 @@ async def receive_screener_result(
         "status": "ok",
         "decider": result,
     }
+    
+def load_positions(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+def save_positions(path: Path, positions: List[Dict[str, Any]]):
+    path.write_text(json.dumps(positions, indent=2), encoding="utf-8")
 
 # =========================================================
 # DAILY SYSTEM ORCHESTRATOR (INTERNAL)
@@ -429,9 +442,9 @@ async def daily_system_run(request: Request):
     # -------------------------
     # Cargar posiciones actuales (si existen)
     # -------------------------
-    positions_path = Path(config.DATA_PATH) / "positions.json"
-    positions = load_json(positions_path) or []
 
+   positions_path = Path(config.DATA_PATH) / "positions.json"
+   positions = load_positions(positions_path)
     decisions = []
 
     # -------------------------
@@ -461,21 +474,41 @@ async def daily_system_run(request: Request):
     # -------------------------
     executed = []
 
-    for d in decisions:
-        action = d.get("action")
-        if action in {"OPEN", "CLOSE", "ROTATE"}:
-            try:
-                import requests
+for d in decisions:
+    action = d.get("action")
 
-                r = requests.post(
-                    config.BROKER_EXEC_URL,
-                    json=d,
-                    timeout=20,
-                )
-                r.raise_for_status()
-                executed.append(d)
-            except Exception as e:
-                logger.error(f"Broker execution failed: {e}")
+    if action in {"OPEN", "CLOSE", "ROTATE"}:
+        try:
+            r = requests.post(
+                config.BROKER_EXEC_URL,
+                json=d,
+                timeout=20,
+            )
+            r.raise_for_status()
+
+            # 🧠 ACTUALIZAR MEMORIA DE POSICIONES
+            if action == "OPEN":
+                positions.append(d)
+
+            elif action == "CLOSE":
+                positions = [
+                    p for p in positions
+                    if p.get("ticker") != d.get("ticker")
+                ]
+
+            elif action == "ROTATE":
+                positions = [
+                    p for p in positions
+                    if p.get("ticker") != d.get("close_ticker")
+                ]
+                positions.append(d)
+
+            save_positions(positions_path, positions)
+            executed.append(d)
+
+        except Exception as e:
+            logger.error(f"Broker execution failed: {e}")
+
 
     logger.info(
         f"🏁 DAILY RUN END | decisions={len(decisions)} | executed={len(executed)}"
