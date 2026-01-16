@@ -1,1 +1,28 @@
-["JNJ", "KO", "PG", "MCD", "SPY"]
+[
+  "JNJ",
+  "KO",
+  "PG",
+  "MCD",
+  "SPY",
+
+  "SQM.SN",
+  "COPEC.SN",
+  "ENELAM.SN",
+  "ENELCHILE.SN",
+  "BCI.SN",
+  "BCHILE.SN",
+  "BSANTANDER.SN",
+  "FALABELLA.SN",
+  "CMPC.SN",
+  "CAP.SN",
+  "CENCOSUD.SN",
+  "COLBUN.SN",
+  "IAM.SN",
+  "ITAUCL.SN",
+  "VAPORES.SN",
+  "PARAUCO.SN",
+  "AESANDES.SN",
+  "RIPLEY.SN",
+  "SONDA.SN",
+  "CUPRUM.SN"
+]
