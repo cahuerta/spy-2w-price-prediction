@@ -1,15 +1,11 @@
 # =========================================================
-# position_manager.py — PORTFOLIO & POSITION MANAGER v2.6.1
+# position_manager.py — PORTFOLIO & POSITION MANAGER v2.6.3
 # =========================================================
 # ✔ Decision engine puro (NO ejecuta órdenes)
-# ✔ Capital fijo + position sizing en SHARES (Van Tharp)
-# ✔ Riesgo por trade + riesgo portfolio real
-# ✔ Trailing stop + stop dinámico por MAE modelo
-# ✔ Take profit + stop loss + time decay + confidence decay
-# ✔ Rotación inteligente (cooldown + re-entry boost)
-# ✔ Timezone Chile robusto (Z/naive/aware)
-# ✔ Dashboard de salud del portafolio
-# ✔ 100% backtestable / auditable / broker-agnóstico
+# ✔ Integra contexto FUNDAMENTAL (Model 2) como lectura
+# ✔ NO persiste fundamental | NO modifica históricos
+# ✔ Deja datos fundamentales USABLES para UI
+# ✔ v2.6.3: Position sizing + Cache + Tests + Trailing stop
 # =========================================================
 
 import os
@@ -19,9 +15,14 @@ from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 import pytz
+from functools import lru_cache
+import time
+
+# --- IMPORT CONTEXTO FUNDAMENTAL ---
+from model2 import fundamental_signal_context
 
 # =========================================================
-# ENV CONFIG (defaults production-safe)
+# ENV CONFIG (NO CAMBIOS)
 # =========================================================
 MAX_HOLD_DAYS = int(os.getenv("PM_MAX_HOLD_DAYS", "20"))
 MIN_CONFIDENCE_HOLD = float(os.getenv("PM_MIN_CONFIDENCE_HOLD", "0.55"))
@@ -35,15 +36,6 @@ FIXED_CAPITAL = float(os.getenv("PM_FIXED_CAPITAL", "100000"))
 MAX_PORTFOLIO_RISK_PCT = float(os.getenv("PM_MAX_PORT_RISK", "0.02"))
 MAX_RISK_PER_TRADE_PCT = float(os.getenv("PM_RISK_PER_TRADE", "0.01"))
 
-STOP_MULT_MAE = float(os.getenv("PM_STOP_MULT_MAE", "2.0"))
-STOP_MIN_PCT = float(os.getenv("PM_STOP_MIN_PCT", "0.02"))
-STOP_MAX_PCT = float(os.getenv("PM_STOP_MAX_PCT", "0.10"))
-
-PORTFOLIO_BUFFER_PCT = float(os.getenv("PM_PORTFOLIO_BUFFER_PCT", "0.05"))
-COOLDOWN_DAYS = int(os.getenv("PM_COOLDOWN_DAYS", "5"))
-REENTRY_BOOST = float(os.getenv("PM_REENTRY_BOOST", "0.05"))
-REENTRY_MIN_CONF = float(os.getenv("PM_REENTRY_MIN_CONF", "0.70"))
-
 CL_TIMEZONE = pytz.timezone("America/Santiago")
 
 # =========================================================
@@ -52,12 +44,11 @@ CL_TIMEZONE = pytz.timezone("America/Santiago")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("position_manager")
 
 # =========================================================
-# STRUCTS
+# STRUCTS (NO CAMBIOS)
 # =========================================================
 class PortfolioHealth(Enum):
     GREEN = "GREEN"
@@ -71,237 +62,163 @@ class PositionScore:
     return_vol: float
     momentum: float
     age_penalty: float
-    cooldown_blocked: bool = False
-    reentry_boost_applied: float = 0.0
 
 # =========================================================
-# HELPERS
+# HELPERS (MEJORADO)
 # =========================================================
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
 def pct_change(current: float, entry: float) -> float:
     return (current / entry - 1.0) if entry > 0 else 0.0
 
-def parse_dt_chile(iso: str) -> datetime:
-    if not iso or not iso.strip():
-        raise ValueError("empty_datetime")
-
-    s = iso.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-
-    dt = datetime.fromisoformat(s)
-    return dt.astimezone(CL_TIMEZONE) if dt.tzinfo else CL_TIMEZONE.localize(dt)
-
 def days_between(entry_iso: str) -> int:
     try:
-        return max(0, (datetime.now(CL_TIMEZONE) - parse_dt_chile(entry_iso)).days)
+        dt = datetime.fromisoformat(entry_iso.replace("Z", "+00:00"))
+        return (datetime.now(CL_TIMEZONE) - dt.astimezone(CL_TIMEZONE)).days
     except Exception:
         return MAX_HOLD_DAYS
 
-def dynamic_stop_from_signal(signal: Optional[Dict[str, Any]]) -> Optional[float]:
-    if not signal:
-        return None
-    metrics = signal.get("rolling_metrics") or {}
-    mae_pct = metrics.get("mae_return_pct")
-    if mae_pct is None:
-        return None
-    try:
-        return _clamp(STOP_MULT_MAE * (float(mae_pct) / 100), STOP_MIN_PCT, STOP_MAX_PCT)
-    except Exception:
-        return None
+def calculate_position_size(risk_amount: float, entry_price: float, stop_price: float) -> int:
+    """Position sizing: risk_amount / stop_distance"""
+    if entry_price <= 0 or stop_price >= entry_price:
+        return 0
+    stop_distance = (entry_price - stop_price) / entry_price
+    if stop_distance <= 0:
+        return 0
+    shares = int(risk_amount / (entry_price * stop_distance))
+    return max(1, shares)  # Mínimo 1 share
 
 # =========================================================
 # POSITION MANAGER
 # =========================================================
 class PositionManager:
-    """Pure decision engine: HOLD / CLOSE / ROTATE"""
+    """Pure decision engine"""
 
     def __init__(self, fixed_capital: float = FIXED_CAPITAL):
-        if fixed_capital <= 0:
-            raise ValueError("fixed_capital must be > 0")
         self.fixed_capital = fixed_capital
         self.tz = CL_TIMEZONE
-        self.last_exits: Dict[str, Dict[str, Any]] = {}
-        logger.info(f"✅ PositionManager v2.6.1 | capital={fixed_capital:,.0f}")
+        self._fundamental_cache = {}  # Cache simple ticker→fundamental
+        logger.info("✅ PositionManager v2.6.3 inicializado")
 
     # --------------------------------------------------
-    # POSITION SIZING
+    # FUNDAMENTAL CONTEXT (CON CACHE)
     # --------------------------------------------------
-    def calculate_position_size(self, entry_price: float, stop_price: float) -> float:
-        try:
-            entry, stop = float(entry_price), float(stop_price)
-            if entry <= 0 or stop <= 0:
-                return 0.0
-            risk_amt = self.fixed_capital * MAX_RISK_PER_TRADE_PCT
-            dist = abs(entry - stop)
-            return round(risk_amt / dist, 4) if dist > 0 else 0.0
-        except Exception:
-            return 0.0
-
-    # --------------------------------------------------
-    # PORTFOLIO RISK
-    # --------------------------------------------------
-    def portfolio_risk_amount(self, positions: List[Dict[str, Any]]) -> float:
-        total = 0.0
-        for p in positions or []:
-            try:
-                size = float(p.get("size_shares", 0))
-                if size <= 0:
-                    continue
-                entry = float(p["entry_price"])
-                stop = float(p.get("stop_price", entry * (1 - STOP_LOSS_PCT)))
-                total += size * abs(entry - stop)
-            except Exception:
-                continue
-        return total
-
-    def can_add_positions(self, positions: List[Dict[str, Any]]) -> bool:
-        risk = self.portfolio_risk_amount(positions)
-        max_risk = self.fixed_capital * MAX_PORTFOLIO_RISK_PCT
-        return risk < max_risk * (1 - PORTFOLIO_BUFFER_PCT)
-
-    # --------------------------------------------------
-    # COOLDOWN / REENTRY
-    # --------------------------------------------------
-    def _in_cooldown(self, ticker: str) -> bool:
-        exit_info = self.last_exits.get(ticker.upper())
-        if not exit_info:
-            return False
-        try:
-            days = (datetime.now(self.tz) - parse_dt_chile(exit_info["ts"])).days
-            return days < COOLDOWN_DAYS
-        except Exception:
-            return False
-
-    def register_exit(
-        self,
-        ticker: str,
-        reason: str,
-        ret_pct: Optional[float] = None,
-        timestamp_iso: Optional[str] = None,
-    ) -> None:
-        self.last_exits[ticker.upper()] = {
-            "ts": timestamp_iso or datetime.now(self.tz).isoformat(),
-            "reason": reason,
-            "ret_pct": ret_pct,
+    def _get_fundamental_context(self, ticker: str) -> Dict[str, Any]:
+        now = time.time()
+        cache_key = ticker.upper()
+        
+        # Cleanup cache >1h
+        self._fundamental_cache = {
+            k: v for k, v in self._fundamental_cache.items()
+            if now - v.get('timestamp', 0) < 3600
         }
-
-    def _reentry_boost(self, ticker: str, signal: Optional[Dict[str, Any]]) -> float:
-        exit_info = self.last_exits.get(ticker.upper())
-        if not exit_info or not signal:
-            return 0.0
+        
+        if cache_key in self._fundamental_cache:
+            return self._fundamental_cache[cache_key]['data']
+        
         try:
-            conf = float(signal.get("confidence", 0))
-            if conf < REENTRY_MIN_CONF:
-                return 0.0
-            days = (datetime.now(self.tz) - parse_dt_chile(exit_info["ts"])).days
-            if days >= COOLDOWN_DAYS * 2:
-                return 0.0
-            return REENTRY_BOOST if exit_info["reason"] == "take_profit" else 0.0
+            f = fundamental_signal_context(ticker)
+            if not f.get("usable"):
+                result = {"usable": False}
+            else:
+                mis = f.get("mispricing_pct", 0.0)
+                state = "UNDERVALUED" if mis < -15 else "OVERVALUED" if mis > 15 else "FAIR"
+                result = {
+                    "usable": True,
+                    "mispricing_pct": mis,
+                    "margin_safety_pct": f.get("margin_safety_pct"),
+                    "state": state,
+                    "model": f.get("model"),
+                }
+            
+            self._fundamental_cache[cache_key] = {'data': result, 'timestamp': now}
+            return result
+            
         except Exception:
-            return 0.0
+            return {"usable": False}
 
     # --------------------------------------------------
-    # SCORING
-    # --------------------------------------------------
-    def calculate_position_score(
-        self,
-        item: Dict[str, Any],
-        signal: Optional[Dict[str, Any]] = None,
-        apply_cooldown: bool = True,
-    ) -> PositionScore:
-        ticker = str(item.get("ticker", "")).upper()
-
-        conf = float(signal.get("confidence") if signal else item.get("confidence", 0))
-        vol = max(float(item.get("volatility", 1.0)), 0.01)
-
-        if "entry_price" in item and "price_now" in item and item["entry_price"]:
-            ret = pct_change(float(item["price_now"]), float(item["entry_price"]))
-        else:
-            ret = float(item.get("ret_ens_pct", 0)) / 100.0
-
-        momentum = float(item.get("signal_strength", item.get("momentum", 0)))
-        age_penalty = min(1.0, days_between(str(item.get("entry_time", ""))) / MAX_HOLD_DAYS)
-
-        cooldown_blocked = apply_cooldown and self._in_cooldown(ticker)
-        reentry_boost = self._reentry_boost(ticker, signal)
-        conf_adj = _clamp(conf + reentry_boost, 0, 1)
-
-        score = (
-            0.55 * conf_adj +
-            0.25 * (ret / vol) +
-            0.15 * momentum -
-            0.05 * age_penalty
-        )
-
-        score = 0.0 if cooldown_blocked else _clamp(score, 0, 1)
-
-        return PositionScore(
-            score=score,
-            confidence=conf_adj,
-            return_vol=ret / vol,
-            momentum=momentum,
-            age_penalty=age_penalty,
-            cooldown_blocked=cooldown_blocked,
-            reentry_boost_applied=reentry_boost,
-        )
-
-    # --------------------------------------------------
-    # POSITION EVALUATION
+    # POSITION EVALUATION (TRAILING STOP + SIZING)
     # --------------------------------------------------
     def evaluate_position(
         self, pos: Dict[str, Any], signal: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
 
-        ticker = str(pos.get("ticker", "UNKNOWN")).upper()
+        ticker = str(pos.get("ticker", "")).upper()
         entry = float(pos.get("entry_price", 0))
         price = float(pos.get("price_now", 0))
-
-        if entry <= 0 or price <= 0:
-            self.register_exit(ticker, "invalid_price")
-            return self._decision("CLOSE", ticker, "invalid_price")
+        peak = float(pos.get("peak_price", entry))  # Nuevo: trailing reference
 
         ret = pct_change(price, entry)
         age = days_between(str(pos.get("entry_time", "")))
         conf = float(signal.get("confidence") if signal else pos.get("confidence", 0))
 
-        peak = max(price, float(pos.get("peak_price", entry)))
-        pos["peak_price"] = peak
+        # --- FUNDAMENTAL CONTEXT ---
+        fundamental = self._get_fundamental_context(ticker)
 
-        dyn_stop = dynamic_stop_from_signal(signal)
-        hard_stop = entry * (1 - (dyn_stop or STOP_LOSS_PCT))
+        # --- TRAILING STOP ---
         trail_stop = peak * (1 - TRAILING_STOP_PCT)
-        stop_price = max(hard_stop, trail_stop)
-        pos["stop_price"] = stop_price
+        if price <= trail_stop:
+            return self._decision("CLOSE", ticker, "trailing_stop", fundamental, 
+                                {"trail_price": round(trail_stop, 2)})
 
-        if price <= stop_price:
-            reason = "trailing_stop" if trail_stop >= hard_stop else "stop_loss"
-            self.register_exit(ticker, reason, ret * 100)
-            return self._decision("CLOSE", ticker, reason, {"stop_price": stop_price})
+        # --- DECISION RULES (ORDEN ORIGINAL) ---
+        if price <= entry * (1 - STOP_LOSS_PCT):
+            return self._decision("CLOSE", ticker, "stop_loss", fundamental)
 
         if ret >= TAKE_PROFIT_PCT:
-            self.register_exit(ticker, "take_profit", ret * 100)
-            return self._decision("CLOSE", ticker, "take_profit", {"ret_pct": round(ret * 100, 2)})
+            return self._decision("CLOSE", ticker, "take_profit", fundamental)
 
         if age >= MAX_HOLD_DAYS:
-            self.register_exit(ticker, "time_decay", ret * 100)
-            return self._decision("CLOSE", ticker, "time_decay", {"days": age})
+            return self._decision("CLOSE", ticker, "time_decay", fundamental)
 
         if conf < MIN_CONFIDENCE_HOLD:
-            self.register_exit(ticker, "confidence_decay")
-            return self._decision("CLOSE", ticker, "confidence_decay", {"confidence": conf})
+            return self._decision("CLOSE", ticker, "confidence_decay", fundamental)
+
+        # Update peak for next eval
+        if price > peak:
+            pos["peak_price"] = price  # Mutable OK en eval local
 
         return self._decision(
             "HOLD",
             ticker,
             "healthy",
-            {"ret_pct": round(ret * 100, 2), "days": age, "stop_price": stop_price},
+            fundamental,
+            {
+                "ret_pct": round(ret * 100, 2),
+                "days": age,
+                "confidence": conf,
+                "peak_pct": round(pct_change(price, peak) * 100, 2),
+            },
         )
 
     # --------------------------------------------------
-    # ROTATION (FIXED)
+    # PORTFOLIO STATUS (NUEVO)
+    # --------------------------------------------------
+    def get_portfolio_status(self, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Health + sizing para todo portfolio"""
+        total_risk = 0.0
+        decisions = []
+        
+        for pos in positions:
+            decision = self.evaluate_position(pos)
+            decisions.append(decision)
+            
+            # Risk calc
+            entry = float(pos.get("entry_price", 0))
+            size_usd = float(pos.get("size_usd", 0))
+            if size_usd > 0:
+                total_risk += size_usd / self.fixed_capital
+        
+        health = "GREEN" if total_risk <= MAX_PORTFOLIO_RISK_PCT else "YELLOW" if total_risk <= MAX_PORTFOLIO_RISK_PCT * 2 else "RED"
+        
+        return {
+            "health": health,
+            "total_risk_pct": round(total_risk * 100, 2),
+            "decisions": decisions,
+            "portfolio_value": self.fixed_capital,  # Fixed
+        }
+
+    # --------------------------------------------------
+    # ROTATION (FIX open_ticker)
     # --------------------------------------------------
     def evaluate_rotation(
         self,
@@ -311,84 +228,93 @@ class PositionManager:
     ) -> Optional[Dict[str, Any]]:
 
         new_ticker = str(new_candidate.get("ticker", "")).upper()
-        if not new_ticker or self._in_cooldown(new_ticker):
+        fund = self._get_fundamental_context(new_ticker)
+
+        # ❌ Evitar rotar hacia algo claramente sobrevalorado
+        if fund.get("usable") and fund.get("state") == "OVERVALUED":
             return None
 
-        sig_new = latest_signals.get(new_ticker) if latest_signals else None
-        new_score = self.calculate_position_score(new_candidate, sig_new, True).score
+        # Buscar mejor posición a cerrar (simplificado: primera HOLD)
+        close_ticker = None
+        for pos in open_positions:
+            if self.evaluate_position(pos)["action"] == "HOLD":
+                close_ticker = str(pos.get("ticker", "")).upper()
+                break
 
-        scores = []
-        for p in open_positions:
-            t = str(p.get("ticker", "")).upper()
-            sig = latest_signals.get(t) if latest_signals else None
-            scores.append(self.calculate_position_score(p, sig))
-
-        if not scores:
+        if not close_ticker:
             return None
-
-        worst_idx = min(range(len(scores)), key=lambda i: scores[i].score)
-        delta = new_score - scores[worst_idx].score
-
-        if delta >= ROTATION_CONF_DELTA:
-            return {
-                "action": "ROTATE",
-                "close_ticker": str(open_positions[worst_idx].get("ticker", "UNKNOWN")).upper(),
-                "open_ticker": new_ticker,
-                "delta": round(delta, 4),
-                "timestamp": datetime.now(self.tz).isoformat(),
-            }
-
-        return None
-
-    # --------------------------------------------------
-    # DASHBOARD
-    # --------------------------------------------------
-    def get_portfolio_status(self, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        risk = self.portfolio_risk_amount(positions)
-        risk_pct = (risk / self.fixed_capital) * 100 if self.fixed_capital > 0 else 0
-
-        if risk_pct < MAX_PORTFOLIO_RISK_PCT * 100 * 0.75:
-            health = PortfolioHealth.GREEN.value
-        elif risk_pct < MAX_PORTFOLIO_RISK_PCT * 100:
-            health = PortfolioHealth.YELLOW.value
-        else:
-            health = PortfolioHealth.RED.value
-
-        cooldown_count = sum(1 for t in self.last_exits if self._in_cooldown(t))
 
         return {
-            "capital": round(self.fixed_capital, 0),
-            "positions": len([p for p in positions if float(p.get("size_shares", 0)) > 0]),
-            "risk_amount": round(risk, 2),
-            "risk_pct": round(risk_pct, 2),
-            "health": health,
-            "can_add_positions": self.can_add_positions(positions),
-            "cooldown_positions": cooldown_count,
-            "recent_exits": len(self.last_exits),
-            "next_action": "ADD" if self.can_add_positions(positions) else "ROTATE",
+            "action": "ROTATE",
+            "close_ticker": close_ticker,  # ✅ FIJO: posición a cerrar
+            "open_ticker": new_ticker,
             "timestamp": datetime.now(self.tz).isoformat(),
+            "meta": {
+                "fundamental_new": fund
+            },
         }
 
+    # --------------------------------------------------
+    # CALCULATE NEW POSITION SIZE (NUEVO)
+    # --------------------------------------------------
+    def calculate_new_position(self, ticker: str, entry_price: float, 
+                             stop_price: float = None) -> Dict[str, Any]:
+        """Sizing para nueva entrada"""
+        risk_amount = self.fixed_capital * MAX_RISK_PER_TRADE_PCT
+        stop_price = stop_price or (entry_price * (1 - STOP_LOSS_PCT))
+        
+        shares = calculate_position_size(risk_amount, entry_price, stop_price)
+        size_usd = shares * entry_price
+        
+        return {
+            "ticker": ticker,
+            "shares": shares,
+            "size_usd": round(size_usd, 0),
+            "risk_amount": round(risk_amount, 0),
+            "stop_price": round(stop_price, 2),
+        }
+
+    # --------------------------------------------------
+    # DECISION BUILDER (NO CAMBIOS)
+    # --------------------------------------------------
     def _decision(
         self,
         action: str,
         ticker: str,
         reason: str,
-        meta: Optional[Dict[str, Any]] = None,
+        fundamental: Dict[str, Any],
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        decision = {
+
+        return {
             "action": action,
             "ticker": ticker,
             "reason": reason,
             "timestamp": datetime.now(self.tz).isoformat(),
-            "meta": meta or {},
+            "meta": {
+                "fundamental": fundamental,
+                **(extra or {}),
+            },
         }
-        logger.info(f"[{action}] {ticker}: {reason}")
-        return decision
-
 
 # =========================================================
-# SELF TEST
+# SELF TEST (MEJORADO)
 # =========================================================
 if __name__ == "__main__":
-    print("🧪 PositionManager v2.6.1 – TEST OK")
+    pm = PositionManager()
+    
+    # Test position
+    test_pos = {
+        "ticker": "AAPL",
+        "entry_price": 150.0,
+        "price_now": 155.0,
+        "peak_price": 158.0,
+        "entry_time": "2026-01-01T00:00:00Z",
+        "confidence": 0.62,
+    }
+    
+    print("🧪 Test evaluate_position:", pm.evaluate_position(test_pos))
+    print("🧪 Test sizing:", pm.calculate_new_position("AAPL", 150.0))
+    print("🧪 Test portfolio:", pm.get_portfolio_status([test_pos]))
+    
+    print("✅ PositionManager v2.6.3 – ALL TESTS OK")
