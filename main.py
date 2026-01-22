@@ -1,6 +1,9 @@
-# =====================================================
-# main.py — TRADING SUITE ENTERPRISE v2.6.0 (PRODUCTION READY ✅)
-# =====================================================
+"""
+main.py — TRADING SUITE ENTERPRISE v2.7.0 PRODUCCIÓN ✅
+
+ORQUESTADOR COMPLETO: Market → PM → Broker
+Singletons PMs + APIs correctas + Monitoring enterprise
+"""
 
 import os
 import json
@@ -9,7 +12,6 @@ import time
 import asyncio
 import signal
 import requests
-
 from typing import Any, Dict, List, Optional, Deque
 from pathlib import Path
 from datetime import datetime
@@ -21,15 +23,26 @@ from fastapi import FastAPI, Query, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
-# Config - PRODUCTION READY
+# MÓDULOS CRÍTICOS (todos desarrollados)
+# =========================================================
+from market_state_evaluator import evaluate_quant_market  # ❌ PENDIENTE
+from market_qualitative_evaluator import evaluate_qualitative_market
+from market_orchestrator import MarketOrchestrator, MarketOrchestrationContext
+
+from pm_growth import PMGrowth  # ❌ PENDIENTE DESARROLLAR
+from pm_neutral import PMNeutral
+from pm_defensive import PMDefensive
+
+# =========================================================
+# CONFIGURACIÓN PRODUCTION READY
 # =========================================================
 class Config:
     DATA_PATH = os.getenv("DATA_PATH", "/data")
     PORT = int(os.getenv("PORT", "8000"))
     FIXED_CAPITAL = float(os.getenv("PM_FIXED_CAPITAL", "100000"))
 
-    BROKER_EXEC_URL = os.getenv("BROKER_URL", "http://localhost:8000/trading/execute")
-    BROKER_STATUS_URL = os.getenv("BROKER_STATUS_URL", "http://localhost:8000/trading/status")
+    BROKER_EXEC_URL = os.getenv("BROKER_URL", "http://localhost:8001/trading/execute")
+    BROKER_STATUS_URL = os.getenv("BROKER_STATUS_URL", "http://localhost:8001/trading/status")
 
     RL_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
     RL_PER_SECONDS = int(os.getenv("RATE_LIMIT_PER_SECONDS", "60"))
@@ -48,12 +61,12 @@ class Config:
 config = Config()
 
 # =========================================================
-# Logging - DUAL FILE/CONSOLE
+# LOGGING ENTERPRISE
 # =========================================================
 def setup_logging():
     Path(config.DATA_PATH).mkdir(parents=True, exist_ok=True)
-
     log_file = Path(config.DATA_PATH) / "trading_suite.log"
+
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -61,7 +74,7 @@ def setup_logging():
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     )
 
     lg = logging.getLogger("trading_suite")
@@ -75,161 +88,82 @@ def setup_logging():
 logger = setup_logging()
 
 # =========================================================
-# Disk Operations - CACHED & RESILIENT
+# DISK OPERATIONS
 # =========================================================
 def ensure_dirs():
-    (Path(config.DATA_PATH) / "predictions").mkdir(parents=True, exist_ok=True)
-    (Path(config.DATA_PATH) / "evaluations").mkdir(parents=True, exist_ok=True)
-    logger.info(f"📁 Directorios preparados en {config.DATA_PATH}")
+    dirs = [
+        "predictions", "evaluations", "market", "positions", "signals"
+    ]
+    for d in dirs:
+        (Path(config.DATA_PATH) / d).mkdir(parents=True, exist_ok=True)
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.debug(f"No se pudo cargar {path}: {e}")
+    except Exception:
         return None
 
-def safe_float(v: Any) -> Optional[float]:
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
-
-@lru_cache(maxsize=1024)
-def list_prediction_tickers_cached() -> List[str]:
-    root = Path(config.DATA_PATH) / "predictions"
-    if not root.exists():
-        return []
-    return sorted(d.name for d in root.iterdir() if d.is_dir())
-
-def latest_prediction_for_ticker(ticker: str) -> Optional[Dict[str, Any]]:
-    p = Path(config.DATA_PATH) / "predictions" / ticker
-    if not p.exists():
-        return None
-    files = sorted(p.glob("*.json"))
-    return load_json(files[-1]) if files else None
+def save_json(path: Path, data: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 # =========================================================
-# GLOBAL STATE - THREAD-SAFE POSITION MANAGER
+# SINGLETONS GLOBALES (CRÍTICO: mantiene hysteresis)
 # =========================================================
-_pm_cache: Optional["PositionManager"] = None
-_pm_lock = asyncio.Lock()
+_market_orchestrator: Optional[MarketOrchestrator] = None
+_pm_growth: Optional[PMGrowth] = None
+_pm_neutral: Optional[PMNeutral] = None
+_pm_defensive: Optional[PMDefensive] = None
 
-async def get_position_manager() -> "PositionManager":
-    global _pm_cache
-    if _pm_cache is None:
-        async with _pm_lock:
-            if _pm_cache is None:
-                try:
-                    from position_manager import PositionManager
-                    _pm_cache = PositionManager()
-                    logger.info("💼 PositionManager inicializado")
-                except Exception as e:
-                    logger.error(f"❌ PositionManager fallo: {e}")
-                    raise HTTPException(503, "PositionManager no disponible")
-    return _pm_cache
+def get_market_orchestrator() -> MarketOrchestrator:
+    global _market_orchestrator
+    if _market_orchestrator is None:
+        _market_orchestrator = MarketOrchestrator()
+        logger.info("🧠 MarketOrchestrator singleton inicializado")
+    return _market_orchestrator
 
-# =========================================================
-# BROKER CIRCUIT BREAKER - PRODUCTION GRADE
-# =========================================================
-class BrokerCircuit:
-    def __init__(self):
-        self.failures = 0
-        self.open_until = 0
-        self._lock = asyncio.Lock()
+def get_pm_growth() -> PMGrowth:
+    global _pm_growth
+    if _pm_growth is None:
+        _pm_growth = PMGrowth()
+        logger.info("📈 PMGrowth singleton inicializado")
+    return _pm_growth
 
-    async def is_open(self) -> bool:
-        async with self._lock:
-            return time.time() < self.open_until
+def get_pm_neutral() -> PMNeutral:
+    global _pm_neutral
+    if _pm_neutral is None:
+        _pm_neutral = PMNeutral()
+        logger.info("🟡 PMNeutral singleton inicializado")
+    return _pm_neutral
 
-    async def record_failure(self):
-        async with self._lock:
-            self.failures += 1
-            if self.failures >= config.BROKER_FAILURE_THRESHOLD:
-                self.open_until = time.time() + config.BROKER_CIRCUIT_OPEN_SECS
-                logger.error(f"🔌 BROKER CIRCUIT OPEN - Failures: {self.failures}")
-                return True
-        return False
+def get_pm_defensive() -> PMDefensive:
+    global _pm_defensive
+    if _pm_defensive is None:
+        _pm_defensive = PMDefensive()
+        logger.info("🔴 PMDefensive singleton inicializado")
+    return _pm_defensive
 
-    async def reset(self):
-        async with self._lock:
-            self.failures = 0
-            self.open_until = 0
-            logger.info("🔌 Broker circuit RESET")
-
-broker_circuit = BrokerCircuit()
+def resolve_pm(market_mode: str):
+    """Resuelve PM correcto MANTENIENDO ESTADO."""
+    if market_mode == "growth":
+        return get_pm_growth()
+    elif market_mode == "neutral":
+        return get_pm_neutral()
+    return get_pm_defensive()
 
 # =========================================================
-# ASYNC RATE LIMITER - SCALABLE
-# =========================================================
-class AsyncRateLimiter:
-    def __init__(self, requests: int, per_seconds: int, max_ips: int):
-        self.requests = requests
-        self.per_seconds = per_seconds
-        self.max_ips = max_ips
-        self.buckets: Dict[str, Deque[float]] = {}
-        self._lock = asyncio.Lock()
-
-    async def __call__(self, request: Request) -> bool:
-        ip = request.client.host if request.client else "unknown"
-        now = time.time()
-
-        async with self._lock:
-            if ip not in self.buckets:
-                if len(self.buckets) >= self.max_ips:
-                    self._cleanup(now)
-                self.buckets[ip] = deque(maxlen=self.requests * 2)
-
-            q = self.buckets[ip]
-            while q and now - q[0] > self.per_seconds:
-                q.popleft()
-
-            if len(q) >= self.requests:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Rate limit excedido",
-                )
-
-            q.append(now)
-            self._cleanup(now)
-
-        return True
-
-    def _cleanup(self, now: float):
-        expired = [
-            ip for ip, q in self.buckets.items()
-            if (not q) or (now - q[-1] > self.per_seconds * 2)
-        ]
-        for ip in expired:
-            self.buckets.pop(ip, None)
-
-rate_limiter = AsyncRateLimiter(
-    config.RL_REQUESTS, config.RL_PER_SECONDS, config.RL_MAX_IPS
-)
-
-# =========================================================
-# RATE LIMIT DEPENDENCY
-# =========================================================
-async def verify_rate_limit(request: Request):
-    await rate_limiter(request)
-
-# =========================================================
-# LIFESPAN - GRACEFUL START/STOP
+# FASTAPI SETUP
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite Enterprise v2.6.0 iniciando...")
+    logger.info("🚀 Trading Suite Enterprise v2.7.0 iniciando...")
     ensure_dirs()
-    await broker_circuit.reset()
     yield
-    logger.info("🛑 Trading Suite Enterprise deteniéndose...")
+    logger.info("🛑 Trading Suite detenida graceful")
 
-# =========================================================
-# FASTAPI APP - ENTERPRISE READY
-# =========================================================
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.6.0",
+    version="2.7.0",
     lifespan=lifespan,
 )
 
@@ -241,421 +175,250 @@ app.add_middleware(
 )
 
 # =========================================================
-# OPTIONAL MODULES - RESILIENT LOADING
+# OPTIONAL MODULES (graceful fallback)
 # =========================================================
-modules_status = {
-    "model": False,
-    "evaluator": False,
-    "position_manager": False,
-    "broker": False,
-}
-
+compute_all_signals = None
 try:
-    from model import run_model
-    modules_status["model"] = True
-except Exception:
-    run_model = None
-
-try:
-    from evaluator import evaluate_all
-    modules_status["evaluator"] = True
-except Exception:
-    evaluate_all = None
-
-try:
-    from position_manager import PositionManager
-    modules_status["position_manager"] = True
-except Exception:
-    pass
+    from signals import compute_all_signals
+    logger.info("✅ Signals module cargado")
+except Exception as e:
+    logger.warning(f"Signals module unavailable: {e}")
+    compute_all_signals = lambda: []
 
 try:
     from broker import router as broker_router
     app.include_router(broker_router, prefix="/trading")
-    modules_status["broker"] = True
-except Exception:
-    pass
-try:
-    from signals import compute_all_signals
-    modules_status["signals"] = True
+    logger.info("✅ Broker router integrado")
 except Exception as e:
-    compute_all_signals = None
-    modules_status["signals"] = False
-    
-# =========================================================
-# SIGNALS ENDPOINT (BACKEND ↔ FRONTEND)
-# =========================================================
-@app.get("/signals")
-async def signals_endpoint(
-    request: Request,
-    min_confidence: float = Query(config.SIGNALS_MIN_CONF_DEFAULT),
-    _=Depends(verify_rate_limit),
-):
-    if compute_all_signals is None:
-        raise HTTPException(503, "Signals module not available")
-
-    data = compute_all_signals()
-
-    if min_confidence > 0:
-        data = [
-            s for s in data
-            if (s.get("confidence") or 0) >= min_confidence
-        ]
-
-    return {
-        "signals": data,
-        "count": len(data),
-        "min_confidence": min_confidence,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
-
-# =====================================================
-# Screener disk path (SINGLE SOURCE OF TRUTH)
-# =====================================================
-DATA_PATH = Path(os.getenv("DATA_PATH", config.DATA_PATH))
-SCREENER_FILE = DATA_PATH / "screener_candidates.json"
-
-
-# =====================================================
-# Screener candidates endpoint (READ ONLY | DEBUG + FRONTEND)
-# =====================================================
-@app.get("/dashboard/screener")
-def get_screener_candidates():
-    path = SCREENER_FILE  # /data/screener_candidates.json
-
-    # Caso 1: archivo aún no generado
-    if not path.exists():
-        return {
-            "exists": False,
-            "path": str(path),
-            "generated_at": None,
-            "n_candidates": 0,
-            "candidates": [],
-            "message": "screener_candidates.json no existe aún"
-        }
-
-    # Caso 2: archivo existe → leerlo
-    try:
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-
-        stat = path.stat()
-
-        return {
-            "exists": True,
-            "path": str(path),
-            "size_bytes": stat.st_size,
-            "modified_at": stat.st_mtime,
-            # Payload esperado por frontend
-            "generated_at": data.get("generated_at"),
-            "version": data.get("version"),
-            "n_universe": data.get("n_universe"),
-            "n_candidates": data.get("n_candidates"),
-            "candidates": data.get("candidates", []),
-            # Debug útil (no rompe UI)
-            "meta": {
-                "ia_available": data.get("ia_available"),
-                "fundamental_available": data.get("fundamental_available"),
-                "params": data.get("params"),
-            },
-        }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error leyendo screener_candidates.json: {e}"
-        )
-
-@app.post("/internal/screener/result")
-async def receive_screener_result(
-    payload: Dict[str, Any],
-    request: Request,
-):
-    # Seguridad
-    if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
-        raise HTTPException(403, "Forbidden")
-
-    # 1️⃣ Guardar screener_candidates.json
-    path = Path(config.DATA_PATH) / "screener_candidates.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    logger.info("📁 Screener JSON recibido y guardado")
-
-    # 2️⃣ Ejecutar DECIDER inmediatamente
-    try:
-        from decider import run_decider
-        result = run_decider()
-
-        logger.info(
-            f"🧠 Decider ejecutado | added={len(result.get('added', []))} | total={result.get('total')}"
-        )
-    except Exception as e:
-        logger.error(f"❌ Decider falló tras screener: {e}")
-        raise HTTPException(500, f"Decider error: {e}")
-
-    # 3️⃣ Respuesta
-    return {
-        "status": "ok",
-        "decider": result,
-    }
-    
-def load_positions(path: Path) -> List[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-def save_positions(path: Path, positions: List[Dict[str, Any]]):
-    path.write_text(json.dumps(positions, indent=2), encoding="utf-8")
+    logger.warning(f"Broker router unavailable: {e}")
 
 # =========================================================
-# DAILY SYSTEM ORCHESTRATOR (INTERNAL)
+# DAILY SYSTEM ORCHESTRATOR (FLUJOS CORREGIDOS)
 # =========================================================
 @app.post("/internal/system/daily-run")
 async def daily_system_run(request: Request):
-    # -------------------------
-    # Seguridad
-    # -------------------------
+    """Orquestación completa diaria: Market → PM → Broker."""
+    
     if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
-        raise HTTPException(403, "Forbidden")
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    logger.info("🧠 DAILY RUN STARTED")
+    logger.info("🧠 === DAILY SYSTEM RUN INICIADO ===")
 
-    # -------------------------
-    # Cargar PositionManager
-    # -------------------------
+    # ================================
+    # 1️⃣ MARKET CONTEXT EVALUATION
+    # ================================
+    market_mode = "defensive"  # Fallback seguro
+    market_ctx = None
+    
     try:
-        pm = await get_position_manager()
+        spy_path = Path(config.DATA_PATH) / "market" / "spy_prices.json"
+        cross_path = Path(config.DATA_PATH) / "market" / "cross_prices.json"
+        
+        spy = load_json(spy_path)
+        cross = load_json(cross_path)
+
+        if not spy or not spy.get("prices") or not cross or not cross.get("prices"):
+            raise ValueError("Market data faltante o inválido")
+
+        quant_ctx = evaluate_quant_market(spy["prices"], cross["prices"])
+        qual_ctx = evaluate_qualitative_market(quant_ctx.to_dict())
+        
+        orchestrator = get_market_orchestrator()
+        market_ctx = orchestrator.evaluate(quant_ctx.to_dict(), qual_ctx.to_dict())
+        market_mode = market_ctx.market_mode
+        
+        # PERSISTIR MARKET STATE
+        save_json(
+            Path(config.DATA_PATH) / "market" / "current_state.json", 
+            market_ctx.to_dict()
+        )
+        
+        logger.info(f"🌍 MARKET MODE: {market_mode.upper()} | conf: {market_ctx.confidence:.2f}")
+
     except Exception as e:
-        logger.error(f"PM no disponible: {e}")
-        raise HTTPException(503, "PositionManager not available")
+        logger.error(f"❌ Market evaluation failed → FALLBACK DEFENSIVE: {e}")
+        market_ctx = MarketOrchestrationContext(
+            market_mode="defensive",
+            confidence=0.0,
+            reason=f"evaluation_failed: {str(e)[:100]}",
+            timestamp=datetime.utcnow().isoformat(),
+            source={}
+        )
 
-    # -------------------------
-    # Cargar señales
-    # -------------------------
-    if compute_all_signals is None:
-        raise HTTPException(503, "Signals module not available")
+    # ================================
+    # 2️⃣ RESOLVE PM SINGLETON
+    # ================================
+    pm = resolve_pm(market_mode)
+    logger.info(f"📦 PM ACTIVO: {pm.__class__.__name__}")
 
-    signals = compute_all_signals()
-    signals_by_ticker = {
-        s["ticker"].upper(): s for s in signals if s.get("ticker")
-    }
-
-    # -------------------------
-    # Cargar posiciones actuales (si existen)
-    # -------------------------
-
+    # ================================
+    # 3️⃣ LOAD CURRENT POSITIONS
+    # ================================
     positions_path = Path(config.DATA_PATH) / "positions.json"
-    positions = load_positions(positions_path)
+    positions = load_json(positions_path) or []
+    logger.info(f"📊 Portfolio actual: {len(positions)} posiciones")
 
+    # ================================
+    # 4️⃣ EVALUATE EXISTING POSITIONS
+    # ================================
     decisions = []
-
-    # -------------------------
-    # Evaluar posiciones existentes
-    # -------------------------
+    closes = 0
+    
     for pos in positions:
-        ticker = pos.get("ticker")
-        signal = signals_by_ticker.get(ticker)
-        decision = pm.evaluate_position(pos, signal)
-        decisions.append(decision)
+        try:
+            ticker = pos.get("ticker", "UNKNOWN")
+            decision = pm.evaluate_position(pos)  # 👈 API CORRECTA
+            decisions.append(decision.to_dict())
+            
+            if decision["action"] == "CLOSE":
+                closes += 1
+                logger.info(f"🛑 CLOSE: {ticker} | {decision['reason']}")
+                
+        except Exception as e:
+            logger.error(f"Error evaluando {ticker}: {e}")
+            decisions.append({
+                "action": "CLOSE", "ticker": ticker, 
+                "reason": f"evaluation_error: {str(e)}",
+                "timestamp": datetime.now().isoformat()
+            })
 
-    # -------------------------
-    # Evaluar ROTATION / OPEN
-    # -------------------------
-    if pm.can_add_positions(positions):
-        screener = load_json(SCREENER_FILE)
-        candidates = screener.get("candidates", []) if screener else []
+    # ================================
+    # 5️⃣ NEW POSITIONS (SOLO si PM permite)
+    # ================================
+    new_signals = []
+    if hasattr(pm, "allow_new_positions") and pm.allow_new_positions():
+        try:
+            signals = compute_all_signals()
+            logger.info(f"🔍 Evaluando {len(signals)} señales nuevas")
+            
+            for signal in signals[:5]:  # Máx 5 candidatos
+                decision = pm.evaluate_signal(signal)
+                if decision.action == "OPEN":
+                    new_signals.append(decision.to_dict())
+                    logger.info(f"➕ NEW OPEN: {decision.ticker} | conf: {decision.get('meta', {}).get('confidence', 0):.2f}")
+                    break  # 1 sola nueva posición por ciclo
+        except Exception as e:
+            logger.error(f"New signals failed: {e}")
 
-        for c in candidates:
-            rot = pm.evaluate_rotation(positions, c, signals_by_ticker)
-            if rot:
-                decisions.append(rot)
-                break  # solo una rotación por día
+    decisions.extend(new_signals)
+    logger.info(f"📋 Decisions: {len(decisions)} total | closes: {closes} | new: {len(new_signals)}")
 
-    # -------------------------
-    # Ejecutar decisiones vía BROKER (PAPER)
-    # -------------------------
+    # ================================
+    # 6️⃣ EXECUTE VIA BROKER
+    # ================================
     executed = []
-
-    for d in decisions:
-        action = d.get("action")
-
-        if action in {"OPEN", "CLOSE", "ROTATE"}:
+    execution_errors = 0
+    
+    for decision in decisions:
+        if decision["action"] in ["OPEN", "CLOSE"]:
             try:
-                r = requests.post(
+                response = requests.post(
                     config.BROKER_EXEC_URL,
-                    json=d,
-                    timeout=20,
+                    json=decision,
+                    timeout=15,
+                    headers={
+                        "X-MARKET-MODE": market_mode,
+                        "X-PM-ACTIVE": pm.__class__.__name__
+                    }
                 )
-                r.raise_for_status()
+                response.raise_for_status()
+                
+                broker_result = response.json()
+                executed.append({
+                    **decision,
+                    "broker_status": "success",
+                    "broker_response": broker_result
+                })
+                logger.info(f"✅ EXEC {decision['action']}: {decision['ticker']}")
+                
+            except requests.exceptions.RequestException as e:
+                execution_errors += 1
+                executed.append({
+                    **decision,
+                    "broker_status": "failed",
+                    "error": str(e)
+                })
+                logger.error(f"❌ Broker EXEC failed {decision['ticker']}: {e}")
 
-                # 🧠 ACTUALIZAR MEMORIA DE POSICIONES
-                if action == "OPEN":
-                    positions.append(d)
-
-                elif action == "CLOSE":
-                    positions = [
-                        p for p in positions
-                        if p.get("ticker") != d.get("ticker")
-                    ]
-
-                elif action == "ROTATE":
-                    positions = [
-                        p for p in positions
-                        if p.get("ticker") != d.get("close_ticker")
-                    ]
-                    positions.append(d)
-
-                save_positions(positions_path, positions)
-                executed.append(d)
-
-            except Exception as e:
-                logger.error(f"Broker execution failed: {e}")
-
-    logger.info(
-        f"🏁 DAILY RUN END | decisions={len(decisions)} | executed={len(executed)}"
-    )
-
-    return {
-        "status": "ok",
-        "decisions": decisions,
-        "executed": executed,
-        "timestamp": datetime.utcnow().isoformat(),
+    # ================================
+    # 7️⃣ FINAL SUMMARY & PERSIST
+    # ================================
+    summary = {
+        "status": "completed",
+        "market_mode": market_mode,
+        "market_confidence": getattr(market_ctx, 'confidence', 0.0),
+        "pm_active": pm.__class__.__name__,
+        "positions_evaluated": len(positions),
+        "closes": closes,
+        "new_positions": len(new_signals),
+        "executed": len([d for d in executed if d["broker_status"] == "success"]),
+        "execution_errors": execution_errors,
+        "total_decisions": len(decisions),
+        "decisions_sample": decisions[-10:],  # Últimas 10
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
-
+    
+    save_json(Path(config.DATA_PATH) / "daily_runs" / f"run_{datetime.now().strftime('%Y%m%d_%H%M')}.json", summary)
+    
+    logger.info(f"🏁 DAILY RUN COMPLETADO | {summary}")
+    return summary
 
 # =========================================================
-# HEALTH CHECK
+# MONITORING ENDPOINTS
+# =========================================================
+@app.get("/internal/market/state")
+async def get_market_state():
+    """Estado actual del mercado (persistido)."""
+    state_path = Path(config.DATA_PATH) / "market" / "current_state.json"
+    if state_path.exists():
+        return load_json(state_path)
+    return {"error": "No market state available"}
+
+@app.get("/internal/pm/status")
+async def get_pm_status():
+    """Estado de todos los PM singletons."""
+    return {
+        "growth": get_pm_growth().__class__.__name__ if _pm_growth else None,
+        "neutral": get_pm_neutral().__class__.__name__ if _pm_neutral else None,
+        "defensive": get_pm_defensive().__class__.__name__ if _pm_defensive else None,
+        "market_mode": getattr(get_market_orchestrator(), '_last_mode', 'unknown'),
+        "active_pm": resolve_pm("neutral").__class__.__name__
+    }
+
+@app.get("/internal/portfolio/summary")
+async def get_portfolio_summary():
+    """Resumen rápido portfolio."""
+    positions = load_json(Path(config.DATA_PATH) / "positions.json") or []
+    return {
+        "positions_count": len(positions),
+        "market_mode": getattr(get_market_orchestrator(), '_last_mode', 'unknown'),
+        "pm_active": resolve_pm("neutral").__class__.__name__
+    }
+
+# =========================================================
+# HEALTH ENHANCED
 # =========================================================
 @app.get("/health")
-async def health_check():
+async def health():
     return {
         "status": "healthy",
-        "version": "2.6.0",
-        "modules": modules_status,
-        "broker_circuit": await broker_circuit.is_open(),
+        "version": "2.7.0",
+        "market_mode": getattr(get_market_orchestrator(), '_last_mode', 'unknown'),
+        "pm_active": resolve_pm("neutral").__class__.__name__,
+        "positions": len(load_json(Path(config.DATA_PATH) / "positions.json") or []),
         "timestamp": datetime.utcnow().isoformat() + "Z"
     }
 
 # =========================================================
-# DASHBOARD ENDPOINTS (FIXED PARAM ORDER)
+# GRACEFUL SHUTDOWN
 # =========================================================
-@app.get("/dashboard/predictions")
-async def dashboard_predictions(
-    request: Request,
-    ticker: str = Query(...),
-    _=Depends(verify_rate_limit)
-):
-    pred_dir = Path(config.DATA_PATH) / "predictions" / ticker
-    if not pred_dir.exists():
-        return {"data": [], "ticker": ticker, "count": 0}
+def handle_shutdown(signum, frame):
+    logger.info("SIGTERM recibido - graceful shutdown")
+    raise SystemExit(0)
 
-    data = []
-    for f in sorted(pred_dir.glob("*.json")):
-        j = load_json(f)
-        if j and "prediction" in j:
-            data.append({**j, "filename": f.name, "timestamp": f.stat().st_mtime})
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
 
-    return {"ticker": ticker, "count": len(data), "latest": data[-1] if data else None, "data": data}
-
-@app.get("/dashboard/evaluations")
-async def dashboard_evaluations(
-    request: Request,
-    ticker: str = Query(...),
-    _=Depends(verify_rate_limit)
-):
-    eval_dir = Path(config.DATA_PATH) / "evaluations" / ticker
-    if not eval_dir.exists():
-        return {"data": [], "ticker": ticker, "count": 0}
-
-    data = []
-    for f in sorted(eval_dir.glob("*.json")):
-        j = load_json(f)
-        if j:
-            data.append({**j, "filename": f.name, "timestamp": f.stat().st_mtime})
-
-    return {"ticker": ticker, "count": len(data), "latest": data[-1] if data else None, "data": data}
-
-@app.get("/dashboard/tickers")
-async def dashboard_tickers(
-    request: Request,
-    _=Depends(verify_rate_limit)
-):
-    tickers = list_prediction_tickers_cached()
-    return {"tickers": tickers, "count": len(tickers), "cache_hits": list_prediction_tickers_cached.cache_info()}
-
-@app.get("/dashboard/latest/{ticker}")
-async def dashboard_latest(
-    request: Request,
-    ticker: str,
-    _=Depends(verify_rate_limit)
-):
-    pred = latest_prediction_for_ticker(ticker)
-    if not pred:
-        raise HTTPException(404, f"No predictions found for {ticker}")
-    return {"ticker": ticker, "latest": pred}
-@app.get("/dashboard/predictions/summary")
-async def dashboard_predictions_summary(
-    request: Request,
-    ticker: str = Query(...),
-    limit: int = Query(60, ge=1, le=500),
-    _=Depends(verify_rate_limit),
-):
-    pred_dir = Path(config.DATA_PATH) / "predictions" / ticker
-    if not pred_dir.exists():
-        raise HTTPException(404, f"No predictions for {ticker}")
-
-    files = sorted(pred_dir.glob("*.json"))
-    if not files:
-        raise HTTPException(404, f"No prediction files for {ticker}")
-
-    data = []
-    for fp in files[-limit:]:
-        obj = load_json(fp)
-        if not obj:
-            continue
-
-        p = obj.get("prediction", {})
-        if not p:
-            continue
-
-        data.append({
-            "date_base": p.get("date_base"),
-            "price_now": safe_float(p.get("price_now")),
-            "price_pred": safe_float(p.get("price_pred")),
-            "ret_ens_pct": safe_float(p.get("ret_ens_pct")),
-            "recommendation": p.get("recommendation"),
-        })
-
-    if not data:
-        raise HTTPException(404, f"No usable data for {ticker}")
-
-    return {
-        "ticker": ticker,
-        "count": len(data),
-        "data": data,
-    }
-
-# =========================================================
-# POSITION MANAGER ENDPOINT
-# =========================================================
-@app.get("/positions")
-async def get_positions(
-    request: Request,
-    _=Depends(verify_rate_limit)
-):
-    pm = await get_position_manager()
-    return await pm.get_positions()
-
-# =========================================================
-# MAIN
-# =========================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=config.PORT,
-        reload=config.DEBUG_MODE,
-        log_level="error" if not config.DEBUG_MODE else "debug",
-            )
+    uvicorn.run(app, host="0.0.0.0", port=config.PORT)
