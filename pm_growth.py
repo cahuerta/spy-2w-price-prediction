@@ -1,11 +1,12 @@
 # =========================================================
-# position_manager.py — PORTFOLIO & POSITION MANAGER v2.6.3
+# pm_growth.py — GROWTH POSITION MANAGER v2.6.3 (ALIGNED)
 # =========================================================
-# ✔ Decision engine puro (NO ejecuta órdenes)
-# ✔ Integra contexto FUNDAMENTAL (Model 2) como lectura
-# ✔ NO persiste fundamental | NO modifica históricos
-# ✔ Deja datos fundamentales USABLES para UI
-# ✔ v2.6.3: Position sizing + Cache + Tests + Trailing stop
+# ✔ PM GROWTH PURO (market_mode == growth)
+# ✔ Decision engine (NO ejecuta órdenes)
+# ✔ REQUIERE señales predictivas (signal obligatorio)
+# ✔ Integra contexto FUNDAMENTAL (Model 2) solo como lectura
+# ✔ Trailing stop + rotation + sizing
+# ✔ Compatible con main v2.7.0 + broker
 # =========================================================
 
 import os
@@ -15,14 +16,13 @@ from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 import pytz
-from functools import lru_cache
 import time
 
-# --- IMPORT CONTEXTO FUNDAMENTAL ---
+# --- FUNDAMENTAL CONTEXT ---
 from model2 import fundamental_signal_context
 
 # =========================================================
-# ENV CONFIG (NO CAMBIOS)
+# ENV CONFIG (GROWTH)
 # =========================================================
 MAX_HOLD_DAYS = int(os.getenv("PM_MAX_HOLD_DAYS", "20"))
 MIN_CONFIDENCE_HOLD = float(os.getenv("PM_MIN_CONFIDENCE_HOLD", "0.55"))
@@ -45,26 +45,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("position_manager")
+logger = logging.getLogger("pm_growth")
 
 # =========================================================
-# STRUCTS (NO CAMBIOS)
+# STRUCTS
 # =========================================================
 class PortfolioHealth(Enum):
     GREEN = "GREEN"
     YELLOW = "YELLOW"
     RED = "RED"
 
-@dataclass
-class PositionScore:
-    score: float
-    confidence: float
-    return_vol: float
-    momentum: float
-    age_penalty: float
-
 # =========================================================
-# HELPERS (MEJORADO)
+# HELPERS
 # =========================================================
 def pct_change(current: float, entry: float) -> float:
     return (current / entry - 1.0) if entry > 0 else 0.0
@@ -76,106 +68,145 @@ def days_between(entry_iso: str) -> int:
     except Exception:
         return MAX_HOLD_DAYS
 
-def calculate_position_size(risk_amount: float, entry_price: float, stop_price: float) -> int:
-    """Position sizing: risk_amount / stop_distance"""
+def calculate_position_size(
+    risk_amount: float, entry_price: float, stop_price: float
+) -> int:
     if entry_price <= 0 or stop_price >= entry_price:
         return 0
     stop_distance = (entry_price - stop_price) / entry_price
     if stop_distance <= 0:
         return 0
     shares = int(risk_amount / (entry_price * stop_distance))
-    return max(1, shares)  # Mínimo 1 share
+    return max(1, shares)
 
 # =========================================================
-# POSITION MANAGER
+# PM GROWTH
 # =========================================================
-class PositionManager:
-    """Pure decision engine"""
+class PMGrowth:
+    """
+    PM GROWTH.
+    SOLO debe usarse cuando market_mode == 'growth'.
+    """
 
     def __init__(self, fixed_capital: float = FIXED_CAPITAL):
         self.fixed_capital = fixed_capital
         self.tz = CL_TIMEZONE
-        self._fundamental_cache = {}  # Cache simple ticker→fundamental
-        logger.info("✅ PositionManager v2.6.3 inicializado")
+        self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
+        logger.info("📈 PMGrowth v2.6.3 inicializado")
 
     # --------------------------------------------------
-    # FUNDAMENTAL CONTEXT (CON CACHE)
+    # CAPABILITIES
+    # --------------------------------------------------
+    def allow_new_positions(self) -> bool:
+        """Growth mode: se permiten nuevas posiciones."""
+        return True
+
+    # --------------------------------------------------
+    # FUNDAMENTAL CONTEXT (CACHE 1h)
     # --------------------------------------------------
     def _get_fundamental_context(self, ticker: str) -> Dict[str, Any]:
         now = time.time()
-        cache_key = ticker.upper()
-        
-        # Cleanup cache >1h
+        key = ticker.upper()
+
+        # limpiar cache viejo
         self._fundamental_cache = {
             k: v for k, v in self._fundamental_cache.items()
-            if now - v.get('timestamp', 0) < 3600
+            if now - v["timestamp"] < 3600
         }
-        
-        if cache_key in self._fundamental_cache:
-            return self._fundamental_cache[cache_key]['data']
-        
+
+        if key in self._fundamental_cache:
+            return self._fundamental_cache[key]["data"]
+
         try:
-            f = fundamental_signal_context(ticker)
+            f = fundamental_signal_context(key)
             if not f.get("usable"):
-                result = {"usable": False}
+                data = {"usable": False}
             else:
                 mis = f.get("mispricing_pct", 0.0)
-                state = "UNDERVALUED" if mis < -15 else "OVERVALUED" if mis > 15 else "FAIR"
-                result = {
+                state = (
+                    "UNDERVALUED" if mis < -15
+                    else "OVERVALUED" if mis > 15
+                    else "FAIR"
+                )
+                data = {
                     "usable": True,
                     "mispricing_pct": mis,
                     "margin_safety_pct": f.get("margin_safety_pct"),
                     "state": state,
                     "model": f.get("model"),
                 }
-            
-            self._fundamental_cache[cache_key] = {'data': result, 'timestamp': now}
-            return result
-            
+
+            self._fundamental_cache[key] = {
+                "data": data,
+                "timestamp": now,
+            }
+            return data
+
         except Exception:
             return {"usable": False}
 
     # --------------------------------------------------
-    # POSITION EVALUATION (TRAILING STOP + SIZING)
+    # POSITION EVALUATION (SIGNAL REQUIRED)
     # --------------------------------------------------
     def evaluate_position(
-        self, pos: Dict[str, Any], signal: Optional[Dict[str, Any]] = None
+        self,
+        pos: Dict[str, Any],
+        signal: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """
+        Evalúa posición existente.
+        SIGNAL ES OBLIGATORIO en PMGrowth.
+        """
 
         ticker = str(pos.get("ticker", "")).upper()
         entry = float(pos.get("entry_price", 0))
         price = float(pos.get("price_now", 0))
-        peak = float(pos.get("peak_price", entry))  # Nuevo: trailing reference
-
-        ret = pct_change(price, entry)
+        peak = float(pos.get("peak_price", entry))
         age = days_between(str(pos.get("entry_time", "")))
-        conf = float(signal.get("confidence") if signal else pos.get("confidence", 0))
 
-        # --- FUNDAMENTAL CONTEXT ---
+        if not signal:
+            return self._decision(
+                "HOLD",
+                ticker,
+                "no_signal",
+                self._get_fundamental_context(ticker),
+            )
+
+        conf = float(signal.get("confidence", 0.0))
+        ret = pct_change(price, entry)
+
         fundamental = self._get_fundamental_context(ticker)
 
-        # --- TRAILING STOP ---
+        # ---- TRAILING STOP ----
         trail_stop = peak * (1 - TRAILING_STOP_PCT)
         if price <= trail_stop:
-            return self._decision("CLOSE", ticker, "trailing_stop", fundamental, 
-                                {"trail_price": round(trail_stop, 2)})
+            return self._decision(
+                "CLOSE",
+                ticker,
+                "trailing_stop",
+                fundamental,
+                {"trail_price": round(trail_stop, 2)},
+            )
 
-        # --- DECISION RULES (ORDEN ORIGINAL) ---
+        # ---- STOP LOSS ----
         if price <= entry * (1 - STOP_LOSS_PCT):
             return self._decision("CLOSE", ticker, "stop_loss", fundamental)
 
+        # ---- TAKE PROFIT ----
         if ret >= TAKE_PROFIT_PCT:
             return self._decision("CLOSE", ticker, "take_profit", fundamental)
 
+        # ---- TIME DECAY ----
         if age >= MAX_HOLD_DAYS:
             return self._decision("CLOSE", ticker, "time_decay", fundamental)
 
+        # ---- CONFIDENCE DECAY ----
         if conf < MIN_CONFIDENCE_HOLD:
             return self._decision("CLOSE", ticker, "confidence_decay", fundamental)
 
-        # Update peak for next eval
+        # ---- UPDATE PEAK ----
         if price > peak:
-            pos["peak_price"] = price  # Mutable OK en eval local
+            pos["peak_price"] = price
 
         return self._decision(
             "HOLD",
@@ -186,59 +217,36 @@ class PositionManager:
                 "ret_pct": round(ret * 100, 2),
                 "days": age,
                 "confidence": conf,
-                "peak_pct": round(pct_change(price, peak) * 100, 2),
             },
         )
 
     # --------------------------------------------------
-    # PORTFOLIO STATUS (NUEVO)
-    # --------------------------------------------------
-    def get_portfolio_status(self, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Health + sizing para todo portfolio"""
-        total_risk = 0.0
-        decisions = []
-        
-        for pos in positions:
-            decision = self.evaluate_position(pos)
-            decisions.append(decision)
-            
-            # Risk calc
-            entry = float(pos.get("entry_price", 0))
-            size_usd = float(pos.get("size_usd", 0))
-            if size_usd > 0:
-                total_risk += size_usd / self.fixed_capital
-        
-        health = "GREEN" if total_risk <= MAX_PORTFOLIO_RISK_PCT else "YELLOW" if total_risk <= MAX_PORTFOLIO_RISK_PCT * 2 else "RED"
-        
-        return {
-            "health": health,
-            "total_risk_pct": round(total_risk * 100, 2),
-            "decisions": decisions,
-            "portfolio_value": self.fixed_capital,  # Fixed
-        }
-
-    # --------------------------------------------------
-    # ROTATION (FIX open_ticker)
+    # ROTATION (GROWTH ONLY)
     # --------------------------------------------------
     def evaluate_rotation(
         self,
         open_positions: List[Dict[str, Any]],
         new_candidate: Dict[str, Any],
-        latest_signals: Optional[Dict[str, Dict[str, Any]]] = None,
+        latest_signals: Dict[str, Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
 
         new_ticker = str(new_candidate.get("ticker", "")).upper()
+        new_signal = latest_signals.get(new_ticker)
+
+        if not new_signal:
+            return None
+
         fund = self._get_fundamental_context(new_ticker)
 
-        # ❌ Evitar rotar hacia algo claramente sobrevalorado
         if fund.get("usable") and fund.get("state") == "OVERVALUED":
             return None
 
-        # Buscar mejor posición a cerrar (simplificado: primera HOLD)
         close_ticker = None
         for pos in open_positions:
-            if self.evaluate_position(pos)["action"] == "HOLD":
-                close_ticker = str(pos.get("ticker", "")).upper()
+            sig = latest_signals.get(pos.get("ticker", "").upper())
+            d = self.evaluate_position(pos, sig)
+            if d["action"] == "HOLD":
+                close_ticker = pos["ticker"]
                 break
 
         if not close_ticker:
@@ -246,36 +254,41 @@ class PositionManager:
 
         return {
             "action": "ROTATE",
-            "close_ticker": close_ticker,  # ✅ FIJO: posición a cerrar
+            "close_ticker": close_ticker,
             "open_ticker": new_ticker,
             "timestamp": datetime.now(self.tz).isoformat(),
             "meta": {
-                "fundamental_new": fund
+                "fundamental_new": fund,
             },
         }
 
     # --------------------------------------------------
-    # CALCULATE NEW POSITION SIZE (NUEVO)
+    # NEW POSITION SIZING
     # --------------------------------------------------
-    def calculate_new_position(self, ticker: str, entry_price: float, 
-                             stop_price: float = None) -> Dict[str, Any]:
-        """Sizing para nueva entrada"""
+    def calculate_new_position(
+        self,
+        ticker: str,
+        entry_price: float,
+        stop_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+
         risk_amount = self.fixed_capital * MAX_RISK_PER_TRADE_PCT
         stop_price = stop_price or (entry_price * (1 - STOP_LOSS_PCT))
-        
-        shares = calculate_position_size(risk_amount, entry_price, stop_price)
-        size_usd = shares * entry_price
-        
+
+        shares = calculate_position_size(
+            risk_amount, entry_price, stop_price
+        )
+
         return {
             "ticker": ticker,
             "shares": shares,
-            "size_usd": round(size_usd, 0),
+            "size_usd": round(shares * entry_price, 0),
             "risk_amount": round(risk_amount, 0),
             "stop_price": round(stop_price, 2),
         }
 
     # --------------------------------------------------
-    # DECISION BUILDER (NO CAMBIOS)
+    # DECISION BUILDER
     # --------------------------------------------------
     def _decision(
         self,
@@ -298,23 +311,21 @@ class PositionManager:
         }
 
 # =========================================================
-# SELF TEST (MEJORADO)
+# SELF TEST
 # =========================================================
 if __name__ == "__main__":
-    pm = PositionManager()
-    
-    # Test position
-    test_pos = {
+    pm = PMGrowth()
+
+    pos = {
         "ticker": "AAPL",
         "entry_price": 150.0,
         "price_now": 155.0,
         "peak_price": 158.0,
         "entry_time": "2026-01-01T00:00:00Z",
-        "confidence": 0.62,
     }
-    
-    print("🧪 Test evaluate_position:", pm.evaluate_position(test_pos))
-    print("🧪 Test sizing:", pm.calculate_new_position("AAPL", 150.0))
-    print("🧪 Test portfolio:", pm.get_portfolio_status([test_pos]))
-    
-    print("✅ PositionManager v2.6.3 – ALL TESTS OK")
+
+    signal = {"confidence": 0.65}
+
+    print("🧪 evaluate_position:", pm.evaluate_position(pos, signal))
+    print("🧪 allow_new_positions:", pm.allow_new_positions())
+    print("✅ PMGrowth v2.6.3 READY")
