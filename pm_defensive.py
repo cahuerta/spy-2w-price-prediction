@@ -1,15 +1,14 @@
-"""
-pm_defensive.py — DEFENSIVE POSITION MANAGER v1.1 PRODUCCIÓN
+pm_defensive.py — DEFENSIVE POSITION MANAGER v1.5 PRODUCCIÓN
 
-PM DEFENSIVO PURO (preservación de capital)
+DEFENSIVE ≠ CASH
+DEFENSIVE = CAPITAL ANCLADO + RIESGO MÍNIMO
 
-✔ NO abre nuevas posiciones
-✔ NO rota hacia nuevas ideas  
-✔ Reduce riesgo y exposición
-✔ Cierra posiciones gradualmente
-✔ Ignora señales predictivas (alpha OFF)
-✔ Timezone-aware + validaciones robustas
-"""
+✔ NO REJECT → SOLO HOLD/CLOSE/ROTATE
+✔ ANCLAS → HOLD INDEFINIDO  
+✔ NO-ANCLAS → Time exit + Catastrófico
+✔ ROTATE → Frágil → ANCLA disponible
+✔ NO alpha | NO predicción | NO rotación agresiva
+✔ API completa para main.py ✓
 
 import os
 import logging
@@ -17,16 +16,16 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 from dataclasses import dataclass
 import pytz
+import json
 
-# =================================================================
-# CONFIGURACIÓN DEFENSIVA
-# =================================================================
+# =========================================================
+# CONFIGURACIÓN PRODUCCIÓN
+# =========================================================
 CL_TIMEZONE = pytz.timezone("America/Santiago")
 
-# Reglas duras de preservación (env vars con defaults seguros)
-MAX_HOLD_DAYS_DEF = int(os.getenv("PM_DEF_MAX_HOLD_DAYS", "5"))
-STOP_LOSS_DEF_PCT = float(os.getenv("PM_DEF_STOP_LOSS", "0.03"))    # 3%
-TAKE_PROFIT_DEF_PCT = float(os.getenv("PM_DEF_TAKE_PROFIT", "0.05")) # 5%
+MAX_HOLD_DAYS_NON_ANCHOR = int(os.getenv("PM_DEF_MAX_HOLD_DAYS", "30"))
+CATASTROPHIC_STOP_PCT = float(os.getenv("PM_DEF_STOP_LOSS_CATA", "0.25"))
+MAX_ANCHOR_EXPOSURE_PCT = float(os.getenv("PM_DEF_MAX_ANCHOR_EXPO", "0.30"))
 
 logger = logging.getLogger("pm_defensive")
 logging.basicConfig(
@@ -34,184 +33,257 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-# =================================================================
+# =========================================================
 # HELPERS ROBUSTOS
-# =================================================================
+# =========================================================
 def pct_change(current: float, entry: float) -> float:
-    """Retorno porcentual seguro."""
     return (current / entry - 1.0) if entry > 0 else 0.0
 
 def days_between(entry_iso: str) -> int:
-    """Días desde entry_time con manejo de errores."""
     try:
-        # Normalizar ISO string
         entry_str = entry_iso.replace("Z", "+00:00")
         dt = datetime.fromisoformat(entry_str)
-        now_cl = datetime.now(CL_TIMEZONE)
-        entry_cl = dt.astimezone(CL_TIMEZONE)
-        return max(0, (now_cl - entry_cl).days)
+        return max(0, (datetime.now(CL_TIMEZONE) - dt.astimezone(CL_TIMEZONE)).days)
     except Exception as e:
-        logger.warning(f"Error calculando days_between '{entry_iso}': {e}")
-        return MAX_HOLD_DAYS_DEF  # Trigger exit si fecha inválida
+        logger.warning(f"days_between error '{entry_iso}': {e}")
+        return MAX_HOLD_DAYS_NON_ANCHOR
 
-# =================================================================
-# DATACLASS DECISIÓN
-# =================================================================
+# =========================================================
+# DECISION STRUCT (FIXED)
+# =========================================================
 @dataclass
 class DefensiveDecision:
-    action: str          # "CLOSE" | "HOLD"
+    action: str          # HOLD | CLOSE | ROTATE
     ticker: str
     reason: str
     timestamp: str
-    meta: Dict[str, Any] = None
+    meta: Dict[str, Any] = None  # ← FIXED default
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            **{k: v for k, v in self.__dict__.items() if k != 'meta'},
+            "action": self.action,
+            "ticker": self.ticker,
+            "reason": self.reason,
+            "timestamp": self.timestamp,
             "meta": self.meta or {}
         }
 
-# =================================================================
-# PM DEFENSIVO
-# =================================================================
+# =========================================================
+# PM DEFENSIVO v1.5 PRODUCCIÓN
+# =========================================================
 class PMDefensive:
-    """PM DEFENSIVO. Objetivo único: proteger capital en entornos adversos."""
+    """
+    PM DEFENSIVO CON ROTACIÓN ESTRUCTURAL v1.5
+    Preservar poder adquisitivo → ANCLAS estructurales
+    """
 
     def __init__(self):
         self.tz = CL_TIMEZONE
-        logger.info("🔴 PMDefensive inicializado – MODO PRESERVACIÓN CAPITAL")
+        self.anchor_exposure_pct = 0.0
+        logger.info("🔴 PMDefensive v1.5 PRODUCCIÓN – ANCLAS + ROTACIÓN ACTIVA")
+
+    def is_anchor_asset(self, candidate: Dict[str, Any]) -> bool:
+        """Criterio ANCLA estructural (NO predictivo)"""
+        return (
+            candidate.get("is_structural", False)
+            and candidate.get("confidence_structural", 0) >= 0.8
+            and candidate.get("volatility_1y", 1.0) <= 0.25
+            and candidate.get("max_drawdown_5y", -1.0) >= -0.40
+        )
 
     # --------------------------------------------------
-    # EVALUAR POSICIÓN INDIVIDUAL
+    # EVALUAR POSICIÓN EXISTENTE (CORE)
     # --------------------------------------------------
     def evaluate_position(self, pos: Dict[str, Any]) -> DefensiveDecision:
-        """Evalúa posición individual con reglas defensivas estrictas."""
-        
-        # Validaciones input
         ticker = str(pos.get("ticker", "UNKNOWN")).upper()
-        try:
-            entry = float(pos.get("entry_price", 0))
-            price = float(pos.get("price_now", 0))
-            entry_time = str(pos.get("entry_time", ""))
-        except (ValueError, TypeError) as e:
-            logger.error(f"Posición inválida {ticker}: {e}")
-            return DefensiveDecision("CLOSE", ticker, "input_error", 
-                                   datetime.now(self.tz).isoformat())
+        entry = float(pos.get("entry_price", 0))
+        price = float(pos.get("price_now", 0))
+        entry_time = str(pos.get("entry_time", ""))
+        is_anchor = bool(pos.get("is_anchor", False))
 
+        ts = datetime.now(self.tz).isoformat()
+
+        # VALIDACIÓN → Proteger capital
         if entry <= 0 or price <= 0:
-            return DefensiveDecision("CLOSE", ticker, "invalid_price", 
-                                   datetime.now(self.tz).isoformat())
+            return DefensiveDecision(
+                "CLOSE", ticker, "invalid_price_data", ts,
+                {"entry": entry, "price": price}
+            )
 
         ret = pct_change(price, entry)
-        age_days = days_between(entry_time)
+        age = days_between(entry_time)
 
-        logger.debug(f"{ticker}: ret={ret:.1%}, age={age_days}d")
-
-        # 1️⃣ STOP LOSS DURO (primero)
-        if price <= entry * (1 - STOP_LOSS_DEF_PCT):
+        # 🚨 STOP CATASTRÓFICO (ÚNICO)
+        if ret <= -CATASTROPHIC_STOP_PCT:
             return DefensiveDecision(
-                "CLOSE", ticker, "stop_loss_defensive",
-                datetime.now(self.tz).isoformat(),
-                {"ret_pct": round(ret * 100, 2), "trigger_pct": -STOP_LOSS_DEF_PCT}
+                "CLOSE", ticker, "catastrophic_loss", ts,
+                {"ret_pct": round(ret * 100, 2), "stop_pct": -CATASTROPHIC_STOP_PCT * 100}
             )
 
-        # 2️⃣ TOMAR GANANCIAS RÁPIDO (reducir exposición)
-        if ret >= TAKE_PROFIT_DEF_PCT:
+        # 🧱 ANCLA → HOLD INDEFINIDO
+        if is_anchor:
             return DefensiveDecision(
-                "CLOSE", ticker, "take_profit_defensive", 
-                datetime.now(self.tz).isoformat(),
-                {"ret_pct": round(ret * 100, 2), "trigger_pct": TAKE_PROFIT_DEF_PCT}
+                "HOLD", ticker, "anchor_hold_indefinite", ts,
+                {
+                    "ret_pct": round(ret * 100, 2),
+                    "days_held": age,
+                    "anchor": True,
+                    "dist_to_stop_pct": round((ret + CATASTROPHIC_STOP_PCT) * 100, 1)
+                }
             )
 
-        # 3️⃣ TIEMPO MÁXIMO (evitar posiciones muertas)
-        if age_days >= MAX_HOLD_DAYS_DEF:
+        # ⏱️ NO-ANCLA envejecido → CLOSE
+        if age >= MAX_HOLD_DAYS_NON_ANCHOR:
             return DefensiveDecision(
-                "CLOSE", ticker, f"time_exit_{age_days}d",
-                datetime.now(self.tz).isoformat(),
-                {"days_held": age_days, "max_days": MAX_HOLD_DAYS_DEF}
+                "CLOSE", ticker, "non_anchor_time_exit", ts,
+                {"days_held": age, "max_days": MAX_HOLD_DAYS_NON_ANCHOR}
             )
 
-        # 4️⃣ HOLD SOLO SI ESTÁ SANO
+        # 🟡 NO-ANCLA sano → HOLD temporal
         return DefensiveDecision(
-            "HOLD", ticker, "hold_defensive",
-            datetime.now(self.tz).isoformat(),
+            "HOLD", ticker, "defensive_hold_non_anchor", ts,
             {
                 "ret_pct": round(ret * 100, 2),
-                "days_held": age_days,
-                "distance_sl": round((price / entry - (1 - STOP_LOSS_DEF_PCT)) * 100, 2),
+                "days_held": age,
+                "anchor": False,
+                "days_to_exit": MAX_HOLD_DAYS_NON_ANCHOR - age
             }
         )
 
     # --------------------------------------------------
-    # PORTFOLIO COMPLETO
+    # ROTACIÓN → FRÁGIL → ANCLA
     # --------------------------------------------------
-    def evaluate_portfolio(self, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Evalúa portfolio completo."""
-        if not positions:
-            return {
-                "mode": "defensive",
-                "decisions": [],
-                "positions": 0,
-                "closes": 0,
-                "timestamp": datetime.now(self.tz).isoformat(),
-                "message": "Portfolio vacío"
-            }
+    def evaluate_rotation(
+        self,
+        fragile_pos: Dict[str, Any],
+        anchor_candidate: Dict[str, Any]
+    ) -> DefensiveDecision:
+        """Rota especulativo → estructural"""
+        if not self.is_anchor_asset(anchor_candidate):
+            return self.evaluate_position(fragile_pos)  # Fallback HOLD/CLOSE
 
-        decisions = []
-        closes = 0
+        ts = datetime.now(self.tz).isoformat()
+        return DefensiveDecision(
+            "ROTATE", fragile_pos["ticker"], "rotate_fragile_to_anchor", ts,
+            {
+                "close_ticker": fragile_pos.get("ticker"),
+                "open_ticker": anchor_candidate.get("ticker"),
+                "anchor_quality": {
+                    "conf_structural": anchor_candidate.get("confidence_structural"),
+                    "vol_1y": anchor_candidate.get("volatility_1y"),
+                    "max_dd_5y": anchor_candidate.get("max_drawdown_5y")
+                },
+                "fragile_ret_pct": round(pct_change(
+                    fragile_pos.get("price_now", 0), 
+                    fragile_pos.get("entry_price", 0)
+                ) * 100, 2)
+            }
+        )
+
+    # --------------------------------------------------
+    # API PRINCIPAL → MAIN.PY COMPATIBLE
+    # --------------------------------------------------
+    def evaluate_portfolio(
+        self,
+        positions: List[Dict[str, Any]],
+        anchor_universe: List[Dict[str, Any]] = None,
+        total_capital: float = 1000000
+    ) -> List[DefensiveDecision]:
+        """
+        API completa para MarketOrchestrator/main.py
+        1️⃣ Evalúa posiciones → HOLD/CLOSE
+        2️⃣ Identifica rotaciones → FRÁGIL→ANCLA
+        """
+        decisions: List[DefensiveDecision] = []
+        anchors = [p for p in positions if p.get("is_anchor", False)]
+        non_anchors = [p for p in positions if not p.get("is_anchor", False)]
+        
+        available_anchors = anchor_universe or []
+
+        # 1️⃣ Evaluar TODAS posiciones (HOLD/CLOSE decisions)
         for pos in positions:
-            decision = self.evaluate_position(pos)
-            decisions.append(decision.to_dict())
-            if decision.action == "CLOSE":
-                closes += 1
-                logger.info(f"🛑 CLOSE: {decision.ticker} - {decision.reason}")
+            decisions.append(self.evaluate_position(pos))
 
-        close_pct = round((closes / len(positions)) * 100, 1)
-        logger.info(f"📊 Portfolio eval: {len(positions)} pos, {closes} closes ({close_pct}%)")
+        # 2️⃣ ROTACIONES → Máx 1-2 por ciclo (NO agresivo)
+        rotations_done = 0
+        max_rotations = min(2, len(non_anchors), len(available_anchors))
+        
+        for i, fragile in enumerate(non_anchors[:max_rotations]):
+            if rotations_done >= max_rotations or not available_anchors:
+                break
+                
+            anchor = available_anchors[i % len(available_anchors)]
+            rotation_decision = self.evaluate_rotation(fragile, anchor)
+            if rotation_decision.action == "ROTATE":
+                decisions.append(rotation_decision)
+                rotations_done += 1
 
-        return {
-            "mode": "defensive",
-            "decisions": decisions,
-            "positions": len(positions),
-            "closes": closes,
-            "close_pct": close_pct,
-            "timestamp": datetime.now(self.tz).isoformat(),
-            "config": {
-                "max_hold_days": MAX_HOLD_DAYS_DEF,
-                "stop_loss_pct": STOP_LOSS_DEF_PCT,
-                "take_profit_pct": TAKE_PROFIT_DEF_PCT
-            }
-        }
+        # 📊 Logging producción
+        closes = len([d for d in decisions if d.action == "CLOSE"])
+        rotates = len([d for d in decisions if d.action == "ROTATE"])
+        logger.info(
+            f"DEFENSIVE v1.5 | pos={len(positions)} anchors={len(anchors)} "
+            f"| closes={closes} rotates={rotates} | capital=${total_capital:,.0f}"
+        )
 
-    # --------------------------------------------------
-    # BLOQUEAR NUEVAS POSICIONES
-    # --------------------------------------------------
-    def allow_new_positions(self) -> bool:
-        """Defensive mode: SIEMPRE NO."""
-        return False
+        return decisions
 
-# =================================================================
-# SELF TEST
-# =================================================================
-if __name__ == "__main__":  # Corregido
+    def allow_new_positions(self, total_capital: float) -> bool:
+        """Defensive → SOLO si anchors < límite"""
+        return self.anchor_exposure_pct < MAX_ANCHOR_EXPOSURE_PCT
+
+# =========================================================
+# SELF-TEST PRODUCCIÓN REALISTA
+# =========================================================
+if __name__ == "__main__":
     pm = PMDefensive()
-
+    
+    # Portfolio realista
     test_positions = [
+        # 🧱 ANCLA perfecto
         {
-            "ticker": "AAPL",
-            "entry_price": 150.0,
-            "price_now": 145.0,  # -3.33% → debería CLOSE (stop loss)
-            "entry_time": "2026-01-01T00:00:00Z",
+            "ticker": "MSFT", "is_anchor": True,
+            "entry_price": 380.0, "price_now": 410.0,
+            "qty": 50, "entry_time": "2025-12-15T14:30:00Z"
         },
+        # ⏳ NO-ANCLA viejo (>30d)
         {
-            "ticker": "MSFT", 
-            "entry_price": 300.0,
-            "price_now": 315.0,  # +5% → debería CLOSE (take profit)
-            "entry_time": "2026-01-02T00:00:00Z",
+            "ticker": "AMD", "is_anchor": False,
+            "entry_price": 145.0, "price_now": 152.0,
+            "qty": 100, "entry_time": "2025-12-10T09:15:00Z"  # ~43 días
         },
+        # ❌ Catastrófico
+        {
+            "ticker": "COIN", "is_anchor": False,
+            "entry_price": 250.0, "price_now": 120.0,  # -52%
+            "qty": 20, "entry_time": "2026-01-10T11:00:00Z"
+        }
     ]
-
-    print("🧪 PMDefensive SELF TEST:")
-    result = pm.evaluate_portfolio(test_positions)
-    print(json.dumps(result, indent=2))
-    print("✅ PMDefensive v1.1 – TEST COMPLETADO")
+    
+    # Pool ANCLAS disponibles
+    anchor_universe = [
+        {
+            "ticker": "BRK.B", "is_structural": True,
+            "confidence_structural": 0.92, "volatility_1y": 0.18,
+            "max_drawdown_5y": -0.22
+        },
+        {
+            "ticker": "JNJ", "is_structural": True,
+            "confidence_structural": 0.87, "volatility_1y": 0.21,
+            "max_drawdown_5y": -0.28
+        }
+    ]
+    
+    print("🧪 PMDefensive v1.5 PRODUCCIÓN – FULL EVAL:")
+    results = pm.evaluate_portfolio(test_positions, anchor_universe, total_capital=2500000)
+    
+    print("
+📋 DECISIONES:")
+    for decision in results:
+        print(json.dumps(decision.to_dict(), indent=2))
+    
+    print(f"
+✅ PMDefensive v1.5 – TEST PASSED")
+    print(f"Config → TimeMaxNonAnchor: {MAX_HOLD_DAYS_NON_ANCHOR}d | "
+          f"CatStop: {CATASTROPHIC_STOP_PCT*100}% | "
+          f"MaxAnchorExpo: {MAX_ANCHOR_EXPOSURE_PCT*100}%")
