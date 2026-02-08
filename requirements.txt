@@ -8,3 +8,4 @@ yfinance
 matplotlib
 alpaca-py>=0.20.0
 tenacity==8.2.3
+openai>=1.0.0
