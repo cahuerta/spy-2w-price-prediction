@@ -27,6 +27,7 @@ from fastapi import (
     Depends,
 )
 
+from pydantic import BaseModel  # ✅ ÚNICA CORRECCIÓN (NO EXISTÍA)
 
 # =========================================================
 # CONFIG
@@ -191,4 +192,3 @@ async def prediction_summary(
         "count": len(data),
         "data": data,
     }
-
