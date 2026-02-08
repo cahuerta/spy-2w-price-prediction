@@ -132,16 +132,12 @@ async def status(_: Any = Depends(rate_limiter)):
         "timestamp": datetime.utcnow().isoformat(),
     }
 
-@router.get("/tickers", response_model=List[TickerStats])
+@router.get("/tickers")
 async def tickers(_: Any = Depends(rate_limiter)):
     pred_path = Path(DATA_PATH) / "predictions"
-    out: List[TickerStats] = []
-
-    for t in list_tickers(str(pred_path)):
-        n = len(list((pred_path / t).glob("*.json")))
-        out.append(TickerStats(ticker=t, n_predictions=n))
-
-    return out
+    return {
+        "tickers": list_tickers(str(pred_path))
+    }
 
 # =========================================================
 # 🔑 ENDPOINT CLAVE — FUENTE ÚNICA DEL FRONTEND
