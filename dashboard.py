@@ -191,3 +191,35 @@ async def prediction_summary(
         "count": len(data),
         "data": data,
     }
+@router.get("/latest/{ticker}")
+async def latest_snapshot(
+    ticker: str,
+    _: Any = Depends(rate_limiter),
+):
+    pred_dir = Path(DATA_PATH) / "predictions" / ticker
+    if not pred_dir.exists():
+        raise HTTPException(404, f"No predictions for {ticker}")
+
+    files = sorted(pred_dir.glob("*.json"))
+    if not files:
+        raise HTTPException(404, f"No prediction files for {ticker}")
+
+    last = load_json(files[-1])
+    if not last:
+        raise HTTPException(404, "Invalid prediction file")
+
+    return {
+        "ticker": ticker,
+        "latest": last
+    }
+    @router.get("/screener")
+async def screener(_: Any = Depends(rate_limiter)):
+    p = Path(DATA_PATH) / "screener" / "screener_latest.json"
+    if not p.exists():
+        raise HTTPException(404, "Screener not available")
+
+    data = load_json(p)
+    if not data:
+        raise HTTPException(500, "Invalid screener file")
+
+    return data
