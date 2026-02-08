@@ -1,11 +1,8 @@
-# =========================================================
-# dashboard.py — TRADING DASHBOARD API v3.0 (ENTERPRISE)
-# =========================================================
+# dashboard.py — VERSIÓN FINAL CORREGIDA (ENTERPRISE / MODELO 3)
 # 🔹 LEE SOLO DESDE /data/predictions
 # 🔹 signals.py NO es fuente de análisis
 # 🔹 Frontend usa predictions como VERDAD
-# 🔹 signals = visor secundario (otra pestaña)
-# =========================================================
+# 🔹 signals = visor secundario (pestaña señales)
 
 import os
 import json
@@ -18,6 +15,7 @@ from datetime import datetime
 from collections import defaultdict, deque
 from functools import lru_cache
 
+import numpy as np
 from fastapi import (
     FastAPI,
     APIRouter,
@@ -26,24 +24,24 @@ from fastapi import (
     Request,
     Depends,
 )
-
-from pydantic import BaseModel  # ✅ ÚNICA CORRECCIÓN (NO EXISTÍA)
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # =========================================================
-# CONFIG
+# Config
 # =========================================================
 DATA_PATH = os.getenv("DATA_PATH", "/data")
 MIN_CONFIDENCE = float(os.getenv("SIGNAL_MIN_CONFIDENCE", "0.4"))
 
 # =========================================================
-# LOGGING
+# Logging
 # =========================================================
 def setup_logging():
     level = logging.INFO
     try:
         log_path = Path(DATA_PATH) / "dashboard.log"
         log_path.parent.mkdir(exist_ok=True)
-        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh = logging.FileHandler(log_path)
     except Exception:
         fh = logging.NullHandler()
 
@@ -56,18 +54,17 @@ def setup_logging():
     )
 
 setup_logging()
-logger = logging.getLogger("dashboard")
+logger = logging.getLogger(__name__)
 
 # =========================================================
-# RATE LIMITER (SIMPLE, EFECTIVO)
+# Rate Limiter
 # =========================================================
 class SimpleRateLimiter:
-    def __init__(self, requests: int = 20, per_seconds: int = 60):
+    def __init__(self, requests=20, per_seconds=60, max_ips=5000):
         self.requests = requests
         self.per_seconds = per_seconds
-        self.buckets: Dict[str, deque] = defaultdict(
-            lambda: deque(maxlen=requests * 2)
-        )
+        self.max_ips = max_ips
+        self.buckets: Dict[str, deque] = defaultdict(lambda: deque(maxlen=requests * 2))
 
     async def __call__(self, request: Request):
         ip = request.client.host if request.client else "unknown"
@@ -78,7 +75,7 @@ class SimpleRateLimiter:
             q.popleft()
 
         if len(q) >= self.requests:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+            raise HTTPException(429, "Rate limit exceeded")
 
         q.append(now)
         return True
@@ -86,19 +83,20 @@ class SimpleRateLimiter:
 rate_limiter = SimpleRateLimiter()
 
 # =========================================================
-# ROUTER
+# Router
 # =========================================================
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 # =========================================================
-# MODELS
+# Models
 # =========================================================
 class TickerStats(BaseModel):
     ticker: str
     n_predictions: int = 0
+    n_evaluations: int = 0
 
 # =========================================================
-# HELPERS
+# Helpers
 # =========================================================
 @lru_cache(maxsize=2)
 def list_tickers(path: str) -> List[str]:
@@ -109,7 +107,7 @@ def list_tickers(path: str) -> List[str]:
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r") as f:
             return json.load(f)
     except Exception:
         return None
@@ -136,16 +134,14 @@ async def status(_: Any = Depends(rate_limiter)):
 @router.get("/tickers", response_model=List[TickerStats])
 async def tickers(_: Any = Depends(rate_limiter)):
     pred_path = Path(DATA_PATH) / "predictions"
-    out: List[TickerStats] = []
-
+    out = []
     for t in list_tickers(str(pred_path)):
         n = len(list((pred_path / t).glob("*.json")))
         out.append(TickerStats(ticker=t, n_predictions=n))
-
     return out
 
 # =========================================================
-# 🔑 ENDPOINT CLAVE — FUENTE ÚNICA DEL FRONTEND
+# 🔑 ENDPOINT CLAVE — ESTE ERA EL QUE FALTABA
 # =========================================================
 @router.get("/predictions/summary")
 async def prediction_summary(
@@ -155,16 +151,15 @@ async def prediction_summary(
 ):
     """
     📈 Fuente ÚNICA del análisis.
-    Lee datos YA calculados por model.py
+    LEE datos históricos ya calculados por model.py
     """
     pred_dir = Path(DATA_PATH) / "predictions" / ticker
-
     if not pred_dir.exists():
-        raise HTTPException(status_code=404, detail=f"No predictions for {ticker}")
+        raise HTTPException(404, f"No predictions for {ticker}")
 
     files = sorted(pred_dir.glob("*.json"))
     if not files:
-        raise HTTPException(status_code=404, detail=f"No prediction files for {ticker}")
+        raise HTTPException(404, f"No prediction files for {ticker}")
 
     data = []
     for fp in files[-limit:]:
@@ -172,8 +167,8 @@ async def prediction_summary(
         if not obj:
             continue
 
-        p = obj.get("prediction")
-        if not isinstance(p, dict):
+        p = obj.get("prediction", {})
+        if not p:
             continue
 
         data.append({
@@ -185,10 +180,29 @@ async def prediction_summary(
         })
 
     if not data:
-        raise HTTPException(status_code=404, detail="No usable prediction data")
+        raise HTTPException(404, f"No usable data for {ticker}")
 
     return {
         "ticker": ticker,
         "count": len(data),
         "data": data,
     }
+
+# =========================================================
+# App
+# =========================================================
+app = FastAPI(title="Trading Dashboard API", version="3.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
