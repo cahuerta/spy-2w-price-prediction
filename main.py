@@ -1,8 +1,8 @@
 # =========================================================
-# main.py — TRADING SUITE ENTERPRISE v2.8.2 PRODUCCION
+# main_engine.py — TRADING SUITE ENTERPRISE v2.8.2
 # =========================================================
-# ORQUESTADOR COMPLETO: Market -> PM -> Broker -> PortfolioStore
-# ASYNC + RETRY + LIMITES + MONITORING
+# CEREBRO PURO (NO FASTAPI)
+# Ejecutado por CRON / JOB
 # =========================================================
 
 import os
@@ -10,20 +10,15 @@ import json
 import logging
 import time
 import asyncio
-import signal
 import httpx
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from datetime import datetime
-from contextlib import asynccontextmanager
-from dashboard import router as dashboard_router
 
 from tenacity import retry, stop_after_attempt, wait_exponential
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
-# MODULOS CORE (CEREBRO)
+# MODULOS CORE
 # =========================================================
 from market_state_evaluator import evaluate_quant_market
 from market_qualitative_evaluator import evaluate_qualitative_market
@@ -45,16 +40,14 @@ from portfolio_store import (
 )
 
 # =========================================================
-# CONFIG PRODUCCION
+# CONFIG
 # =========================================================
 class Config:
     DATA_PATH = os.getenv("DATA_PATH", "/data")
-    PORT = int(os.getenv("PORT", "8000"))
     BROKER_EXEC_URL = os.getenv(
         "BROKER_URL",
         "http://localhost:8001/trading/execute",
     )
-    PIPELINE_KEY = os.getenv("PIPELINE_KEY")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
     BROKER_TIMEOUT = int(os.getenv("BROKER_TIMEOUT", "15"))
@@ -62,72 +55,41 @@ class Config:
 config = Config()
 
 # =========================================================
-# LOGGING (AISLADO DEL DASHBOARD)
+# LOGGING
 # =========================================================
-def setup_logging():
-    Path(config.DATA_PATH).mkdir(parents=True, exist_ok=True)
-    log_file = Path(config.DATA_PATH) / "trading_suite.log"
+Path(config.DATA_PATH).mkdir(parents=True, exist_ok=True)
 
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    return logging.getLogger("trading_suite")
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(
+            Path(config.DATA_PATH) / "trading_suite.log",
+            encoding="utf-8",
+        ),
+        logging.StreamHandler(),
+    ],
+)
 
-logger = setup_logging()
+logger = logging.getLogger("trading_engine")
 
 # =========================================================
-# SINGLETONS (THREAD SAFE)
+# SINGLETONS
 # =========================================================
-import threading
-
-_singleton_lock = threading.Lock()
-_market_orchestrator: Optional[MarketOrchestrator] = None
-_pm_growth: Optional[PMGrowth] = None
-_pm_neutral: Optional[PMNeutral] = None
-_pm_defensive: Optional[PMDefensive] = None
-
-def get_market_orchestrator() -> MarketOrchestrator:
-    global _market_orchestrator
-    with _singleton_lock:
-        if _market_orchestrator is None:
-            _market_orchestrator = MarketOrchestrator()
-        return _market_orchestrator
-
-def get_pm_growth() -> PMGrowth:
-    global _pm_growth
-    with _singleton_lock:
-        if _pm_growth is None:
-            _pm_growth = PMGrowth()
-        return _pm_growth
-
-def get_pm_neutral() -> PMNeutral:
-    global _pm_neutral
-    with _singleton_lock:
-        if _pm_neutral is None:
-            _pm_neutral = PMNeutral()
-        return _pm_neutral
-
-def get_pm_defensive() -> PMDefensive:
-    global _pm_defensive
-    with _singleton_lock:
-        if _pm_defensive is None:
-            _pm_defensive = PMDefensive()
-        return _pm_defensive
+_market_orchestrator = MarketOrchestrator()
+_pm_growth = PMGrowth()
+_pm_neutral = PMNeutral()
+_pm_defensive = PMDefensive()
 
 def resolve_pm(mode: str):
     if mode == "growth":
-        return get_pm_growth()
+        return _pm_growth
     if mode == "neutral":
-        return get_pm_neutral()
-    return get_pm_defensive()
+        return _pm_neutral
+    return _pm_defensive
 
 # =========================================================
-# BROKER CLIENT (RETRY + BACKOFF)
+# BROKER CLIENT
 # =========================================================
 async def execute_broker(
     decision: Dict[str, Any],
@@ -149,7 +111,6 @@ async def execute_broker(
                 headers={
                     "X-MARKET-MODE": market_mode,
                     "X-PM-ACTIVE": decision.get("pm", "unknown"),
-                    "Content-Type": "application/json",
                 },
             )
             r.raise_for_status()
@@ -164,47 +125,21 @@ async def execute_broker(
         return None
 
 # =========================================================
-# FASTAPI APP (CEREBRO)
+# MAIN DAILY RUN (CEREBRO)
 # =========================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Trading Suite v2.8.2 starting")
-    yield
-    logger.info("Trading Suite v2.8.2 shutdown")
-
-app = FastAPI(
-    title="Trading Suite Enterprise",
-    version="2.8.2",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.include_router(dashboard_router)
-
-# =========================================================
-# DAILY RUN (PIPELINE PRINCIPAL)
-# =========================================================
-@app.post("/internal/system/daily-run")
-async def daily_system_run(request: Request):
-    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
-        raise HTTPException(status_code=403, detail="Invalid pipeline key")
-
+async def daily_run():
     logger.info("DAILY RUN START")
 
-    # --------------------------------------------------
+    # -------------------------------
     # 1. MARKET EVALUATION
-    # --------------------------------------------------
+    # -------------------------------
     try:
-        spy_path = Path(config.DATA_PATH) / "market/spy_prices.json"
-        cross_path = Path(config.DATA_PATH) / "market/cross_prices.json"
-
-        spy = json.loads(spy_path.read_text())
-        cross = json.loads(cross_path.read_text())
+        spy = json.loads(
+            (Path(config.DATA_PATH) / "market/spy_prices.json").read_text()
+        )
+        cross = json.loads(
+            (Path(config.DATA_PATH) / "market/cross_prices.json").read_text()
+        )
 
         quant = evaluate_quant_market(
             spy["prices"],
@@ -212,14 +147,12 @@ async def daily_system_run(request: Request):
         )
         qual = evaluate_qualitative_market(quant.to_dict())
 
-        orchestrator = get_market_orchestrator()
-        market_ctx = orchestrator.evaluate(
+        market_ctx = _market_orchestrator.evaluate(
             quant.to_dict(),
             qual.to_dict(),
         )
         market_mode = market_ctx.market_mode
 
-        Path(config.DATA_PATH, "market").mkdir(exist_ok=True)
         (Path(config.DATA_PATH) / "market/current_state.json").write_text(
             json.dumps(market_ctx.to_dict(), indent=2)
         )
@@ -230,7 +163,7 @@ async def daily_system_run(request: Request):
         )
 
     except Exception as e:
-        logger.error(f"Market eval failed -> fallback defensive: {e}")
+        logger.error(f"Market eval failed → DEFENSIVE: {e}")
         market_ctx = MarketOrchestrationContext(
             market_mode="defensive",
             confidence=0.0,
@@ -240,147 +173,88 @@ async def daily_system_run(request: Request):
         )
         market_mode = "defensive"
 
-    # --------------------------------------------------
-    # 2. PM RESOLUTION
-    # --------------------------------------------------
+    # -------------------------------
+    # 2. PM
+    # -------------------------------
     pm = resolve_pm(market_mode)
     logger.info(f"PM ACTIVO: {pm.__class__.__name__}")
 
-    # --------------------------------------------------
-    # 3. PORTFOLIO + LIMITS
-    # --------------------------------------------------
+    # -------------------------------
+    # 3. PORTFOLIO
+    # -------------------------------
     positions = load_positions()
-    summary = portfolio_summary()
 
-    if len(positions) >= config.MAX_POSITIONS:
-        allow_actions = ["CLOSE", "ROTATE"]
-        logger.warning("PORTFOLIO FULL -> only CLOSE / ROTATE")
-    else:
-        allow_actions = ["OPEN", "CLOSE", "ROTATE"]
+    allow_actions = (
+        ["CLOSE", "ROTATE"]
+        if len(positions) >= config.MAX_POSITIONS
+        else ["OPEN", "CLOSE", "ROTATE"]
+    )
 
-    # --------------------------------------------------
-    # 4. POSITION EVALUATION
-    # --------------------------------------------------
+    # -------------------------------
+    # 4. DECISIONS
+    # -------------------------------
     decisions: List[Dict[str, Any]] = []
 
     for pos in positions:
-        decision = pm.evaluate_position(pos).to_dict()
-        decision["pm"] = pm.__class__.__name__
-
-        if decision["action"] in allow_actions:
-            decisions.append(decision)
+        d = pm.evaluate_position(pos).to_dict()
+        d["pm"] = pm.__class__.__name__
+        if d["action"] in allow_actions:
+            decisions.append(d)
 
     logger.info(f"Valid decisions: {len(decisions)}")
 
-    # --------------------------------------------------
-    # 5. ASYNC EXECUTION
-    # --------------------------------------------------
-    async def exec_one(decision: Dict[str, Any]) -> bool:
-        fill = await execute_broker(decision, market_mode)
+    # -------------------------------
+    # 5. EXECUTION
+    # -------------------------------
+    async def exec_one(d: Dict[str, Any]) -> bool:
+        fill = await execute_broker(d, market_mode)
         if not fill:
             return False
 
-        action = decision["action"]
-
-        if action == "OPEN":
-            return register_open(decision, fill, market_ctx.to_dict())
-        if action == "CLOSE":
-            return register_close(decision, fill)
-        if action == "ROTATE":
+        if d["action"] == "OPEN":
+            return register_open(d, fill, market_ctx.to_dict())
+        if d["action"] == "CLOSE":
+            return register_close(d, fill)
+        if d["action"] == "ROTATE":
             return register_rotate(
-                decision,
+                d,
                 broker_close_fill=fill.get("close", {}),
                 broker_open_fill=fill.get("open", {}),
                 market_ctx=market_ctx.to_dict(),
             )
         return False
 
+    executed = 0
     if decisions:
-        results = await asyncio.gather(
-            *(exec_one(d) for d in decisions),
-            return_exceptions=True,
-        )
-        executed = sum(1 for r in results if r is True)
-    else:
-        executed = 0
+        results = await asyncio.gather(*(exec_one(d) for d in decisions))
+        executed = sum(1 for r in results if r)
 
-    # --------------------------------------------------
-    # 6. SUMMARY + PERSIST
-    # --------------------------------------------------
-    final_summary = portfolio_summary()
+    # -------------------------------
+    # 6. SUMMARY
+    # -------------------------------
+    final = portfolio_summary()
 
     run_summary = {
         "market_mode": market_mode,
         "pm": pm.__class__.__name__,
-        "positions_before": len(positions),
-        "positions_after": final_summary["positions"],
-        "anchors": final_summary["anchors"],
-        "total_value": final_summary["total_value"],
-        "unrealized_pnl_pct": final_summary["unrealized_pnl_pct"],
+        "positions": final["positions"],
+        "anchors": final["anchors"],
+        "total_value": final["total_value"],
+        "unrealized_pnl_pct": final["unrealized_pnl_pct"],
         "decisions": len(decisions),
         "executed": executed,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
     Path(config.DATA_PATH, "daily_runs").mkdir(exist_ok=True)
-    run_file = Path(config.DATA_PATH) / f"daily_runs/run_{int(time.time())}.json"
-    run_file.write_text(json.dumps(run_summary, indent=2))
-
-    logger.info(
-        f"DAILY RUN COMPLETE: {executed}/{len(decisions)} executed"
+    (Path(config.DATA_PATH) / f"daily_runs/run_{int(time.time())}.json").write_text(
+        json.dumps(run_summary, indent=2)
     )
 
-    return run_summary
+    logger.info("DAILY RUN COMPLETE")
 
 # =========================================================
-# MONITORING ENDPOINTS (INTERNOS)
-# =========================================================
-@app.get("/health")
-async def health():
-    summary = portfolio_summary()
-    return {
-        "status": "healthy",
-        "version": "2.8.2",
-        "positions": summary["positions"],
-        "anchors": summary["anchors"],
-        "total_value": summary["total_value"],
-        "unrealized_pnl_pct": summary["unrealized_pnl_pct"],
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-@app.get("/internal/portfolio/summary")
-async def portfolio_state():
-    return portfolio_summary()
-
-@app.get("/config")
-async def get_config():
-    return {
-        "version": "2.8.2",
-        "max_positions": config.MAX_POSITIONS,
-        "broker_timeout": config.BROKER_TIMEOUT,
-    }
-
-# =========================================================
-# GRACEFUL SHUTDOWN
-# =========================================================
-def handle_shutdown(signum, frame):
-    logger.info("SIGTERM/SIGINT received")
-    raise SystemExit(0)
-
-signal.signal(signal.SIGTERM, handle_shutdown)
-signal.signal(signal.SIGINT, handle_shutdown)
-
-# =========================================================
-# MAIN
+# ENTRYPOINT
 # =========================================================
 if __name__ == "__main__":
-    import uvicorn
-    logger.info(
-        f"Trading Suite v2.8.2 START | PORT={config.PORT}"
-    )
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=config.PORT,
-        log_level="error",
-    )
+    asyncio.run(daily_run())
