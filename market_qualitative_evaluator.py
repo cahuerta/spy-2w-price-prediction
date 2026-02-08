@@ -137,9 +137,9 @@ Downside risk: {quant_context.get('downside_risk', 'unknown')}"""
         truncated_news = news_summary[:800]
         if len(news_summary) > 800:
             truncated_news += "... [truncado]"
-        user_prompt += f"
+        user_prompt += f"""
 
-NOTICIAS RECIENTES: {truncated_news}"
+NOTICIAS RECIENTES: {truncated_news}"""
     
     # --------------------
     # Llamada IA con fallback
