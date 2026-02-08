@@ -212,7 +212,12 @@ async def latest_snapshot(
         "ticker": ticker,
         "latest": last
     }
-    @router.get("/screener")
+
+
+# =========================================================
+# SCREENER (READ ONLY)
+# =========================================================
+@router.get("/screener")
 async def screener(_: Any = Depends(rate_limiter)):
     p = Path(DATA_PATH) / "screener" / "screener_latest.json"
     if not p.exists():
