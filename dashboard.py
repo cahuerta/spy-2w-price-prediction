@@ -219,7 +219,7 @@ async def latest_snapshot(
 # =========================================================
 @router.get("/screener")
 async def screener(_: Any = Depends(rate_limiter)):
-    p = Path(DATA_PATH) / "screener" / "screener_latest.json"
+    p = Path(DATA_PATH) / "screener_candidates.json"
     if not p.exists():
         raise HTTPException(404, "Screener not available")
 
