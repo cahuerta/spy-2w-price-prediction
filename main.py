@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
+from dashboard import router as dashboard_router
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 from fastapi import FastAPI, HTTPException, Request
