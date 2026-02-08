@@ -1,8 +1,12 @@
-# dashboard.py — VERSIÓN FINAL CORREGIDA (ENTERPRISE / MODELO 3)
+# =========================================================
+# dashboard.py — ENTERPRISE DASHBOARD MODULE (PRODUCCIÓN)
+# =========================================================
 # 🔹 LEE SOLO DESDE /data/predictions
 # 🔹 signals.py NO es fuente de análisis
 # 🔹 Frontend usa predictions como VERDAD
 # 🔹 signals = visor secundario (pestaña señales)
+# 🔹 ESTE ARCHIVO NO MONTA FASTAPI (solo router)
+# =========================================================
 
 import os
 import json
@@ -15,26 +19,23 @@ from datetime import datetime
 from collections import defaultdict, deque
 from functools import lru_cache
 
-import numpy as np
 from fastapi import (
-    FastAPI,
     APIRouter,
     Query,
     HTTPException,
     Request,
     Depends,
 )
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # =========================================================
-# Config
+# CONFIG
 # =========================================================
 DATA_PATH = os.getenv("DATA_PATH", "/data")
 MIN_CONFIDENCE = float(os.getenv("SIGNAL_MIN_CONFIDENCE", "0.4"))
 
 # =========================================================
-# Logging
+# LOGGING (AISLADO)
 # =========================================================
 def setup_logging():
     level = logging.INFO
@@ -54,17 +55,18 @@ def setup_logging():
     )
 
 setup_logging()
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("dashboard")
 
 # =========================================================
-# Rate Limiter
+# RATE LIMITER (LOCAL)
 # =========================================================
 class SimpleRateLimiter:
-    def __init__(self, requests=20, per_seconds=60, max_ips=5000):
+    def __init__(self, requests=20, per_seconds=60):
         self.requests = requests
         self.per_seconds = per_seconds
-        self.max_ips = max_ips
-        self.buckets: Dict[str, deque] = defaultdict(lambda: deque(maxlen=requests * 2))
+        self.buckets: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=requests * 2)
+        )
 
     async def __call__(self, request: Request):
         ip = request.client.host if request.client else "unknown"
@@ -83,20 +85,19 @@ class SimpleRateLimiter:
 rate_limiter = SimpleRateLimiter()
 
 # =========================================================
-# Router
+# ROUTER (CONTRATO FIJO)
 # =========================================================
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 # =========================================================
-# Models
+# MODELS
 # =========================================================
 class TickerStats(BaseModel):
     ticker: str
     n_predictions: int = 0
-    n_evaluations: int = 0
 
 # =========================================================
-# Helpers
+# HELPERS
 # =========================================================
 @lru_cache(maxsize=2)
 def list_tickers(path: str) -> List[str]:
@@ -107,7 +108,7 @@ def list_tickers(path: str) -> List[str]:
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -119,7 +120,7 @@ def safe_float(v):
         return None
 
 # =========================================================
-# ENDPOINTS
+# ENDPOINTS (CONTRATO FRONTEND INTACTO)
 # =========================================================
 @router.get("/status")
 async def status(_: Any = Depends(rate_limiter)):
@@ -134,14 +135,16 @@ async def status(_: Any = Depends(rate_limiter)):
 @router.get("/tickers", response_model=List[TickerStats])
 async def tickers(_: Any = Depends(rate_limiter)):
     pred_path = Path(DATA_PATH) / "predictions"
-    out = []
+    out: List[TickerStats] = []
+
     for t in list_tickers(str(pred_path)):
         n = len(list((pred_path / t).glob("*.json")))
         out.append(TickerStats(ticker=t, n_predictions=n))
+
     return out
 
 # =========================================================
-# 🔑 ENDPOINT CLAVE — ESTE ERA EL QUE FALTABA
+# 🔑 ENDPOINT CLAVE — FUENTE ÚNICA DEL FRONTEND
 # =========================================================
 @router.get("/predictions/summary")
 async def prediction_summary(
@@ -151,9 +154,10 @@ async def prediction_summary(
 ):
     """
     📈 Fuente ÚNICA del análisis.
-    LEE datos históricos ya calculados por model.py
+    Lee datos YA calculados por model.py
     """
     pred_dir = Path(DATA_PATH) / "predictions" / ticker
+
     if not pred_dir.exists():
         raise HTTPException(404, f"No predictions for {ticker}")
 
@@ -167,8 +171,8 @@ async def prediction_summary(
         if not obj:
             continue
 
-        p = obj.get("prediction", {})
-        if not p:
+        p = obj.get("prediction")
+        if not isinstance(p, dict):
             continue
 
         data.append({
@@ -180,29 +184,10 @@ async def prediction_summary(
         })
 
     if not data:
-        raise HTTPException(404, f"No usable data for {ticker}")
+        raise HTTPException(404, "No usable prediction data")
 
     return {
         "ticker": ticker,
         "count": len(data),
         "data": data,
     }
-
-# =========================================================
-# App
-# =========================================================
-app = FastAPI(title="Trading Dashboard API", version="3.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(router)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
