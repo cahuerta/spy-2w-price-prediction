@@ -341,7 +341,7 @@ async def fetch_symbol_data(
 # =========================================================
 async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     ALPACA_KEY = os.getenv("ALPACA_API_KEY")
-    ALPACA_SECRET = os.getenv("ALPACA_API_SECRET")
+    ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
     PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
     if not ALPACA_AVAILABLE:
