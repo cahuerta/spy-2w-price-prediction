@@ -24,7 +24,7 @@ from decider import run_decider
 from model_runner import run_all_models
 from evaluator import evaluate_all
 
-from evaluador_cuantitativo_mercado import evaluate_quant_market
+from market_state_evaluator import evaluate_quant_market
 from market_qualitative_evaluator import evaluate_qualitative_market
 from market_orchestrator import MarketOrchestrator
 
