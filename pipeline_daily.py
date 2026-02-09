@@ -32,7 +32,9 @@ from decider import run_decider
 # SÍ model_runner (ejecuta model.py y guarda en disco)
 from model_runner import run_all_models
 
-from evaluator_runner import run_evaluator_runner
+from evaluator import evaluate_all
+
+eval_out = evaluate_all()
 
 from evaluador_cuantitativo_mercado import evaluate_quant_market
 from market_qualitative_evaluator import evaluate_qualitative_market
