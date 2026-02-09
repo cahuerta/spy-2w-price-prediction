@@ -85,9 +85,9 @@ except ImportError:
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 OUTPUT_FILE = DATA_PATH / "screener_candidates.json"
 
-ALPACA_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_API_SECRET")
-PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+ALPACA_KEY_BOOT = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_BOOT = os.getenv("ALPACA_API_SECRET")
+PAPER_BOOT = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
 MIN_DOLLAR_VOLUME = float(os.getenv("SCREENER_MIN_DOLLAR_VOL", "50_000_000"))
@@ -344,6 +344,10 @@ async def fetch_symbol_data(
 # MAIN ASYNC SCREENER v3.1
 # =========================================================
 async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
+    ALPACA_KEY = os.getenv("ALPACA_API_KEY")
+    ALPACA_SECRET = os.getenv("ALPACA_API_SECRET")
+    PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+
     if not ALPACA_AVAILABLE:
         raise RuntimeError(f"alpaca-py core no disponible: {_ALPACA_IMPORT_ERROR}")
 
