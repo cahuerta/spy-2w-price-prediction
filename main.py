@@ -4,9 +4,10 @@
 # ✔ Runtime de trading (NO batch)
 # ✔ NO decide mercado
 # ✔ NO ejecuta modelos
-# ✔ NO ejecuta PMs directamente
-# ✔ Consume market_context.json (fuente única)
-# ✔ Expone endpoints para PIPELINE y TRADING
+# ✔ NO ejecuta pipeline
+# ✔ RECIBE resultados del pipeline
+# ✔ GRABA a disco (fuente única)
+# ✔ Ejecuta SOLO TradingOrchestrator
 # =========================================================
 
 import os
@@ -31,7 +32,6 @@ from dashboard import router as dashboard_router
 # =========================================================
 from market_orchestrator import MarketOrchestrationContext
 from trading_orchestrator import TradingOrchestrator
-from pipeline_daily import main as run_pipeline  # 🔴 IMPORT REAL
 
 # =========================================================
 # CONFIG
@@ -44,7 +44,10 @@ class Config:
 
 config = Config()
 
-MARKET_CTX_FILE = config.DATA_PATH / "market_context.json"
+DATA_PATH = config.DATA_PATH
+MARKET_CTX_FILE = DATA_PATH / "market_context.json"
+SCREENER_FILE = DATA_PATH / "screener_candidates.json"
+PIPELINE_AUDIT_FILE = DATA_PATH / "last_pipeline.json"
 
 # =========================================================
 # LOGGING
@@ -58,11 +61,13 @@ logger = logging.getLogger("trading_suite")
 # =========================================================
 # HELPERS
 # =========================================================
+def save_json(path: Path, data: Dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
 def load_market_context() -> MarketOrchestrationContext:
-    """
-    Fuente ÚNICA de verdad.
-    Generada por pipeline_daily.py
-    """
     if not MARKET_CTX_FILE.exists():
         raise RuntimeError("market_context.json no existe")
 
@@ -94,34 +99,48 @@ app.add_middleware(
 app.include_router(dashboard_router)
 
 # =========================================================
-# PIPELINE ENDPOINT (CRON → HTTP)
+# PIPELINE COMMIT (RECIBE Y GRABA)
 # =========================================================
-@app.post("/internal/pipeline/run")
-async def pipeline_run(request: Request):
+@app.post("/internal/pipeline/commit")
+async def pipeline_commit(payload: Dict[str, Any], request: Request):
     """
-    Ejecuta pipeline_daily.main() DENTRO del web service.
-    Render permite escribir en /data aquí.
+    Recibe output de pipeline_daily.main()
+    y lo persiste en disco.
     """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
-    logger.info("🚀 Pipeline triggered via HTTP")
-    run_pipeline()
+    logger.info("💾 Committing pipeline payload")
+
+    try:
+        # --- guardar screener ---
+        if "screener" in payload:
+            save_json(SCREENER_FILE, payload["screener"])
+            logger.info("📄 screener_candidates.json guardado")
+
+        # --- guardar market context ---
+        if "market_ctx" in payload:
+            save_json(MARKET_CTX_FILE, payload["market_ctx"])
+            logger.info("📄 market_context.json guardado")
+
+        # --- auditoría completa ---
+        save_json(PIPELINE_AUDIT_FILE, payload)
+
+    except Exception as e:
+        logger.error("❌ Commit failed")
+        raise HTTPException(500, str(e))
 
     return {
         "status": "ok",
-        "message": "pipeline executed",
+        "message": "pipeline committed",
         "timestamp": datetime.utcnow().isoformat(),
     }
 
 # =========================================================
-# TRADING ENDPOINT (PIPELINE → TRADING)
+# TRADING ENDPOINT
 # =========================================================
 @app.post("/internal/trading/run")
 async def trading_run(request: Request):
-    """
-    Ejecuta SOLO trading, usando market_context.json
-    """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
@@ -164,4 +183,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         log_level="error",
-    )
+                   )
