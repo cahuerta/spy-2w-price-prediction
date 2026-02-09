@@ -75,14 +75,10 @@ async def run_pipeline(request: Request):
         run_all_models()
         logger.info("✅ Model runner OK")
 
-        # -------------------------------------------------
-        # 4️⃣ EVALUATOR
-        # -------------------------------------------------
-        logger.info("📊 [4/8] Evaluator...")
-        eval_out = evaluate_all()
-        logger.info(
-            f"✅ Evaluator OK | evaluated={len(eval_out.get('evaluated', []))}"
-        )
+        # 4️⃣ EVALUATOR (side-effect only)
+logger.info("📊 [4/8] Evaluator (background)...")
+evaluate_all()
+logger.info("ℹ️ Evaluator executed (no downstream dependency)") 
 
         # -------------------------------------------------
         # 5️⃣ MARKET QUANT
