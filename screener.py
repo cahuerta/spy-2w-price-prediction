@@ -85,10 +85,6 @@ except ImportError:
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 OUTPUT_FILE = DATA_PATH / "screener_candidates.json"
 
-ALPACA_KEY_BOOT = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_BOOT = os.getenv("ALPACA_API_SECRET")
-PAPER_BOOT = os.getenv("ALPACA_PAPER", "true").lower() == "true"
-
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
 MIN_DOLLAR_VOLUME = float(os.getenv("SCREENER_MIN_DOLLAR_VOL", "50_000_000"))
 MIN_VOLATILITY = float(os.getenv("SCREENER_MIN_VOL", "0.015"))
