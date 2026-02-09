@@ -34,6 +34,11 @@ from market_orchestrator import MarketOrchestrationContext
 from trading_orchestrator import TradingOrchestrator
 
 # =========================================================
+# PIPELINE ROUTER
+# =========================================================
+from pipeline_router import router as pipeline_router
+
+# =========================================================
 # CONFIG
 # =========================================================
 class Config:
@@ -97,6 +102,7 @@ app.add_middleware(
 )
 
 app.include_router(dashboard_router)
+app.include_router(pipeline_router)
 
 # =========================================================
 # PIPELINE COMMIT (RECIBE Y GRABA)
