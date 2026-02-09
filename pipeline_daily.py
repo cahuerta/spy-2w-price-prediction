@@ -6,6 +6,7 @@
 # ✔ Backend = fuente de verdad
 # ✔ Fallo corta pipeline
 # ✔ Market context persistido en disco
+# ✔ Trading 100% delegado al TradingOrchestrator
 # =========================================================
 
 import traceback
@@ -26,7 +27,8 @@ from evaluator import evaluate_all
 from evaluador_cuantitativo_mercado import evaluate_quant_market
 from market_qualitative_evaluator import evaluate_qualitative_market
 from market_orchestrator import MarketOrchestrator
-from orchestrator import run_orchestrator
+
+from trading_orchestrator import TradingOrchestrator
 
 # =========================
 # CONFIG
@@ -88,7 +90,7 @@ def main():
         logger.info("✅ Model OK | predictions guardadas en /data/predictions")
 
         # -------------------------------------------------
-        # 4️⃣ EVALUATOR (DIRECTO)
+        # 4️⃣ EVALUATOR
         # -------------------------------------------------
         logger.info("📊 [4/8] Evaluator...")
         eval_out = evaluate_all()
@@ -121,7 +123,7 @@ def main():
         )
 
         # -------------------------------------------------
-        # 7️⃣ MARKET ORCHESTRATOR
+        # 7️⃣ MARKET ORCHESTRATOR (CONTEXTO FINAL)
         # -------------------------------------------------
         logger.info("🧭 [7/8] Market orchestration...")
         market_orch = MarketOrchestrator()
@@ -140,14 +142,21 @@ def main():
         logger.info(f"💾 Market context guardado en {MARKET_CTX_FILE}")
 
         # -------------------------------------------------
-        # 8️⃣ TRADING ORCHESTRATOR (CONDICIONAL)
+        # 8️⃣ TRADING ORCHESTRATOR (ÚNICO PUNTO DE TRADING)
         # -------------------------------------------------
-        if market_ctx.market_mode != "defensive":
-            logger.info("🤖 [8/8] Trading orchestrator...")
-            run_orchestrator()
-            logger.info("✅ Trading orchestrator OK")
-        else:
-            logger.warning("⛔ Trading BLOQUEADO por market_mode=DEFENSIVE")
+        logger.info("🤖 [8/8] Trading orchestrator...")
+
+        trading_orch = TradingOrchestrator()
+
+        trade_out = trading_orch.run(
+            market_ctx=market_ctx.to_dict(),
+            eval_out=eval_out,
+        )
+
+        logger.info(
+            f"✅ Trading OK | mode={trade_out.get('mode')} | "
+            f"decisions={len(trade_out.get('decisions', []))}"
+        )
 
     except Exception as e:
         logger.error("❌ PIPELINE FAILED")
