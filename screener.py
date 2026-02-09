@@ -457,13 +457,24 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
 # =========================================================
 # SYNC WRAPPER (CLI ONLY) — seguro
 # =========================================================
+
 def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     """
     Wrapper sync SOLO para CLI / cron python directo.
-    ⚠️ No lo uses desde endpoints async de FastAPI (usa run_screener_async).
+    Escribe screener_candidates.json en disco (overwrite).
     """
-    return asyncio.run(run_screener_async(limit_assets))
+    result = asyncio.run(run_screener_async(limit_assets))
 
+    # --- GUARDAR EN DISCO ---
+    DATA_PATH.mkdir(parents=True, exist_ok=True)
+    tmp = OUTPUT_FILE.with_suffix(".tmp")
+
+    tmp.write_text(json.dumps(result, indent=2))
+    tmp.replace(OUTPUT_FILE)
+
+    logger.info(f"📄 Screener guardado en disco: {OUTPUT_FILE}")
+
+    return result
 
 # =========================================================
 # CLI
