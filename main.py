@@ -6,7 +6,7 @@
 # ✔ NO ejecuta modelos
 # ✔ NO ejecuta PMs directamente
 # ✔ Consume market_context.json (fuente única)
-# ✔ Ejecuta SOLO TradingOrchestrator
+# ✔ Expone endpoints para PIPELINE y TRADING
 # =========================================================
 
 import os
@@ -27,10 +27,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from dashboard import router as dashboard_router
 
 # =========================================================
-# CORE (ÚNICO EJECUTOR)
+# CORE
 # =========================================================
 from market_orchestrator import MarketOrchestrationContext
 from trading_orchestrator import TradingOrchestrator
+from pipeline_daily import main as run_pipeline  # 🔴 IMPORT REAL
 
 # =========================================================
 # CONFIG
@@ -93,20 +94,40 @@ app.add_middleware(
 app.include_router(dashboard_router)
 
 # =========================================================
-# PIPELINE → TRADING TRIGGER (ÚNICO)
+# PIPELINE ENDPOINT (CRON → HTTP)
 # =========================================================
-@app.post("/internal/trading/run")
-async def trading_run(request: Request):
+@app.post("/internal/pipeline/run")
+async def pipeline_run(request: Request):
     """
-    Endpoint llamado SOLO por pipeline_daily.py
+    Ejecuta pipeline_daily.main() DENTRO del web service.
+    Render permite escribir en /data aquí.
     """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
-    logger.info("🔔 Trading run triggered by pipeline")
+    logger.info("🚀 Pipeline triggered via HTTP")
+    run_pipeline()
+
+    return {
+        "status": "ok",
+        "message": "pipeline executed",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+# =========================================================
+# TRADING ENDPOINT (PIPELINE → TRADING)
+# =========================================================
+@app.post("/internal/trading/run")
+async def trading_run(request: Request):
+    """
+    Ejecuta SOLO trading, usando market_context.json
+    """
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    logger.info("🔔 Trading run triggered")
 
     market_ctx = load_market_context()
-
     orchestrator = TradingOrchestrator()
     result = await orchestrator.run(market_ctx.to_dict())
 
@@ -144,22 +165,3 @@ if __name__ == "__main__":
         port=config.PORT,
         log_level="error",
     )
-# =========================================================
-# PIPELINE TRIGGER (DESDE CRON)
-# =========================================================
-from pipeline_daily import main as run_pipeline
-
-@app.post("/internal/pipeline/run")
-async def pipeline_run(request: Request):
-    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
-        raise HTTPException(403, "Invalid pipeline key")
-
-    logger.info("🚀 Pipeline triggered via HTTP")
-
-    run_pipeline()   # ⬅ corre DENTRO del web service
-
-    return {
-        "status": "ok",
-        "message": "pipeline executed",
-        "timestamp": datetime.utcnow().isoformat(),
-    }
