@@ -1,21 +1,6 @@
 # =========================================================
 # pipeline_daily.py — DAILY SYSTEM PIPELINE (PRODUCCIÓN)
 # =========================================================
-# Flujo SECUENCIAL y BLOQUEANTE:
-#
-# 1️⃣ Screener            → screener_candidates.json
-# 2️⃣ Decider             → tickers.json
-# 3️⃣ Model Runner        → predictions/<TICKER>/*.json
-# 4️⃣ Evaluator           → evaluations/<TICKER>/*.json
-# 5️⃣ Market Quant        → QuantMarketContext
-# 6️⃣ Market Qualitative  → QualitativeMarketContext
-# 7️⃣ Market Orchestrator → MarketOrchestrationContext
-# 8️⃣ (Opcional) Trading Orchestrator
-#
-# ✔ Un solo cron
-# ✔ Backend = fuente de verdad
-# ✔ Fallo corta pipeline
-# =========================================================
 
 import traceback
 from datetime import datetime
@@ -26,20 +11,12 @@ import logging
 # =========================
 from screener import run_screener
 from decider import run_decider
-
-# 🔴 CORRECCIÓN CLAVE:
-# NO prediction_runner (no existe)
-# SÍ model_runner (ejecuta model.py y guarda en disco)
 from model_runner import run_all_models
-
 from evaluator import evaluate_all
-
-eval_out = evaluate_all()
 
 from evaluador_cuantitativo_mercado import evaluate_quant_market
 from market_qualitative_evaluator import evaluate_qualitative_market
 from market_orchestrator import MarketOrchestrator
-
 from orchestrator import run_orchestrator
 
 # =========================
@@ -80,19 +57,19 @@ def main():
         )
 
         # -------------------------------------------------
-        # 3️⃣ MODEL RUNNER (FUENTE DE VERDAD)
+        # 3️⃣ MODEL RUNNER
         # -------------------------------------------------
         logger.info("📈 [3/8] Model runner...")
         run_all_models()
         logger.info("✅ Model OK | predictions guardadas en /data/predictions")
 
         # -------------------------------------------------
-        # 4️⃣ EVALUATOR
+        # 4️⃣ EVALUATOR (DIRECTO, SIN WRAPPER)
         # -------------------------------------------------
         logger.info("📊 [4/8] Evaluator...")
-        eval_out = run_evaluator_runner()
+        eval_out = evaluate_all()
         logger.info(
-            f"✅ Evaluator OK | evaluated={eval_out['evaluated']}"
+            f"✅ Evaluator OK | evaluated={len(eval_out.get('evaluated', []))}"
         )
 
         # -------------------------------------------------
@@ -100,15 +77,15 @@ def main():
         # -------------------------------------------------
         logger.info("📉 [5/8] Market quantitative context...")
         quant_ctx = evaluate_quant_market(
-            prices_main=eval_out["prices_main"],
-            prices_cross=eval_out["prices_cross"]
+            prices_main=eval_out.get("prices_main"),
+            prices_cross=eval_out.get("prices_cross")
         )
         logger.info(
-            f"✅ Market quant OK | regime={quant_ctx.regime} | vol={quant_ctx.volatility}"
+            f"✅ Market quant OK | regime={quant_ctx.regime}"
         )
 
         # -------------------------------------------------
-        # 6️⃣ MARKET QUALITATIVE (IA)
+        # 6️⃣ MARKET QUALITATIVE
         # -------------------------------------------------
         logger.info("🧠 [6/8] Market qualitative context...")
         qual_ctx = evaluate_qualitative_market(
@@ -134,7 +111,7 @@ def main():
         )
 
         # -------------------------------------------------
-        # 8️⃣ TRADING ORCHESTRATOR (CONDICIONAL)
+        # 8️⃣ TRADING ORCHESTRATOR
         # -------------------------------------------------
         if market_ctx.market_mode != "defensive":
             logger.info("🤖 [8/8] Trading orchestrator...")
@@ -155,8 +132,5 @@ def main():
     logger.info("=" * 60)
 
 
-# =========================
-# ENTRYPOINT
-# =========================
 if __name__ == "__main__":
     main()
