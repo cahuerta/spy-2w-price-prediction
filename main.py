@@ -144,3 +144,22 @@ if __name__ == "__main__":
         port=config.PORT,
         log_level="error",
     )
+# =========================================================
+# PIPELINE TRIGGER (DESDE CRON)
+# =========================================================
+from pipeline_daily import main as run_pipeline
+
+@app.post("/internal/pipeline/run")
+async def pipeline_run(request: Request):
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    logger.info("🚀 Pipeline triggered via HTTP")
+
+    run_pipeline()   # ⬅ corre DENTRO del web service
+
+    return {
+        "status": "ok",
+        "message": "pipeline executed",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
