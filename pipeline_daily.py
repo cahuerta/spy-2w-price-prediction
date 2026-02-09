@@ -3,18 +3,15 @@
 # =========================================================
 # ✔ Flujo secuencial y bloqueante
 # ✔ Un solo cron diario
-# ✔ Backend = fuente de verdad
+# ✔ NO escribe a disco
+# ✔ Backend (Main) = fuente de verdad
 # ✔ Fallo corta pipeline
-# ✔ Market context persistido en disco
 # ✔ Trading 100% delegado al TradingOrchestrator
 # =========================================================
 
 import traceback
 from datetime import datetime
 import logging
-import json
-import os
-from pathlib import Path
 
 # =========================
 # IMPORTS — CAPAS REALES
@@ -31,12 +28,6 @@ from market_orchestrator import MarketOrchestrator
 from trading_orchestrator import TradingOrchestrator
 
 # =========================
-# CONFIG
-# =========================
-DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
-MARKET_CTX_FILE = DATA_PATH / "market_context.json"
-
-# =========================
 # LOGGING
 # =========================
 logging.basicConfig(
@@ -44,19 +35,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)-7s] %(message)s"
 )
 logger = logging.getLogger("pipeline")
-
-# =========================
-# HELPERS
-# =========================
-def save_json_atomic(path: Path, data: dict):
-    """
-    Escritura atómica de JSON.
-    OJO: esto solo funcionará si DATA_PATH es escribible.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(path)
 
 # =========================
 # PIPELINE
@@ -141,10 +119,6 @@ def main():
             f"(conf {market_ctx.confidence:.2f})"
         )
 
-        # 💾 Persistir contexto de mercado
-        save_json_atomic(MARKET_CTX_FILE, market_ctx.to_dict())
-        logger.info(f"💾 Market context guardado en {MARKET_CTX_FILE}")
-
         # -------------------------------------------------
         # 8️⃣ TRADING ORCHESTRATOR
         # -------------------------------------------------
@@ -161,19 +135,39 @@ def main():
             f"| decisions={len(trade_out.get('decisions', []))}"
         )
 
+        # -------------------------------------------------
+        # RETURN PAYLOAD (PADRE DECIDE QUÉ GRABAR)
+        # -------------------------------------------------
+        return {
+            "status": "ok",
+            "timestamp": datetime.utcnow().isoformat(),
+            "screener": screener_out,
+            "decider": decider_out,
+            "evaluator": eval_out,
+            "market_ctx": market_ctx.to_dict(),
+            "trading": trade_out,
+        }
+
     except Exception as e:
         logger.error("❌ PIPELINE FAILED")
         logger.error(str(e))
         traceback.print_exc()
-        return
 
-    end_ts = datetime.utcnow().isoformat()
-    logger.info("=" * 60)
-    logger.info(f"🏁 PIPELINE DAILY END | {end_ts}")
-    logger.info("=" * 60)
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    finally:
+        end_ts = datetime.utcnow().isoformat()
+        logger.info("=" * 60)
+        logger.info(f"🏁 PIPELINE DAILY END | {end_ts}")
+        logger.info("=" * 60)
+
 
 # =========================
-# ENTRYPOINT
+# ENTRYPOINT (CRON DIRECTO)
 # =========================
 if __name__ == "__main__":
     main()
