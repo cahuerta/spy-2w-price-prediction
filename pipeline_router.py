@@ -16,7 +16,7 @@ import traceback
 # =========================
 # IMPORTS — CAPAS REALES
 # =========================
-from screener import run_screener
+from screener import run_screener_async
 from decider import run_decider
 from model_runner import run_all_models
 from evaluator import evaluate_all
@@ -53,7 +53,7 @@ async def run_pipeline(request: Request):
         # 1️⃣ SCREENER
         # -------------------------------------------------
         logger.info("🔍 [1/8] Screener...")
-        screener_out = run_screener()
+        screener_out = await run_screener_async()
         logger.info(
             f"✅ Screener OK | candidates={screener_out.get('n_candidates')}"
         )
