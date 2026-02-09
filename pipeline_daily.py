@@ -1,10 +1,19 @@
 # =========================================================
 # pipeline_daily.py — DAILY SYSTEM PIPELINE (PRODUCCIÓN)
 # =========================================================
+# ✔ Flujo secuencial y bloqueante
+# ✔ Un solo cron diario
+# ✔ Backend = fuente de verdad
+# ✔ Fallo corta pipeline
+# ✔ Market context persistido en disco
+# =========================================================
 
 import traceback
 from datetime import datetime
 import logging
+import json
+import os
+from pathlib import Path
 
 # =========================
 # IMPORTS — CAPAS REALES
@@ -20,6 +29,12 @@ from market_orchestrator import MarketOrchestrator
 from orchestrator import run_orchestrator
 
 # =========================
+# CONFIG
+# =========================
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+MARKET_CTX_FILE = DATA_PATH / "market_context.json"
+
+# =========================
 # LOGGING
 # =========================
 logging.basicConfig(
@@ -27,6 +42,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)-7s] %(message)s"
 )
 logger = logging.getLogger("pipeline")
+
+# =========================
+# HELPERS
+# =========================
+def save_json_atomic(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
 
 # =========================
 # PIPELINE
@@ -64,7 +88,7 @@ def main():
         logger.info("✅ Model OK | predictions guardadas en /data/predictions")
 
         # -------------------------------------------------
-        # 4️⃣ EVALUATOR (DIRECTO, SIN WRAPPER)
+        # 4️⃣ EVALUATOR (DIRECTO)
         # -------------------------------------------------
         logger.info("📊 [4/8] Evaluator...")
         eval_out = evaluate_all()
@@ -85,7 +109,7 @@ def main():
         )
 
         # -------------------------------------------------
-        # 6️⃣ MARKET QUALITATIVE
+        # 6️⃣ MARKET QUALITATIVE (IA)
         # -------------------------------------------------
         logger.info("🧠 [6/8] Market qualitative context...")
         qual_ctx = evaluate_qualitative_market(
@@ -105,13 +129,18 @@ def main():
             quant_ctx.to_dict(),
             qual_ctx.to_dict()
         )
+
         logger.info(
             f"🎯 MARKET MODE = {market_ctx.market_mode.upper()} "
             f"(conf {market_ctx.confidence:.2f})"
         )
 
+        # 💾 Persistir contexto de mercado (FUENTE ÚNICA)
+        save_json_atomic(MARKET_CTX_FILE, market_ctx.to_dict())
+        logger.info(f"💾 Market context guardado en {MARKET_CTX_FILE}")
+
         # -------------------------------------------------
-        # 8️⃣ TRADING ORCHESTRATOR
+        # 8️⃣ TRADING ORCHESTRATOR (CONDICIONAL)
         # -------------------------------------------------
         if market_ctx.market_mode != "defensive":
             logger.info("🤖 [8/8] Trading orchestrator...")
@@ -131,6 +160,8 @@ def main():
     logger.info(f"🏁 PIPELINE DAILY END | {end_ts}")
     logger.info("=" * 60)
 
-
+# =========================
+# ENTRYPOINT
+# =========================
 if __name__ == "__main__":
     main()
