@@ -1,34 +1,34 @@
 # =========================================================
-# main.py — TRADING SUITE ENTERPRISE v2.8.2 PRODUCCIÓN
+# main.py — TRADING SUITE ENTERPRISE v2.8.3 PRODUCCIÓN
+# =========================================================
+# ✔ Runtime de trading (NO batch)
+# ✔ Consume market_context.json (fuente única)
+# ✔ PM decide, Broker ejecuta, Portfolio persiste
+# ✔ Pipeline externo dispara ejecución
 # =========================================================
 
 import os
 import json
 import logging
-import time
-import asyncio
 import signal
 import httpx
-from typing import Any, Dict, List, Optional
+from typing import Dict, Any, List
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from tenacity import retry, stop_after_attempt, wait_exponential
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
-# DASHBOARD (SOLO ROUTER, NO APP)
+# DASHBOARD (SOLO ROUTER)
 # =========================================================
 from dashboard import router as dashboard_router
 
 # =========================================================
-# MÓDULOS CORE
+# CORE
 # =========================================================
-from market_state_evaluator import evaluate_quant_market
-from market_qualitative_evaluator import evaluate_qualitative_market
-from market_orchestrator import MarketOrchestrator, MarketOrchestrationContext
+from market_orchestrator import MarketOrchestrationContext
 
 from pm_growth import PMGrowth
 from pm_neutral import PMNeutral
@@ -43,95 +43,130 @@ from portfolio_store import (
 )
 
 # =========================================================
-# CONFIG PRODUCCIÓN
+# CONFIG
 # =========================================================
 class Config:
-    DATA_PATH = os.getenv("DATA_PATH", "/data")
+    DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
     PORT = int(os.getenv("PORT", "8000"))
-    BROKER_EXEC_URL = os.getenv("BROKER_URL", "http://localhost:8001/trading/execute")
     PIPELINE_KEY = os.getenv("PIPELINE_KEY")
+    BROKER_EXEC_URL = os.getenv(
+        "BROKER_URL", "http://localhost:8001/trading/execute"
+    )
+    BROKER_TIMEOUT = int(os.getenv("BROKER_TIMEOUT", "20"))
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
-    BROKER_TIMEOUT = int(os.getenv("BROKER_TIMEOUT", "15"))
 
 config = Config()
+
+MARKET_CTX_FILE = config.DATA_PATH / "market_context.json"
 
 # =========================================================
 # LOGGING
 # =========================================================
-def setup_logging():
-    Path(config.DATA_PATH).mkdir(parents=True, exist_ok=True)
-    log_file = Path(config.DATA_PATH) / "trading_suite.log"
-
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    return logging.getLogger("trading_suite")
-
-logger = setup_logging()
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("trading_suite")
 
 # =========================================================
-# SINGLETONS
+# SINGLETON PMs
 # =========================================================
-import threading
-_singleton_lock = threading.Lock()
-_market_orchestrator = None
-_pm_growth = None
-_pm_neutral = None
-_pm_defensive = None
-
-def get_market_orchestrator():
-    global _market_orchestrator
-    with _singleton_lock:
-        if _market_orchestrator is None:
-            _market_orchestrator = MarketOrchestrator()
-        return _market_orchestrator
-
-def get_pm_growth():
-    global _pm_growth
-    with _singleton_lock:
-        if _pm_growth is None:
-            _pm_growth = PMGrowth()
-        return _pm_growth
-
-def get_pm_neutral():
-    global _pm_neutral
-    with _singleton_lock:
-        if _pm_neutral is None:
-            _pm_neutral = PMNeutral()
-        return _pm_neutral
-
-def get_pm_defensive():
-    global _pm_defensive
-    with _singleton_lock:
-        if _pm_defensive is None:
-            _pm_defensive = PMDefensive()
-        return _pm_defensive
+_pm_growth = PMGrowth()
+_pm_neutral = PMNeutral()
+_pm_defensive = PMDefensive()
 
 def resolve_pm(mode: str):
     if mode == "growth":
-        return get_pm_growth()
+        return _pm_growth
     if mode == "neutral":
-        return get_pm_neutral()
-    return get_pm_defensive()
+        return _pm_neutral
+    return _pm_defensive
 
 # =========================================================
-# FASTAPI APP (ÚNICA)
+# MARKET CONTEXT LOADER (FUENTE ÚNICA)
+# =========================================================
+def load_market_context() -> MarketOrchestrationContext:
+    if not MARKET_CTX_FILE.exists():
+        raise RuntimeError("market_context.json no existe")
+
+    data = json.loads(MARKET_CTX_FILE.read_text())
+    return MarketOrchestrationContext(**data)
+
+# =========================================================
+# TRADING CYCLE (CORE)
+# =========================================================
+async def run_trading_cycle() -> Dict[str, Any]:
+    """
+    Ejecuta ciclo completo:
+    - Lee market_context.json
+    - Resuelve PM
+    - PM decide
+    - Broker ejecuta
+    - Portfolio se actualiza
+    """
+
+    market_ctx = load_market_context()
+    pm = resolve_pm(market_ctx.market_mode)
+
+    logger.info(
+        f"▶ Trading cycle | mode={market_ctx.market_mode} "
+        f"conf={market_ctx.confidence:.2f}"
+    )
+
+    positions = load_positions()
+    decisions = pm.evaluate_portfolio(positions)
+
+    results = []
+
+    async with httpx.AsyncClient(timeout=config.BROKER_TIMEOUT) as client:
+        for decision in decisions:
+            try:
+                r = await client.post(
+                    config.BROKER_EXEC_URL,
+                    json=decision,
+                )
+                broker_res = r.json()
+                results.append(broker_res)
+
+                # ----------------------------------
+                # PORTFOLIO SYNC
+                # ----------------------------------
+                if decision["action"] == "OPEN" and broker_res["status"] == "executed":
+                    register_open(decision, broker_res, market_ctx.to_dict())
+
+                elif decision["action"] == "CLOSE" and broker_res["status"] == "executed":
+                    register_close(decision, broker_res)
+
+                elif decision["action"] == "ROTATE" and broker_res["status"] == "executed":
+                    register_rotate(
+                        decision,
+                        broker_res,
+                        broker_res,
+                        market_ctx.to_dict(),
+                    )
+
+            except Exception as e:
+                logger.error(f"❌ Broker error: {e}")
+
+    return {
+        "market_mode": market_ctx.market_mode,
+        "decisions": len(decisions),
+        "portfolio": portfolio_summary(),
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+# =========================================================
+# FASTAPI APP
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Trading Suite v2.8.2 starting")
+    logger.info("Trading Suite v2.8.3 START")
     yield
-    logger.info("Trading Suite v2.8.2 shutdown")
+    logger.info("Trading Suite v2.8.3 STOP")
 
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.8.2",
+    version="2.8.3",
     lifespan=lifespan,
 )
 
@@ -142,30 +177,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔑 DASHBOARD MONTADO AQUÍ
 app.include_router(dashboard_router)
 
 # =========================================================
-# CRON ENDPOINT — NO TOCAR
+# PIPELINE TRIGGER (ÚNICO)
 # =========================================================
-@app.post("/internal/system/daily-run")
-async def daily_system_run(request: Request):
+@app.post("/internal/trading/run")
+async def trading_run(request: Request):
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
-    logger.info("DAILY RUN START")
-
-    # TODO: (tu lógica existente intacta)
-    # ⬇️ NO CAMBIADA ⬇️
-
-    return {"status": "ok"}
+    logger.info("🔔 Trading run triggered by pipeline")
+    return await run_trading_cycle()
 
 # =========================================================
 # HEALTH
 # =========================================================
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "ok"}
 
 # =========================================================
 # SHUTDOWN
@@ -186,4 +216,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         log_level="error",
-    )
+)
