@@ -1,77 +1,156 @@
 # =========================================================
-# pipeline_daily.py — ORQUESTADOR DIARIO (FINAL REAL)
+# pipeline_daily.py — DAILY SYSTEM PIPELINE (PRODUCCIÓN)
 # =========================================================
-# Flujo:
-# 1) Screener
-# 2) Backend: decider + evaluación + broker (paper)
+# Flujo SECUENCIAL y BLOQUEANTE:
+#
+# 1️⃣ Screener            → screener_candidates.json
+# 2️⃣ Decider             → tickers.json
+# 3️⃣ Model Runner        → predictions/<TICKER>/*.json
+# 4️⃣ Evaluator           → evaluations/<TICKER>/*.json
+# 5️⃣ Market Quant        → QuantMarketContext
+# 6️⃣ Market Qualitative  → QualitativeMarketContext
+# 7️⃣ Market Orchestrator → MarketOrchestrationContext
+# 8️⃣ (Opcional) Trading Orchestrator
 #
 # ✔ Un solo cron
-# ✔ Backend es la única fuente de verdad
+# ✔ Backend = fuente de verdad
+# ✔ Fallo corta pipeline
 # =========================================================
 
-from datetime import datetime
-import os
 import traceback
-import requests
+from datetime import datetime
+import logging
 
+# =========================
+# IMPORTS — CAPAS
+# =========================
 from screener import run_screener
+from decider import run_decider
 
-BACKEND_URL = os.getenv("BACKEND_URL")
-PIPELINE_KEY = os.getenv("PIPELINE_KEY")
+from prediction_runner import run_prediction_runner
+from evaluator_runner import run_evaluator_runner
 
-HEADERS = {"X-PIPELINE-KEY": PIPELINE_KEY}
+from evaluador_cuantitativo_mercado import evaluate_quant_market
+from market_qualitative_evaluator import evaluate_qualitative_market
+from market_orchestrator import MarketOrchestrator
 
+from orchestrator import run_orchestrator
 
-def post(path: str, payload=None):
-    r = requests.post(
-        f"{BACKEND_URL}{path}",
-        json=payload,
-        headers=HEADERS,
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json()
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)-7s] %(message)s"
+)
+logger = logging.getLogger("pipeline")
 
-
+# =========================
+# PIPELINE
+# =========================
 def main():
     start_ts = datetime.utcnow().isoformat()
-    print("=" * 60)
-    print(f"🚀 PIPELINE DAILY START | {start_ts}")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info(f"🚀 PIPELINE DAILY START | {start_ts}")
+    logger.info("=" * 60)
 
     try:
-        # -------------------------
-        # 1) SCREENER
-        # -------------------------
-        print("🔍 [1/2] Running SCREENER...")
+        # -------------------------------------------------
+        # 1️⃣ SCREENER
+        # -------------------------------------------------
+        logger.info("🔍 [1/8] Screener...")
         screener_out = run_screener()
-        print(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
+        logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
 
-        post("/internal/screener/result", screener_out)
-        print("📤 Screener enviado al backend")
-
-        # -------------------------
-        # 2) DAILY SYSTEM RUN
-        # -------------------------
-        print("🧠 [2/2] Running DAILY SYSTEM...")
-        out = post("/internal/system/daily-run")
-
-        print(
-            f"✅ Daily run OK | decisions={len(out.get('decisions', []))} | "
-            f"executed={len(out.get('executed', []))}"
+        # -------------------------------------------------
+        # 2️⃣ DECIDER
+        # -------------------------------------------------
+        logger.info("🧠 [2/8] Decider...")
+        decider_out = run_decider()
+        logger.info(
+            f"✅ Decider OK | added={len(decider_out['added'])} | total={decider_out['total']}"
         )
 
+        # -------------------------------------------------
+        # 3️⃣ MODEL RUNNER
+        # -------------------------------------------------
+        logger.info("📈 [3/8] Model runner...")
+        model_out = run_prediction_runner()
+        logger.info(
+            f"✅ Model OK | tickers={model_out['tickers']} | generated={model_out['generated']}"
+        )
+
+        # -------------------------------------------------
+        # 4️⃣ EVALUATOR
+        # -------------------------------------------------
+        logger.info("📊 [4/8] Evaluator...")
+        eval_out = run_evaluator_runner()
+        logger.info(
+            f"✅ Evaluator OK | evaluated={eval_out['evaluated']}"
+        )
+
+        # -------------------------------------------------
+        # 5️⃣ MARKET QUANT
+        # -------------------------------------------------
+        logger.info("📉 [5/8] Market quantitative context...")
+        quant_ctx = evaluate_quant_market(
+            prices_main=eval_out["prices_main"],
+            prices_cross=eval_out["prices_cross"]
+        )
+        logger.info(
+            f"✅ Market quant OK | regime={quant_ctx.regime} | vol={quant_ctx.volatility}"
+        )
+
+        # -------------------------------------------------
+        # 6️⃣ MARKET QUALITATIVE (IA)
+        # -------------------------------------------------
+        logger.info("🧠 [6/8] Market qualitative context...")
+        qual_ctx = evaluate_qualitative_market(
+            quant_ctx.to_dict(),
+            news_summary=eval_out.get("news_summary")
+        )
+        logger.info(
+            f"✅ Market qual OK | bias={qual_ctx.macro_bias} | conf={qual_ctx.confidence:.2f}"
+        )
+
+        # -------------------------------------------------
+        # 7️⃣ MARKET ORCHESTRATOR
+        # -------------------------------------------------
+        logger.info("🧭 [7/8] Market orchestration...")
+        market_orch = MarketOrchestrator()
+        market_ctx = market_orch.evaluate(
+            quant_ctx.to_dict(),
+            qual_ctx.to_dict()
+        )
+        logger.info(
+            f"🎯 MARKET MODE = {market_ctx.market_mode.upper()} "
+            f"(conf {market_ctx.confidence:.2f})"
+        )
+
+        # -------------------------------------------------
+        # 8️⃣ TRADING ORCHESTRATOR (OPCIONAL)
+        # -------------------------------------------------
+        if market_ctx.market_mode != "defensive":
+            logger.info("🤖 [8/8] Trading orchestrator...")
+            run_orchestrator()
+            logger.info("✅ Trading orchestrator OK")
+        else:
+            logger.warning("⛔ Trading BLOQUEADO por market_mode=DEFENSIVE")
+
     except Exception as e:
-        print("❌ PIPELINE FAILED")
-        print(str(e))
+        logger.error("❌ PIPELINE FAILED")
+        logger.error(str(e))
         traceback.print_exc()
         return
 
     end_ts = datetime.utcnow().isoformat()
-    print("=" * 60)
-    print(f"🏁 PIPELINE DAILY END | {end_ts}")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info(f"🏁 PIPELINE DAILY END | {end_ts}")
+    logger.info("=" * 60)
 
 
+# =========================
+# ENTRYPOINT
+# =========================
 if __name__ == "__main__":
     main()
