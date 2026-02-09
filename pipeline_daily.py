@@ -22,12 +22,16 @@ from datetime import datetime
 import logging
 
 # =========================
-# IMPORTS — CAPAS
+# IMPORTS — CAPAS REALES
 # =========================
 from screener import run_screener
 from decider import run_decider
 
-from prediction_runner import run_prediction_runner
+# 🔴 CORRECCIÓN CLAVE:
+# NO prediction_runner (no existe)
+# SÍ model_runner (ejecuta model.py y guarda en disco)
+from model_runner import run_all_models
+
 from evaluator_runner import run_evaluator_runner
 
 from evaluador_cuantitativo_mercado import evaluate_quant_market
@@ -60,7 +64,9 @@ def main():
         # -------------------------------------------------
         logger.info("🔍 [1/8] Screener...")
         screener_out = run_screener()
-        logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
+        logger.info(
+            f"✅ Screener OK | candidates={screener_out.get('n_candidates')}"
+        )
 
         # -------------------------------------------------
         # 2️⃣ DECIDER
@@ -72,13 +78,11 @@ def main():
         )
 
         # -------------------------------------------------
-        # 3️⃣ MODEL RUNNER
+        # 3️⃣ MODEL RUNNER (FUENTE DE VERDAD)
         # -------------------------------------------------
         logger.info("📈 [3/8] Model runner...")
-        model_out = run_prediction_runner()
-        logger.info(
-            f"✅ Model OK | tickers={model_out['tickers']} | generated={model_out['generated']}"
-        )
+        run_all_models()
+        logger.info("✅ Model OK | predictions guardadas en /data/predictions")
 
         # -------------------------------------------------
         # 4️⃣ EVALUATOR
@@ -128,7 +132,7 @@ def main():
         )
 
         # -------------------------------------------------
-        # 8️⃣ TRADING ORCHESTRATOR (OPCIONAL)
+        # 8️⃣ TRADING ORCHESTRATOR (CONDICIONAL)
         # -------------------------------------------------
         if market_ctx.market_mode != "defensive":
             logger.info("🤖 [8/8] Trading orchestrator...")
