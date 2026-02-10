@@ -5,21 +5,18 @@
 # ---------------------------------------------------------
 # ✔ Determinista, auditable, reproducible
 # ✔ NO predice | NO decide | SOLO mide riesgo real
-# ✔ LEE Alpaca directamente (como screener)
+# ✔ LEE Yahoo Finance directamente (estable)
 # ✔ NO guarda nada en disco
 # ✔ Entry-point único para el pipeline
 # =========================================================
 
-import os
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, asdict
 from typing import Dict, Literal
 from datetime import datetime, timedelta
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+import yfinance as yf
 
 
 # =========================================================
@@ -134,41 +131,43 @@ def classify_regime(
 
 
 # =========================================================
-# LOADER AUTÓNOMO DE MERCADO (ALPACA)
+# LOADER AUTÓNOMO DE MERCADO (YAHOO FINANCE)
 # =========================================================
 def load_market_prices() -> tuple[pd.Series, pd.DataFrame]:
-    key = os.getenv("ALPACA_API_KEY")
-    secret = os.getenv("ALPACA_SECRET_KEY")
-
-    if not key or not secret:
-        raise RuntimeError("Credenciales Alpaca no configuradas")
-
-    client = StockHistoricalDataClient(key, secret)
-
-    end = datetime.utcnow()
+    end = datetime.utcnow().date()
     start = end - timedelta(days=MARKET_LOOKBACK_DAYS)
 
     # --------- MAIN (SPY) ----------
-    req_main = StockBarsRequest(
-        symbol_or_symbols=MARKET_MAIN_SYMBOL,
-        timeframe=TimeFrame.Day,
+    df_main = yf.download(
+        MARKET_MAIN_SYMBOL,
         start=start,
         end=end,
+        progress=False,
+        auto_adjust=True,
     )
 
-    df_main = client.get_stock_bars(req_main).df
-    prices_main = df_main["close"].dropna()
+    if df_main is None or df_main.empty:
+        raise RuntimeError("No se pudieron cargar datos MAIN desde Yahoo")
+
+    prices_main = df_main["Close"].dropna()
 
     # --------- CROSS ASSETS ----------
-    req_cross = StockBarsRequest(
-        symbol_or_symbols=MARKET_CROSS_SYMBOLS,
-        timeframe=TimeFrame.Day,
+    df_cross = yf.download(
+        MARKET_CROSS_SYMBOLS,
         start=start,
         end=end,
+        progress=False,
+        auto_adjust=True,
     )
 
-    df_cross = client.get_stock_bars(req_cross).df
-    prices_cross = df_cross["close"].unstack(level=0).dropna()
+    if df_cross is None or df_cross.empty:
+        raise RuntimeError("No se pudieron cargar datos CROSS desde Yahoo")
+
+    # yfinance devuelve columnas multinivel
+    if isinstance(df_cross.columns, pd.MultiIndex):
+        prices_cross = df_cross["Close"].dropna()
+    else:
+        prices_cross = df_cross.filter(like="Close").dropna()
 
     return prices_main, prices_cross
 
@@ -203,7 +202,7 @@ def evaluate_quant_market(
 
 
 # =========================================================
-# ENTRYPOINT PARA PIPELINE
+# ENTRYPOINT PARA PIPELINE (MISMO CONTRATO)
 # =========================================================
 def run_market_state() -> QuantMarketContext:
     prices_main, prices_cross = load_market_prices()
