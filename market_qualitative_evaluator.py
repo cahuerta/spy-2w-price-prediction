@@ -118,7 +118,7 @@ def evaluate_qualitative_market(
     client = OpenAI(api_key=api_key)
     
 
-# --------------------
+    # --------------------
     # Input cuantitativo formateado
     # --------------------
     quant_block = f"""
