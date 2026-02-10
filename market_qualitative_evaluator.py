@@ -119,9 +119,9 @@ def evaluate_qualitative_market(
     
 
 # --------------------
-# Input cuantitativo formateado
-# --------------------
-quant_block = f"""
+    # Input cuantitativo formateado
+    # --------------------
+    quant_block = f"""
 CONTEXTO CUANTITATIVO ACTUAL:
 
 Volatilidad: {float(quant_context.get('volatility', 0)):.1%}
