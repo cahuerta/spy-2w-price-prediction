@@ -12,6 +12,8 @@ from fastapi import APIRouter, HTTPException, Request
 from datetime import datetime
 import logging
 import traceback
+import os
+import httpx
 
 # =========================
 # IMPORTS — CAPAS REALES
@@ -130,6 +132,42 @@ async def run_pipeline(request: Request):
             f"✅ Trading OK | mode={trade_out.get('mode')} "
             f"| decisions={len(trade_out.get('decisions', []))}"
         )
+        # -------------------------------------------------
+        # 9️⃣ COMMIT A DISCO (FUENTE ÚNICA)
+        # -------------------------------------------------
+        logger.info("💾 [9/9] Committing pipeline results...")
+
+        import os
+        import httpx
+
+        PIPELINE_KEY = os.getenv("PIPELINE_KEY")
+        BASE_URL = str(request.base_url).rstrip("/")
+
+        commit_payload = {
+            "screener": screener_out,
+            "market_ctx": market_ctx.to_dict(),
+            "audit": {
+                "timestamp": datetime.utcnow().isoformat(),
+                "market_mode": market_ctx.market_mode,
+                "confidence": market_ctx.confidence,
+                "decisions": len(trade_out.get("decisions", [])),
+            },
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{BASE_URL}/internal/pipeline/commit",
+                json=commit_payload,
+                headers={"X-PIPELINE-KEY": PIPELINE_KEY},
+                timeout=30,
+            )
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Pipeline commit failed: {resp.status_code} {resp.text}"
+            )
+
+        logger.info("✅ Pipeline committed to disk")
 
         # -------------------------------------------------
         # RESPONSE
