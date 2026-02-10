@@ -1,33 +1,56 @@
 # =========================================================
-# evaluador_cuantitativo_mercado.py - V2.0 RIESGO REAL
+# evaluador_cuantitativo_mercado.py — V3.0 RIESGO REAL (PRODUCCIÓN)
 #
-# MOTOR CUANTITATIVO DE ENTORNO DE MERCADO (SIN DECISIONES)
+# MOTOR CUANTITATIVO DE ENTORNO DE MERCADO (AUTÓNOMO)
 # ---------------------------------------------------------
-# Determinista, auditable, reproducible
-# NO predice | NO decide | SOLO MIDE RIESGO REAL
-# Thresholds neutrales -> TU decides estrategia
-# Edge cases robustos + logging minimo
+# ✔ Determinista, auditable, reproducible
+# ✔ NO predice | NO decide | SOLO mide riesgo real
+# ✔ LEE Alpaca directamente (como screener)
+# ✔ NO guarda nada en disco
+# ✔ Entry-point único para el pipeline
 # =========================================================
 
+import os
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, asdict
 from typing import Dict, Literal
+from datetime import datetime, timedelta
+
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
 
 # =========================================================
-# CONFIGURACION NEUTRAL (RIESGO REAL)
+# CONFIGURACIÓN DE MERCADO (MACRO)
+# =========================================================
+MARKET_MAIN_SYMBOL = "SPY"
+
+MARKET_CROSS_SYMBOLS = [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "TLT",
+    "GLD",
+]
+
+MARKET_LOOKBACK_DAYS = 150
+
+
+# =========================================================
+# CONFIGURACIÓN DE RIESGO (NEUTRAL)
 # =========================================================
 VOL_LOOKBACK = 20
 DD_LOOKBACK = 63
 TREND_LOOKBACK = 50
 CORR_LOOKBACK = 30
 
-# THRESHOLDS REALISTAS (sin bias)
 VOL_HIGH = 0.35
 VOL_LOW = 0.10
 DD_HIGH = -0.20
 DD_MED = -0.10
-CORR_HIGH = 0.85
+
 
 # =========================================================
 # DATACLASS SALIDA
@@ -45,8 +68,9 @@ class QuantMarketContext:
     def to_dict(self) -> Dict:
         return asdict(self)
 
+
 # =========================================================
-# METRICAS (ROBUSTAS)
+# MÉTRICAS ROBUSTAS
 # =========================================================
 def realized_volatility(returns: pd.Series, lookback: int) -> float:
     if len(returns) < lookback:
@@ -65,7 +89,7 @@ def trend_strength(prices: pd.Series, lookback: int) -> float:
     if len(prices) < lookback:
         return 0.0
     ma = prices.rolling(lookback).mean().dropna()
-    if len(ma) == 0:
+    if ma.empty:
         return 0.0
     return float((prices.iloc[-1] / ma.iloc[-1]) - 1.0)
 
@@ -81,8 +105,9 @@ def cross_asset_corr(df_prices: pd.DataFrame, lookback: int) -> float:
     upper = corr[np.triu_indices_from(corr, k=1)]
     return float(np.nanmean(upper))
 
+
 # =========================================================
-# CLASIFICADORES NEUTRALES
+# CLASIFICADORES
 # =========================================================
 def classify_downside(dd: float) -> Literal["low", "medium", "high"]:
     if dd <= DD_HIGH:
@@ -98,15 +123,58 @@ def classify_regime(
     corr: float,
     trend: float
 ) -> Literal["growth", "neutral", "defensive"]:
-    # Solo extremos -> defensive (tu decides accion)
+
     if dd <= -0.25 or vol >= 0.45 or corr >= 0.90:
         return "defensive"
+
     if trend > 0.05 and vol <= VOL_LOW and corr < 0.60:
         return "growth"
+
     return "neutral"
 
+
 # =========================================================
-# FUNCION PRINCIPAL (TU LA LLAMAS)
+# LOADER AUTÓNOMO DE MERCADO (ALPACA)
+# =========================================================
+def load_market_prices() -> tuple[pd.Series, pd.DataFrame]:
+    key = os.getenv("ALPACA_API_KEY")
+    secret = os.getenv("ALPACA_SECRET_KEY")
+
+    if not key or not secret:
+        raise RuntimeError("Credenciales Alpaca no configuradas")
+
+    client = StockHistoricalDataClient(key, secret)
+
+    end = datetime.utcnow()
+    start = end - timedelta(days=MARKET_LOOKBACK_DAYS)
+
+    # --------- MAIN (SPY) ----------
+    req_main = StockBarsRequest(
+        symbol_or_symbols=MARKET_MAIN_SYMBOL,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+    )
+
+    df_main = client.get_stock_bars(req_main).df
+    prices_main = df_main["close"].dropna()
+
+    # --------- CROSS ASSETS ----------
+    req_cross = StockBarsRequest(
+        symbol_or_symbols=MARKET_CROSS_SYMBOLS,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+    )
+
+    df_cross = client.get_stock_bars(req_cross).df
+    prices_cross = df_cross["close"].unstack(level=0).dropna()
+
+    return prices_main, prices_cross
+
+
+# =========================================================
+# CORE EVALUATOR (PURO)
 # =========================================================
 def evaluate_quant_market(
     prices_main: pd.Series,
@@ -133,5 +201,18 @@ def evaluate_quant_market(
         n_observations=len(prices_main),
     )
 
-# USO:
-# context = evaluate_quant_market(spy_prices, cross_prices)
+
+# =========================================================
+# ENTRYPOINT PARA PIPELINE
+# =========================================================
+def run_market_state() -> QuantMarketContext:
+    prices_main, prices_cross = load_market_prices()
+    return evaluate_quant_market(prices_main, prices_cross)
+
+
+# =========================================================
+# CLI (DEBUG / MANUAL)
+# =========================================================
+if __name__ == "__main__":
+    ctx = run_market_state()
+    print(ctx.to_dict())
