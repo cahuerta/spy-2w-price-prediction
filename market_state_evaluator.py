@@ -51,7 +51,18 @@ class QuantMarketContext:
     corr_source: Literal["measured", "historical", "knn", "unavailable"]
 
     def to_dict(self) -> Dict:
-        return asdict(self)
+        """
+        Serialización segura:
+        - np.float / np.int → float
+        - np.nan → None
+        """
+        d = asdict(self)
+        for k, v in d.items():
+            if isinstance(v, (np.floating, np.integer)):
+                d[k] = float(v)
+            elif isinstance(v, float) and np.isnan(v):
+                d[k] = None
+        return d
 
 
 # =========================================================
@@ -108,8 +119,7 @@ def load_market_history() -> pd.DataFrame:
         except Exception:
             continue
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 # =========================================================
