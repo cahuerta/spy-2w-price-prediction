@@ -75,19 +75,18 @@ async def run_pipeline(request: Request):
         run_all_models()
         logger.info("✅ Model runner OK")
 
-        # 4️⃣ EVALUATOR (side-effect only)
-logger.info("📊 [4/8] Evaluator (background)...")
-evaluate_all()
-logger.info("ℹ️ Evaluator executed (no downstream dependency)") 
+        # -------------------------------------------------
+        # 4️⃣ EVALUATOR (SIDE-EFFECT ONLY)
+        # -------------------------------------------------
+        logger.info("📊 [4/8] Evaluator (background only)...")
+        evaluate_all()
+        logger.info("ℹ️ Evaluator executed (no downstream dependency)")
 
         # -------------------------------------------------
         # 5️⃣ MARKET QUANT
         # -------------------------------------------------
         logger.info("📉 [5/8] Market quantitative context...")
-        quant_ctx = evaluate_quant_market(
-            prices_main=eval_out.get("prices_main"),
-            prices_cross=eval_out.get("prices_cross"),
-        )
+        quant_ctx = evaluate_quant_market()
         logger.info(f"✅ Market quant OK | regime={quant_ctx.regime}")
 
         # -------------------------------------------------
@@ -95,8 +94,7 @@ logger.info("ℹ️ Evaluator executed (no downstream dependency)")
         # -------------------------------------------------
         logger.info("🧠 [6/8] Market qualitative context...")
         qual_ctx = evaluate_qualitative_market(
-            quant_ctx.to_dict(),
-            news_summary=eval_out.get("news_summary"),
+            quant_ctx.to_dict()
         )
         logger.info(
             f"✅ Market qual OK | bias={qual_ctx.macro_bias} "
@@ -125,8 +123,7 @@ logger.info("ℹ️ Evaluator executed (no downstream dependency)")
         trading_orch = TradingOrchestrator()
 
         trade_out = trading_orch.run(
-            market_ctx=market_ctx.to_dict(),
-            eval_out=eval_out,
+            market_ctx=market_ctx.to_dict()
         )
 
         logger.info(
@@ -135,7 +132,7 @@ logger.info("ℹ️ Evaluator executed (no downstream dependency)")
         )
 
         # -------------------------------------------------
-        # RESPONSE (MAIN DECIDE QUÉ PERSISTIR)
+        # RESPONSE
         # -------------------------------------------------
         return {
             "status": "ok",
