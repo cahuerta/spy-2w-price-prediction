@@ -83,17 +83,17 @@ async def run_pipeline(request: Request):
         logger.info("ℹ️ Evaluator executed (no downstream dependency)")
 
         # -------------------------------------------------
-        # 5️⃣ MARKET QUANT
+        # 5️⃣ MARKET QUANT (AUTÓNOMO)
         # -------------------------------------------------
         logger.info("📉 [5/8] Market quantitative context...")
-        quant_ctx = evaluate_quant_market()
+        quant_ctx = run_market_state()
         logger.info(f"✅ Market quant OK | regime={quant_ctx.regime}")
 
         # -------------------------------------------------
         # 6️⃣ MARKET QUALITATIVE (IA)
         # -------------------------------------------------
         logger.info("🧠 [6/8] Market qualitative context...")
-        quant_ctx = run_market_state()
+        qual_ctx = evaluate_qualitative_market(
             quant_ctx.to_dict()
         )
         logger.info(
@@ -123,7 +123,7 @@ async def run_pipeline(request: Request):
         trading_orch = TradingOrchestrator()
 
         trade_out = await trading_orch.run(
-        market_ctx=market_ctx.to_dict()
+            market_ctx=market_ctx.to_dict()
         )
 
         logger.info(
