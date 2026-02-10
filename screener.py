@@ -9,8 +9,10 @@
 # ✅ Wrapper sync seguro (solo CLI)
 # ✅ Production hardened v3.1
 # =========================================================
+
 import alpaca
 print("ALPACA VERSION:", alpaca.__version__)
+
 import os
 import json
 import logging
@@ -77,7 +79,6 @@ try:
 except ImportError:
     ScreenerClient = None
     SCREENER_AVAILABLE = False
-
 
 # =========================================================
 # Configuración
@@ -337,7 +338,7 @@ async def fetch_symbol_data(
 
 
 # =========================================================
-# MAIN ASYNC SCREENER v3.1
+# MAIN ASYNC SCREENER v3.1  ✅ (AGREGADO: top10_global SIEMPRE)
 # =========================================================
 async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     ALPACA_KEY = os.getenv("ALPACA_API_KEY")
@@ -382,6 +383,9 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         logger.info(f"Universe fallback: {len(universe)} assets")
 
     semaphore = asyncio.Semaphore(ALPACA_CONCURRENT)
+
+    # ✅ NUEVO: guardamos todo lo evaluado (para top10_global SIEMPRE)
+    evaluated: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
 
     total_batches = (len(universe) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -399,13 +403,22 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
             ],
             return_exceptions=True,
         )
-        candidates.extend([r for r in results if isinstance(r, dict)])
 
-    # Quant ranking
+        # ✅ NUEVO: separar "evaluated" vs "candidates"
+        for r in results:
+            if isinstance(r, dict):
+                evaluated.append(r)
+                if float(r.get("score", 0.0)) >= MIN_SCORE:
+                    candidates.append(r)
+
+    # Quant ranking (candidatos estrictos)
     candidates.sort(key=lambda x: x["score"], reverse=True)
     candidates = candidates[:TOP_K]
 
-    # IA enrichment (post-filter)
+    # ✅ NUEVO: Top 10 GLOBAL (aunque candidates sea 0)
+    top10_global = sorted(evaluated, key=lambda x: x["score"], reverse=True)[:10]
+
+    # IA enrichment (post-filter) — SOLO sobre candidatos (sin cambiar contrato)
     if IA_AVAILABLE and candidates:
         try:
             candidates = await enrich_screener_candidates_batch(candidates)
@@ -439,17 +452,11 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
             "batch_size": BATCH_SIZE,
         },
         "candidates": candidates,
+
+        # ✅ AGREGADO (NO rompe nada): top 10 de TODO lo evaluado
+        "top10_global": top10_global,
+        "n_evaluated": len(evaluated),
     }
-
-    return output
-
-    if candidates:
-        logger.info(
-            f"✅ Screener v3.1 | {len(candidates)} candidatos | "
-            f"TOP: {candidates[0]['ticker']} ({candidates[0]['score']:.3f})"
-        )
-    else:
-        logger.info("✅ Screener v3.1 | 0 candidatos")
 
     return output
 
@@ -457,7 +464,6 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
 # =========================================================
 # SYNC WRAPPER (CLI ONLY) — seguro
 # =========================================================
-
 def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     """
     Wrapper sync SOLO para CLI / cron python directo.
@@ -475,6 +481,7 @@ def run_screener(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     logger.info(f"📄 Screener guardado en disco: {OUTPUT_FILE}")
 
     return result
+
 
 # =========================================================
 # CLI
