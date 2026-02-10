@@ -1,15 +1,17 @@
 # =========================================================
-# evaluador_cuantitativo_mercado.py — V3.1 RIESGO REAL (PRODUCCIÓN)
+# market_quant_context.py — V3.2 RIESGO REAL (PRODUCCIÓN)
 #
-# MOTOR CUANTITATIVO DE ENTORNO DE MERCADO (AUTÓNOMO)
+# CONTEXTO CUANTITATIVO DE MERCADO CON MEMORIA HISTÓRICA
 # ---------------------------------------------------------
 # ✔ Determinista, auditable, reproducible
-# ✔ NO predice | NO decide | SOLO mide riesgo real
-# ✔ LEE Yahoo Finance directamente
+# ✔ NO predice | NO decide | SOLO mide riesgo
+# ✔ Lee Yahoo Finance + JSON históricos reales
 # ✔ NO guarda nada en disco
-# ✔ Si el mercado NO es evaluable → lo declara explícitamente
+# ✔ Escala: determinístico → histórico → vecinos
 # =========================================================
 
+import os
+import json
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, asdict
@@ -20,28 +22,18 @@ import yfinance as yf
 
 
 # =========================================================
-# CONFIGURACIÓN DE MERCADO (MACRO)
+# CONFIGURACIÓN
 # =========================================================
 MARKET_MAIN_SYMBOL = "SPY"
-
-MARKET_CROSS_SYMBOLS = [
-    "SPY",
-    "QQQ",
-    "IWM",
-    "TLT",
-    "GLD",
-]
-
+MARKET_CROSS_SYMBOLS = ["SPY", "QQQ", "IWM", "TLT", "GLD"]
 MARKET_LOOKBACK_DAYS = 150
 
-
-# =========================================================
-# CONFIGURACIÓN DE RIESGO (NEUTRAL)
-# =========================================================
 VOL_LOOKBACK = 20
 DD_LOOKBACK = 63
 TREND_LOOKBACK = 50
 CORR_LOOKBACK = 30
+
+MARKET_HISTORY_DIR = "data/market_history"
 
 
 # =========================================================
@@ -50,67 +42,113 @@ CORR_LOOKBACK = 30
 @dataclass
 class QuantMarketContext:
     regime: Literal["growth", "neutral", "defensive"]
-    volatility: float | float("nan")
-    drawdown_rolling: float | float("nan")
-    trend_strength: float | float("nan")
-    cross_asset_correlation: float | float("nan")
+    volatility: float
+    drawdown_rolling: float
+    trend_strength: float
+    cross_asset_correlation: float
     downside_risk: Literal["low", "medium", "high", "unknown"]
     n_observations: int
+    corr_source: Literal["measured", "historical", "knn", "unavailable"]
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
 
 # =========================================================
-# MÉTRICAS ROBUSTAS (ESCALARES O NaN)
+# MÉTRICAS DETERMINÍSTICAS
 # =========================================================
-def realized_volatility(returns: pd.Series, lookback: int) -> float:
-    if len(returns) < lookback:
+def realized_volatility(returns: pd.Series) -> float:
+    if len(returns) < VOL_LOOKBACK:
         return np.nan
-    return float(np.sqrt(252) * returns.tail(lookback).std())
+    return float(np.sqrt(252) * returns.tail(VOL_LOOKBACK).std())
 
 
-def rolling_drawdown(prices: pd.Series, lookback: int) -> float:
-    if len(prices) < lookback:
+def rolling_drawdown(prices: pd.Series) -> float:
+    if len(prices) < DD_LOOKBACK:
         return np.nan
-    window = prices.tail(lookback)
-    return float(((window / window.cummax()) - 1).min())
+    w = prices.tail(DD_LOOKBACK)
+    return float(((w / w.cummax()) - 1).min())
 
 
-def trend_strength(prices: pd.Series, lookback: int) -> float:
-    if len(prices) < lookback:
+def trend_strength(prices: pd.Series) -> float:
+    if len(prices) < TREND_LOOKBACK:
         return np.nan
-    ma = prices.rolling(lookback).mean().dropna()
+    ma = prices.rolling(TREND_LOOKBACK).mean().dropna()
     if ma.empty:
         return np.nan
     return float((prices.iloc[-1] / ma.iloc[-1]) - 1.0)
 
 
-def cross_asset_corr(df_prices: pd.DataFrame, lookback: int) -> float:
-    """
-    Retorna:
-      - float escalar si es estadísticamente definible
-      - np.nan si NO es definible (pocos activos / datos)
-    """
-    if df_prices.shape[1] < 2:
+def cross_asset_corr(df: pd.DataFrame) -> float:
+    if df.shape[1] < 2:
         return np.nan
-
-    returns = df_prices.pct_change().dropna()
-    if len(returns) < lookback:
+    rets = df.pct_change().dropna()
+    if len(rets) < CORR_LOOKBACK:
         return np.nan
-
-    corr_matrix = returns.tail(lookback).corr()
-    values = corr_matrix.values
-    upper = values[np.triu_indices_from(values, k=1)]
-
-    if upper.size == 0:
-        return np.nan
-
-    return float(np.nanmean(upper))
+    corr = rets.tail(CORR_LOOKBACK).corr().values
+    upper = corr[np.triu_indices_from(corr, k=1)]
+    return float(np.nanmean(upper)) if upper.size else np.nan
 
 
 # =========================================================
-# CLASIFICADORES (CON NAN AWARE)
+# HISTÓRICO REAL DESDE JSON
+# =========================================================
+def load_market_history() -> pd.DataFrame:
+    if not os.path.isdir(MARKET_HISTORY_DIR):
+        return pd.DataFrame()
+
+    rows = []
+    for f in os.listdir(MARKET_HISTORY_DIR):
+        if not f.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(MARKET_HISTORY_DIR, f), "r") as fh:
+                data = json.load(fh)
+                rows.append(data)
+        except Exception:
+            continue
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+# =========================================================
+# FALLBACK HISTÓRICO
+# =========================================================
+def historical_corr(history: pd.DataFrame) -> float:
+    if history.empty or "cross_asset_correlation" not in history:
+        return np.nan
+    s = history["cross_asset_correlation"].dropna()
+    if len(s) < 20:
+        return np.nan
+    return float(s.median())
+
+
+def knn_corr(history: pd.DataFrame, features: Dict[str, float], k: int = 5) -> float:
+    required = ["volatility", "drawdown_rolling", "trend_strength"]
+
+    if history.empty or not all(c in history for c in required):
+        return np.nan
+
+    if any(np.isnan(features[r]) for r in required):
+        return np.nan
+
+    hist = history.dropna(subset=required + ["cross_asset_correlation"])
+    if len(hist) < k:
+        return np.nan
+
+    X = hist[required].values
+    y = hist["cross_asset_correlation"].values
+    x0 = np.array([features[r] for r in required])
+
+    dists = np.linalg.norm(X - x0, axis=1)
+    idx = np.argsort(dists)[:k]
+
+    return float(np.mean(y[idx]))
+
+
+# =========================================================
+# CLASIFICADORES
 # =========================================================
 def classify_downside(dd: float) -> Literal["low", "medium", "high", "unknown"]:
     if np.isnan(dd):
@@ -122,47 +160,31 @@ def classify_downside(dd: float) -> Literal["low", "medium", "high", "unknown"]:
     return "low"
 
 
-def classify_regime(
-    vol: float,
-    dd: float,
-    corr: float,
-    trend: float
-) -> Literal["growth", "neutral", "defensive"]:
-
-    # ⚠️ Mercado NO evaluable → neutral forzado
+def classify_regime(vol, dd, corr, trend) -> Literal["growth", "neutral", "defensive"]:
     if any(np.isnan(x) for x in [vol, dd, corr, trend]):
         return "neutral"
-
     if dd <= -0.25 or vol >= 0.45 or corr >= 0.90:
         return "defensive"
-
     if trend > 0.05 and vol <= 0.10 and corr < 0.60:
         return "growth"
-
     return "neutral"
 
 
 # =========================================================
-# LOADER AUTÓNOMO DE MERCADO (YAHOO FINANCE)
+# LOADER YAHOO FINANCE
 # =========================================================
 def load_market_prices() -> tuple[pd.Series, pd.DataFrame]:
     end = datetime.utcnow().date()
     start = end - timedelta(days=MARKET_LOOKBACK_DAYS)
 
-    df_main = yf.download(
+    main = yf.download(
         MARKET_MAIN_SYMBOL,
         start=start,
         end=end,
         auto_adjust=True,
         progress=False,
     )
-
-    if df_main is None or df_main.empty:
-        raise RuntimeError("Datos MAIN no disponibles")
-
-    prices_main = df_main["Close"].dropna()
-
-    df_cross = yf.download(
+    cross = yf.download(
         MARKET_CROSS_SYMBOLS,
         start=start,
         end=end,
@@ -170,53 +192,62 @@ def load_market_prices() -> tuple[pd.Series, pd.DataFrame]:
         progress=False,
     )
 
-    if df_cross is None or df_cross.empty:
-        raise RuntimeError("Datos CROSS no disponibles")
+    if main.empty or cross.empty:
+        raise RuntimeError("Datos de mercado no disponibles")
 
+    prices_main = main["Close"].dropna()
     prices_cross = (
-        df_cross["Close"]
-        if isinstance(df_cross.columns, pd.MultiIndex)
-        else df_cross.filter(like="Close")
+        cross["Close"]
+        if isinstance(cross.columns, pd.MultiIndex)
+        else cross.filter(like="Close")
     ).dropna()
 
     return prices_main, prices_cross
 
 
 # =========================================================
-# CORE EVALUATOR
+# CORE
 # =========================================================
-def evaluate_quant_market(
-    prices_main: pd.Series,
-    prices_cross: pd.DataFrame
-) -> QuantMarketContext:
+def run_market_state() -> QuantMarketContext:
+    prices_main, prices_cross = load_market_prices()
+    history = load_market_history()
 
     returns = prices_main.pct_change().dropna()
 
-    vol = realized_volatility(returns, VOL_LOOKBACK)
-    dd = rolling_drawdown(prices_main, DD_LOOKBACK)
-    trend = trend_strength(prices_main, TREND_LOOKBACK)
-    corr = cross_asset_corr(prices_cross, CORR_LOOKBACK)
+    vol = realized_volatility(returns)
+    dd = rolling_drawdown(prices_main)
+    trend = trend_strength(prices_main)
+    corr = cross_asset_corr(prices_cross)
+    source = "measured"
 
-    downside = classify_downside(dd)
-    regime = classify_regime(vol, dd, corr, trend)
+    if np.isnan(corr):
+        corr = historical_corr(history)
+        source = "historical"
+
+    if np.isnan(corr):
+        corr = knn_corr(
+            history,
+            {
+                "volatility": vol,
+                "drawdown_rolling": dd,
+                "trend_strength": trend,
+            },
+        )
+        source = "knn"
+
+    if np.isnan(corr):
+        source = "unavailable"
 
     return QuantMarketContext(
-        regime=regime,
+        regime=classify_regime(vol, dd, corr, trend),
         volatility=vol,
         drawdown_rolling=dd,
         trend_strength=trend,
         cross_asset_correlation=corr,
-        downside_risk=downside,
+        downside_risk=classify_downside(dd),
         n_observations=len(prices_main),
+        corr_source=source,
     )
-
-
-# =========================================================
-# ENTRYPOINT PARA PIPELINE
-# =========================================================
-def run_market_state() -> QuantMarketContext:
-    prices_main, prices_cross = load_market_prices()
-    return evaluate_quant_market(prices_main, prices_cross)
 
 
 if __name__ == "__main__":
