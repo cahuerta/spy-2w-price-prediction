@@ -163,11 +163,15 @@ def load_market_prices() -> tuple[pd.Series, pd.DataFrame]:
     if df_cross is None or df_cross.empty:
         raise RuntimeError("No se pudieron cargar datos CROSS desde Yahoo")
 
-    # yfinance devuelve columnas multinivel
+    # yfinance puede devolver columnas MultiIndex o simples
     if isinstance(df_cross.columns, pd.MultiIndex):
         prices_cross = df_cross["Close"].dropna()
     else:
         prices_cross = df_cross.filter(like="Close").dropna()
+
+    # 🔒 FIX CRÍTICO: garantizar DataFrame SIEMPRE
+    if isinstance(prices_cross, pd.Series):
+        prices_cross = prices_cross.to_frame()
 
     return prices_main, prices_cross
 
