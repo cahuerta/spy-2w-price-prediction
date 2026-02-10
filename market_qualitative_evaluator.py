@@ -117,19 +117,20 @@ def evaluate_qualitative_market(
     
     client = OpenAI(api_key=api_key)
     
-    # --------------------
-    # Input cuantitativo formateado
-    # --------------------
-    quant_block = f"""
+
+# --------------------
+# Input cuantitativo formateado
+# --------------------
+quant_block = f"""
 CONTEXTO CUANTITATIVO ACTUAL:
 
-Volatilidad: {quant_context.get('volatility', 0):.1%}
-Drawdown rolling: {quant_context.get('drawdown_rolling', 0):.1%}
-Trend strength: {quant_context.get('trend_strength', 0):.1%}
-Cross-asset correlation: {quant_context.get('cross_asset_correlation', 0):.1%}
+Volatilidad: {float(quant_context.get('volatility', 0)):.1%}
+Drawdown rolling: {float(quant_context.get('drawdown_rolling', 0)):.1%}
+Trend strength: {float(quant_context.get('trend_strength', 0)):.1%}
+Cross-asset correlation: {float(quant_context.get('cross_asset_correlation', 0)):.1%}
 Regime cuantitativo: {quant_context.get('regime', 'neutral')}
-Downside risk: {quant_context.get('downside_risk', 'unknown')}"""
-
+Downside risk: {quant_context.get('downside_risk', 'unknown')}
+"""
     user_prompt = quant_block
     
     if news_summary:
