@@ -21,7 +21,7 @@ from decider import run_decider
 from model_runner import run_all_models
 from evaluator import evaluate_all
 
-from market_state_evaluator import evaluate_quant_market
+from evaluador_cuantitativo_mercado import run_market_state
 from market_qualitative_evaluator import evaluate_qualitative_market
 from market_orchestrator import MarketOrchestrator
 from trading_orchestrator import TradingOrchestrator
@@ -93,7 +93,7 @@ async def run_pipeline(request: Request):
         # 6️⃣ MARKET QUALITATIVE (IA)
         # -------------------------------------------------
         logger.info("🧠 [6/8] Market qualitative context...")
-        qual_ctx = evaluate_qualitative_market(
+        quant_ctx = run_market_state()
             quant_ctx.to_dict()
         )
         logger.info(
@@ -122,8 +122,8 @@ async def run_pipeline(request: Request):
         logger.info("🤖 [8/8] Trading orchestrator...")
         trading_orch = TradingOrchestrator()
 
-        trade_out = trading_orch.run(
-            market_ctx=market_ctx.to_dict()
+        trade_out = await trading_orch.run(
+        market_ctx=market_ctx.to_dict()
         )
 
         logger.info(
