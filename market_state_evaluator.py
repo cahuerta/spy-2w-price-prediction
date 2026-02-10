@@ -1,13 +1,5 @@
 # =========================================================
 # market_quant_context.py — V3.2 RIESGO REAL (PRODUCCIÓN)
-#
-# CONTEXTO CUANTITATIVO DE MERCADO CON MEMORIA HISTÓRICA
-# ---------------------------------------------------------
-# ✔ Determinista, auditable, reproducible
-# ✔ NO predice | NO decide | SOLO mide riesgo
-# ✔ Lee Yahoo Finance + JSON históricos reales
-# ✔ NO guarda nada en disco
-# ✔ Escala: determinístico → histórico → vecinos
 # =========================================================
 
 import os
@@ -37,6 +29,33 @@ MARKET_HISTORY_DIR = "data/market_history"
 
 
 # =========================================================
+# UTILIDAD CRÍTICA — ESCALAR FORZADO (FUENTE)
+# =========================================================
+def _scalar(x, default: float = 0.0) -> float:
+    """
+    Fuerza float escalar REAL.
+    Nunca retorna Series / ndarray / NaN.
+    """
+    try:
+        if x is None:
+            return default
+
+        if isinstance(x, (list, tuple, np.ndarray)):
+            arr = np.asarray(x, dtype=float)
+            return float(np.nanmean(arr)) if arr.size else default
+
+        if hasattr(x, "mean"):  # pandas Series
+            v = x.mean()
+            return float(v) if np.isfinite(v) else default
+
+        x = float(x)
+        return x if np.isfinite(x) else default
+
+    except Exception:
+        return default
+
+
+# =========================================================
 # DATACLASS SALIDA
 # =========================================================
 @dataclass
@@ -51,46 +70,35 @@ class QuantMarketContext:
     corr_source: Literal["measured", "historical", "knn", "unavailable"]
 
     def to_dict(self) -> Dict:
-        """
-        Serialización segura:
-        - np.float / np.int → float
-        - np.nan → None
-        """
-        d = asdict(self)
-        for k, v in d.items():
-            if isinstance(v, (np.floating, np.integer)):
-                d[k] = float(v)
-            elif isinstance(v, float) and np.isnan(v):
-                d[k] = None
-        return d
+        return asdict(self)
 
 
 # =========================================================
 # MÉTRICAS DETERMINÍSTICAS
 # =========================================================
-def realized_volatility(returns: pd.Series) -> float:
+def realized_volatility(returns: pd.Series):
     if len(returns) < VOL_LOOKBACK:
         return np.nan
-    return float(np.sqrt(252) * returns.tail(VOL_LOOKBACK).std())
+    return np.sqrt(252) * returns.tail(VOL_LOOKBACK).std()
 
 
-def rolling_drawdown(prices: pd.Series) -> float:
+def rolling_drawdown(prices: pd.Series):
     if len(prices) < DD_LOOKBACK:
         return np.nan
     w = prices.tail(DD_LOOKBACK)
-    return float(((w / w.cummax()) - 1).min())
+    return ((w / w.cummax()) - 1).min()
 
 
-def trend_strength(prices: pd.Series) -> float:
+def trend_strength(prices: pd.Series):
     if len(prices) < TREND_LOOKBACK:
         return np.nan
     ma = prices.rolling(TREND_LOOKBACK).mean().dropna()
     if ma.empty:
         return np.nan
-    return float((prices.iloc[-1] / ma.iloc[-1]) - 1.0)
+    return (prices.iloc[-1] / ma.iloc[-1]) - 1.0
 
 
-def cross_asset_corr(df: pd.DataFrame) -> float:
+def cross_asset_corr(df: pd.DataFrame):
     if df.shape[1] < 2:
         return np.nan
     rets = df.pct_change().dropna()
@@ -98,7 +106,7 @@ def cross_asset_corr(df: pd.DataFrame) -> float:
         return np.nan
     corr = rets.tail(CORR_LOOKBACK).corr().values
     upper = corr[np.triu_indices_from(corr, k=1)]
-    return float(np.nanmean(upper)) if upper.size else np.nan
+    return np.nanmean(upper) if upper.size else np.nan
 
 
 # =========================================================
@@ -114,8 +122,7 @@ def load_market_history() -> pd.DataFrame:
             continue
         try:
             with open(os.path.join(MARKET_HISTORY_DIR, f), "r") as fh:
-                data = json.load(fh)
-                rows.append(data)
+                rows.append(json.load(fh))
         except Exception:
             continue
 
@@ -125,16 +132,14 @@ def load_market_history() -> pd.DataFrame:
 # =========================================================
 # FALLBACK HISTÓRICO
 # =========================================================
-def historical_corr(history: pd.DataFrame) -> float:
+def historical_corr(history: pd.DataFrame):
     if history.empty or "cross_asset_correlation" not in history:
         return np.nan
     s = history["cross_asset_correlation"].dropna()
-    if len(s) < 20:
-        return np.nan
-    return float(s.median())
+    return s.median() if len(s) >= 20 else np.nan
 
 
-def knn_corr(history: pd.DataFrame, features: Dict[str, float], k: int = 5) -> float:
+def knn_corr(history: pd.DataFrame, features: Dict[str, float], k: int = 5):
     required = ["volatility", "drawdown_rolling", "trend_strength"]
 
     if history.empty or not all(c in history for c in required):
@@ -154,7 +159,7 @@ def knn_corr(history: pd.DataFrame, features: Dict[str, float], k: int = 5) -> f
     dists = np.linalg.norm(X - x0, axis=1)
     idx = np.argsort(dists)[:k]
 
-    return float(np.mean(y[idx]))
+    return np.mean(y[idx])
 
 
 # =========================================================
@@ -224,28 +229,36 @@ def run_market_state() -> QuantMarketContext:
 
     returns = prices_main.pct_change().dropna()
 
-    vol = realized_volatility(returns)
-    dd = rolling_drawdown(prices_main)
-    trend = trend_strength(prices_main)
-    corr = cross_asset_corr(prices_cross)
+    vol_raw = realized_volatility(returns)
+    dd_raw = rolling_drawdown(prices_main)
+    trend_raw = trend_strength(prices_main)
+    corr_raw = cross_asset_corr(prices_cross)
+
+    vol = _scalar(vol_raw)
+    dd = _scalar(dd_raw)
+    trend = _scalar(trend_raw)
+    corr = _scalar(corr_raw)
+
     source = "measured"
 
-    if np.isnan(corr):
-        corr = historical_corr(history)
+    if corr == 0.0:
+        corr = _scalar(historical_corr(history))
         source = "historical"
 
-    if np.isnan(corr):
-        corr = knn_corr(
-            history,
-            {
-                "volatility": vol,
-                "drawdown_rolling": dd,
-                "trend_strength": trend,
-            },
+    if corr == 0.0:
+        corr = _scalar(
+            knn_corr(
+                history,
+                {
+                    "volatility": vol,
+                    "drawdown_rolling": dd,
+                    "trend_strength": trend,
+                },
+            )
         )
         source = "knn"
 
-    if np.isnan(corr):
+    if corr == 0.0:
         source = "unavailable"
 
     return QuantMarketContext(
