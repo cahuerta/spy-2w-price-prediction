@@ -18,7 +18,7 @@ from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Dict, Any
-
+from signals_router import router as signals_router
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -166,6 +166,8 @@ async def trading_run(request: Request):
 # =========================================================
 # HEALTH
 # =========================================================
+app.include_router(signals_router)
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
