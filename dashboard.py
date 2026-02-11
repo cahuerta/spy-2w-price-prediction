@@ -27,7 +27,6 @@ from fastapi import (
     Request,
     Depends,
 )
-from pydantic import BaseModel
 
 # =========================================================
 # CONFIG
@@ -215,5 +214,21 @@ async def screener():
     data = load_json(p)
     if not data:
         raise HTTPException(500, "Invalid screener file")
+
+    return data
+
+# =========================================================
+# MARKET CONTEXT (SIN RATE LIMIT)
+# =========================================================
+@router.get("/market-context")
+async def market_context():
+    p = Path(DATA_PATH) / "market_context.json"
+
+    if not p.exists():
+        raise HTTPException(404, "Market context not available")
+
+    data = load_json(p)
+    if not data:
+        raise HTTPException(500, "Invalid market context file")
 
     return data
