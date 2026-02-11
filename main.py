@@ -172,6 +172,13 @@ app.include_router(signals_router)
 async def health():
     return {"status": "ok"}
 
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "spy-2w-price-prediction",
+        "env": "production"
+    }
 # =========================================================
 # SHUTDOWN
 # =========================================================
