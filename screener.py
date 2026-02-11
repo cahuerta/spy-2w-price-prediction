@@ -90,7 +90,10 @@ LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
 MIN_DOLLAR_VOLUME = float(os.getenv("SCREENER_MIN_DOLLAR_VOL", "50_000_000"))
 MIN_VOLATILITY = float(os.getenv("SCREENER_MIN_VOL", "0.015"))
 MAX_VOLATILITY = float(os.getenv("SCREENER_MAX_VOL", "0.06"))
-MIN_SCORE = float(os.getenv("SCREENER_MIN_SCORE", "0.6"))
+
+# ✅ CAMBIO 1 (solo esto): 0.6 -> 0.55 por defecto
+MIN_SCORE = float(os.getenv("SCREENER_MIN_SCORE", "0.55"))
+
 MAX_ASSETS = int(os.getenv("SCREENER_MAX_ASSETS", "300"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 TOP_K = int(os.getenv("SCREENER_TOP_K", "50"))
@@ -297,22 +300,16 @@ async def fetch_symbol_data(
             volumes = np.array([b.volume for b in bars], float)
 
             dollar_volume = float(np.mean(closes * volumes))
-            if dollar_volume < MIN_DOLLAR_VOLUME:
-                return None
 
             rets = pct_returns(closes)
             if len(rets) < 10:
                 return None
 
             vol = float(np.std(rets))
-            if not (MIN_VOLATILITY <= vol <= MAX_VOLATILITY):
-                return None
 
             score, quality, beta = compute_score_enhanced_v3(
                 closes, volumes, dollar_volume, benchmark_returns=benchmark_returns
             )
-            if score < MIN_SCORE:
-                return None
 
             rsi = compute_rsi_wilder(closes, RSI_PERIOD)
             sharpe = float(np.mean(rets) / vol * np.sqrt(252)) if vol > 0 else 0.0
@@ -323,7 +320,8 @@ async def fetch_symbol_data(
                 "ticker": symbol,
                 "score": score,
                 "quality": quality,
-                "trend_3m_pct": round((closes[-1] / closes[0] - 1) * 100, 2),
+                "trend_3m_pct": round((closes[-1] / closes[0]) - 1, 6) * 100
+                if closes[0] else round((closes[-1] / closes[0] - 1) * 100, 2),
                 "volatility": round(vol, 4),
                 "rsi_wilder": round(rsi, 1),
                 "sharpe_ratio": round(sharpe, 2),
@@ -338,7 +336,7 @@ async def fetch_symbol_data(
 
 
 # =========================================================
-# MAIN ASYNC SCREENER v3.1  ✅ (AGREGADO: top10_global SIEMPRE)
+# MAIN ASYNC SCREENER v3.1 ✅
 # =========================================================
 async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
     ALPACA_KEY = os.getenv("ALPACA_API_KEY")
@@ -371,7 +369,6 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         logger.warning(f"Screener API failed: {e} → fallback assets list")
 
         assets = trading.get_all_assets()
-
         universe = [
             a.symbol
             for a in assets
@@ -384,7 +381,6 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
 
     semaphore = asyncio.Semaphore(ALPACA_CONCURRENT)
 
-    # ✅ NUEVO: guardamos todo lo evaluado (para top10_global SIEMPRE)
     evaluated: List[Dict[str, Any]] = []
     candidates: List[Dict[str, Any]] = []
 
@@ -404,21 +400,26 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
             return_exceptions=True,
         )
 
-        # ✅ NUEVO: separar "evaluated" vs "candidates"
         for r in results:
             if isinstance(r, dict):
                 evaluated.append(r)
-                if float(r.get("score", 0.0)) >= MIN_SCORE:
+
+                # ✅ CAMBIO 2: filtros SOLO aquí (candidates)
+                if (
+                    float(r.get("avg_dollar_volume", 0.0)) >= MIN_DOLLAR_VOLUME
+                    and MIN_VOLATILITY <= float(r.get("volatility", 0.0)) <= MAX_VOLATILITY
+                    and float(r.get("score", 0.0)) >= MIN_SCORE
+                ):
                     candidates.append(r)
 
-    # Quant ranking (candidatos estrictos)
+    # Ranking candidatos estrictos
     candidates.sort(key=lambda x: x["score"], reverse=True)
     candidates = candidates[:TOP_K]
 
-    # ✅ NUEVO: Top 10 GLOBAL (aunque candidates sea 0)
+    # Top 10 global SIEMPRE desde evaluated
     top10_global = sorted(evaluated, key=lambda x: x["score"], reverse=True)[:10]
 
-    # IA enrichment (post-filter) — SOLO sobre candidatos (sin cambiar contrato)
+    # IA enrichment — SOLO sobre candidatos
     if IA_AVAILABLE and candidates:
         try:
             candidates = await enrich_screener_candidates_batch(candidates)
@@ -453,7 +454,6 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         },
         "candidates": candidates,
 
-        # ✅ AGREGADO (NO rompe nada): top 10 de TODO lo evaluado
         "top10_global": top10_global,
         "n_evaluated": len(evaluated),
     }
