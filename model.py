@@ -4,7 +4,7 @@
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from data_provider import get_price_history
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
@@ -182,12 +182,11 @@ def _run_full_math_engine(
     alpha: float,
     period: str,
 ) -> Dict:
-    # Descarga explícita (sin ambigüedad)
-    raw = yf.download(
-        ticker,
+    # Descarga vía data_provider (fachada única)
+    raw = get_price_history(
+        ticker=ticker,
         period=period,
-        progress=False,
-        auto_adjust=False
+        interval="1d"
     )
 
     if raw is None or len(raw) == 0:
