@@ -6,6 +6,7 @@
 # 🔹 Frontend usa predictions como VERDAD
 # 🔹 signals = visor secundario (pestaña señales)
 # 🔹 ESTE ARCHIVO NO MONTA FASTAPI (solo router)
+# 🔹 RATE LIMIT SOLO EN ENDPOINT PESADO (summary)
 # =========================================================
 
 import os
@@ -32,10 +33,9 @@ from pydantic import BaseModel
 # CONFIG
 # =========================================================
 DATA_PATH = os.getenv("DATA_PATH", "/data")
-MIN_CONFIDENCE = float(os.getenv("SIGNAL_MIN_CONFIDENCE", "0.4"))
 
 # =========================================================
-# LOGGING (AISLADO)
+# LOGGING
 # =========================================================
 def setup_logging():
     level = logging.INFO
@@ -58,10 +58,10 @@ setup_logging()
 logger = logging.getLogger("dashboard")
 
 # =========================================================
-# RATE LIMITER (LOCAL)
+# RATE LIMITER (SOLO PARA SUMMARY)
 # =========================================================
 class SimpleRateLimiter:
-    def __init__(self, requests=20, per_seconds=60):
+    def __init__(self, requests=30, per_seconds=60):
         self.requests = requests
         self.per_seconds = per_seconds
         self.buckets: Dict[str, deque] = defaultdict(
@@ -85,16 +85,9 @@ class SimpleRateLimiter:
 rate_limiter = SimpleRateLimiter()
 
 # =========================================================
-# ROUTER (CONTRATO FIJO)
+# ROUTER
 # =========================================================
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
-
-# =========================================================
-# MODELS
-# =========================================================
-class TickerStats(BaseModel):
-    ticker: str
-    n_predictions: int = 0
 
 # =========================================================
 # HELPERS
@@ -120,10 +113,10 @@ def safe_float(v):
         return None
 
 # =========================================================
-# ENDPOINTS (CONTRATO FRONTEND INTACTO)
+# STATUS (SIN RATE LIMIT)
 # =========================================================
 @router.get("/status")
-async def status(_: Any = Depends(rate_limiter)):
+async def status():
     pred = Path(DATA_PATH) / "predictions"
     return {
         "status": "ok",
@@ -132,15 +125,18 @@ async def status(_: Any = Depends(rate_limiter)):
         "timestamp": datetime.utcnow().isoformat(),
     }
 
+# =========================================================
+# TICKERS (SIN RATE LIMIT)
+# =========================================================
 @router.get("/tickers")
-async def tickers(_: Any = Depends(rate_limiter)):
+async def tickers():
     pred_path = Path(DATA_PATH) / "predictions"
     return {
         "tickers": list_tickers(str(pred_path))
     }
 
 # =========================================================
-# 🔑 ENDPOINT CLAVE — FUENTE ÚNICA DEL FRONTEND
+# SUMMARY (ÚNICO CON RATE LIMIT)
 # =========================================================
 @router.get("/predictions/summary")
 async def prediction_summary(
@@ -148,10 +144,6 @@ async def prediction_summary(
     limit: int = Query(60, ge=1, le=500),
     _: Any = Depends(rate_limiter),
 ):
-    """
-    📈 Fuente ÚNICA del análisis.
-    Lee datos YA calculados por model.py
-    """
     pred_dir = Path(DATA_PATH) / "predictions" / ticker
 
     if not pred_dir.exists():
@@ -187,12 +179,14 @@ async def prediction_summary(
         "count": len(data),
         "data": data,
     }
+
+# =========================================================
+# LATEST (SIN RATE LIMIT)
+# =========================================================
 @router.get("/latest/{ticker}")
-async def latest_snapshot(
-    ticker: str,
-    _: Any = Depends(rate_limiter),
-):
+async def latest_snapshot(ticker: str):
     pred_dir = Path(DATA_PATH) / "predictions" / ticker
+
     if not pred_dir.exists():
         raise HTTPException(404, f"No predictions for {ticker}")
 
@@ -209,12 +203,11 @@ async def latest_snapshot(
         "latest": last
     }
 
-
 # =========================================================
-# SCREENER (READ ONLY)
+# SCREENER (SIN RATE LIMIT)
 # =========================================================
 @router.get("/screener")
-async def screener(_: Any = Depends(rate_limiter)):
+async def screener():
     p = Path(DATA_PATH) / "screener_candidates.json"
     if not p.exists():
         raise HTTPException(404, "Screener not available")
