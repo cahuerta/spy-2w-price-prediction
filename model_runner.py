@@ -22,7 +22,9 @@ from model import run_model   # 🔑 TU MOTOR REAL
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 PREDICTIONS_PATH = DATA_PATH / "predictions"
 TICKERS_FILE = DATA_PATH / "tickers.json"
-
+logger.info(f"[MODEL_RUNNER] DATA_PATH = {DATA_PATH.resolve()}")
+logger.info(f"[MODEL_RUNNER] DATA_PATH exists = {DATA_PATH.exists()}")
+logger.info(f"[MODEL_RUNNER] PREDICTIONS_PATH = {PREDICTIONS_PATH.resolve()}")
 # =========================================================
 # LOGGING
 # =========================================================
