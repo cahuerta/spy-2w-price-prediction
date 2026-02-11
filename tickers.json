@@ -4,6 +4,10 @@
   "PG",
   "MCD",
   "SPY",
+  "TSLA",
+  "BIP",
+  "MAIN",
+  "MELI",
 
   "SQM.SN",
   "COPEC.SN",
@@ -24,5 +28,10 @@
   "AESANDES.SN",
   "RIPLEY.SN",
   "SONDA.SN",
-  "CUPRUM.SN"
+  "CUPRUM.SN",
+
+  "ENTEL.SN",
+  "ENJOY.SN",
+  "LIPIGAS.SN",
+  "LTM.SN"
 ]
