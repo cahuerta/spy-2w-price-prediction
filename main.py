@@ -8,6 +8,7 @@
 # ✔ RECIBE resultados del pipeline
 # ✔ GRABA a disco (fuente única)
 # ✔ Ejecuta SOLO TradingOrchestrator
+# ✔ 🔥 MERGE DE TICKERS EN STARTUP (NUNCA BORRA)
 # =========================================================
 
 import os
@@ -17,26 +18,17 @@ import signal
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Dict, Any
-from signals_router import router as signals_router
+from typing import Dict, Any, List
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-# =========================================================
-# ROUTERS
-# =========================================================
+from signals_router import router as signals_router
 from dashboard import router as dashboard_router
+from pipeline_router import router as pipeline_router
 
-# =========================================================
-# CORE
-# =========================================================
 from market_orchestrator import MarketOrchestrationContext
 from trading_orchestrator import TradingOrchestrator
-
-# =========================================================
-# PIPELINE ROUTER
-# =========================================================
-from pipeline_router import router as pipeline_router
 
 # =========================================================
 # CONFIG
@@ -50,6 +42,8 @@ class Config:
 config = Config()
 
 DATA_PATH = config.DATA_PATH
+
+TICKERS_FILE = DATA_PATH / "tickers.json"
 MARKET_CTX_FILE = DATA_PATH / "market_context.json"
 SCREENER_FILE = DATA_PATH / "screener_candidates.json"
 PIPELINE_AUDIT_FILE = DATA_PATH / "last_pipeline.json"
@@ -64,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger("trading_suite")
 
 # =========================================================
-# HELPERS
+# HELPERS DISCO
 # =========================================================
 def save_json(path: Path, data: Dict[str, Any]):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,10 +66,52 @@ def save_json(path: Path, data: Dict[str, Any]):
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
 
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    return json.loads(path.read_text())
+
+# =========================================================
+# 🔥 MERGE DE TICKERS (STARTUP)
+# =========================================================
+def merge_tickers_on_startup():
+    """
+    Une tickers base + tickers dinámicos.
+    NUNCA borra. SOLO agrega.
+    """
+    logger.info("🔧 Merging tickers on startup")
+
+    # --- tickers existentes en disco (fuente real) ---
+    disk_tickers: List[str] = load_json(TICKERS_FILE, [])
+
+    # --- tickers base (hardcodeados o iniciales) ---
+    base_tickers: List[str] = [
+        "JNJ", "KO", "PG", "MCD", "SPY",
+        "SQM.SN", "COPEC.SN", "ENELAM.SN", "ENELCHILE.SN",
+        "BCI.SN", "BCHILE.SN", "BSANTANDER.SN",
+        "FALABELLA.SN", "CMPC.SN", "CAP.SN",
+        "CENCOSUD.SN", "COLBUN.SN", "IAM.SN",
+        "ITAUCL.SN", "VAPORES.SN", "PARAUCO.SN",
+        "AESANDES.SN", "RIPLEY.SN", "SONDA.SN", "CUPRUM.SN",
+    ]
+
+    merged = sorted(set(disk_tickers) | set(base_tickers))
+
+    if merged != disk_tickers:
+        save_json(TICKERS_FILE, merged)
+        logger.info(
+            f"📈 tickers.json actualizado | total={len(merged)} "
+            f"(antes={len(disk_tickers)})"
+        )
+    else:
+        logger.info("✔ tickers.json ya estaba actualizado")
+
+# =========================================================
+# MARKET CONTEXT
+# =========================================================
 def load_market_context() -> MarketOrchestrationContext:
     if not MARKET_CTX_FILE.exists():
         raise RuntimeError("market_context.json no existe")
-
     data = json.loads(MARKET_CTX_FILE.read_text())
     return MarketOrchestrationContext(**data)
 
@@ -84,9 +120,13 @@ def load_market_context() -> MarketOrchestrationContext:
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Trading Suite v2.9.0 START")
+    logger.info("🚀 Trading Suite v2.9.0 START")
+
+    # 🔥 ÚNICO CAMBIO REAL
+    merge_tickers_on_startup()
+
     yield
-    logger.info("Trading Suite v2.9.0 STOP")
+    logger.info("🛑 Trading Suite v2.9.0 STOP")
 
 app = FastAPI(
     title="Trading Suite Enterprise",
@@ -101,56 +141,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================================================
+# ROUTERS
+# =========================================================
 app.include_router(dashboard_router)
 app.include_router(pipeline_router)
+app.include_router(signals_router)
 
 # =========================================================
-# PIPELINE COMMIT (RECIBE Y GRABA)
+# PIPELINE COMMIT
 # =========================================================
 @app.post("/internal/pipeline/commit")
 async def pipeline_commit(payload: Dict[str, Any], request: Request):
-    """
-    Recibe output de pipeline_daily.main()
-    y lo persiste en disco.
-    """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
     logger.info("💾 Committing pipeline payload")
 
     try:
-        # --- guardar screener ---
         if "screener" in payload:
             save_json(SCREENER_FILE, payload["screener"])
-            logger.info("📄 screener_candidates.json guardado")
 
-        # --- guardar market context ---
         if "market_ctx" in payload:
             save_json(MARKET_CTX_FILE, payload["market_ctx"])
-            logger.info("📄 market_context.json guardado")
 
-        # --- auditoría completa ---
         save_json(PIPELINE_AUDIT_FILE, payload)
 
     except Exception as e:
         logger.error("❌ Commit failed")
         raise HTTPException(500, str(e))
 
-    return {
-        "status": "ok",
-        "message": "pipeline committed",
-        "timestamp": datetime.utcnow().isoformat(),
-    }
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 # =========================================================
-# TRADING ENDPOINT
+# TRADING
 # =========================================================
 @app.post("/internal/trading/run")
 async def trading_run(request: Request):
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
-
-    logger.info("🔔 Trading run triggered")
 
     market_ctx = load_market_context()
     orchestrator = TradingOrchestrator()
@@ -166,8 +195,6 @@ async def trading_run(request: Request):
 # =========================================================
 # HEALTH
 # =========================================================
-app.include_router(signals_router)
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -179,6 +206,7 @@ def root():
         "service": "spy-2w-price-prediction",
         "env": "production"
     }
+
 # =========================================================
 # SHUTDOWN
 # =========================================================
@@ -198,4 +226,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         log_level="error",
-                   )
+    )
