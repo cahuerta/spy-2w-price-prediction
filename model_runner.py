@@ -22,9 +22,7 @@ from model import run_model   # 🔑 TU MOTOR REAL
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 PREDICTIONS_PATH = DATA_PATH / "predictions"
 TICKERS_FILE = DATA_PATH / "tickers.json"
-logger.info(f"[MODEL_RUNNER] DATA_PATH = {DATA_PATH.resolve()}")
-logger.info(f"[MODEL_RUNNER] DATA_PATH exists = {DATA_PATH.exists()}")
-logger.info(f"[MODEL_RUNNER] PREDICTIONS_PATH = {PREDICTIONS_PATH.resolve()}")
+
 # =========================================================
 # LOGGING
 # =========================================================
@@ -33,6 +31,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)-7s] %(message)s"
 )
 logger = logging.getLogger("model_runner")
+
+# =========================================================
+# 🔍 AUDITORÍA DE RUTAS (FIX 1)
+# =========================================================
+logger.info(f"[MODEL_RUNNER] DATA_PATH = {DATA_PATH.resolve()}")
+logger.info(f"[MODEL_RUNNER] DATA_PATH exists = {DATA_PATH.exists()}")
+logger.info(f"[MODEL_RUNNER] PREDICTIONS_PATH = {PREDICTIONS_PATH.resolve()}")
 
 # =========================================================
 # HELPERS
@@ -69,15 +74,26 @@ def run_model_for_ticker(ticker: str) -> dict:
     result = run_model(ticker=ticker)
 
     today = datetime.utcnow().date().isoformat()
-    out_file = (
-        PREDICTIONS_PATH
-        / ticker
-        / f"{today}.json"
-    )
+
+    # =====================================================
+    # 📁 Asegurar directorio del ticker (FIX 2)
+    # =====================================================
+    ticker_dir = PREDICTIONS_PATH / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+
+    out_file = ticker_dir / f"{today}.json"
 
     save_json_atomic(out_file, result)
 
-    logger.info(f"💾 Guardado: {out_file}")
+    # =====================================================
+    # ✅ Verificación post-escritura (FIX 3)
+    # =====================================================
+    if not out_file.exists():
+        raise RuntimeError(
+            f"[MODEL_RUNNER] Archivo NO existe tras grabar: {out_file}"
+        )
+
+    logger.info(f"💾 Guardado: {out_file.resolve()}")
     return result
 
 
