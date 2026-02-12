@@ -17,7 +17,8 @@ from datetime import datetime
 from typing import Dict, Any
 
 from screener_data_layer import fetch_multiple_symbols
-from screener_data_layer import compute_score
+from screener_engine import compute_score
+
 
 try:
     from screener_ia_module import enrich_screener_candidates_batch
