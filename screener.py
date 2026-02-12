@@ -350,7 +350,7 @@ async def run_screener_async(limit_assets: int = MAX_ASSETS) -> Dict[str, Any]:
         raise RuntimeError("Credenciales Alpaca no configuradas")
 
     trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER)
-    data = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET, feed="iex" )
+    data = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET )
 
     benchmark_returns = load_benchmark_returns(data)
     if benchmark_returns is None:
