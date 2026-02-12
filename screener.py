@@ -1,11 +1,11 @@
 # =========================================================
-# screener.py — MARKET SCREENER (CRON COORDINATOR)
+# screener.py — MARKET SCREENER (CRON MODE) ✅ SAFE
 # =========================================================
-# ✔ Determinista
-# ✔ Candidatos estrictos (puede ser 0)
-# ✔ Top 20 global SIEMPRE presentes
-# ✔ NO rompe contratos existentes
-# ✔ Guarda screener_candidates.json
+# ✔ No rompe contratos
+# ✔ Firma compatible con pipeline_router
+# ✔ Guarda mismo JSON
+# ✔ IA opcional
+# ✔ Quant first, IA second
 # =========================================================
 
 import os
@@ -13,12 +13,9 @@ import json
 import logging
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from datetime import datetime
 
-# =========================================================
-# IMPORT CAPAS (NO CAMBIAR)
-# =========================================================
 from screener_data_layer import fetch_multiple_symbols
 from screener_engine import compute_score
 from screener_ia_module import enrich_screener_candidates_batch
@@ -33,42 +30,36 @@ logging.basicConfig(
 logger = logging.getLogger("screener")
 
 # =========================================================
-# CONFIG (CONTRATO ESTABLE)
+# CONFIG
 # =========================================================
-DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
-OUTPUT_FILE = DATA_PATH / "screener_candidates.json"
-
-LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
-MIN_DOLLAR_VOLUME = float(os.getenv("SCREENER_MIN_DOLLAR_VOL", "50_000_000"))
-MIN_VOLATILITY = float(os.getenv("SCREENER_MIN_VOL", "0.015"))
-MAX_VOLATILITY = float(os.getenv("SCREENER_MAX_VOL", "0.06"))
-MIN_SCORE = float(os.getenv("SCREENER_MIN_SCORE", "0.55"))
+DATA_PATH = Path(os.getenv("DATA_PATH", "./data"))
+OUTPUT_FILE = DATA_PATH / "screener.json"  # ⚠ MISMO NOMBRE
 
 TOP_GLOBAL = 20
 
-# =========================================================
-# UNIVERSO BASE (NO ROMPER)
-# =========================================================
 DEFAULT_UNIVERSE = [
     "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA",
     "AMD","NFLX","SPY","QQQ","IWM","JNJ","KO","PG",
     "MCD","XOM","CVX","BA","JPM","GS","BAC"
 ]
 
-# =========================================================
-# CORE ASYNC
-# =========================================================
-async def run_screener_async(symbols: List[str]) -> Dict[str, Any]:
+MIN_SCORE = float(os.getenv("SCREENER_MIN_SCORE", "0.55"))
+MIN_DOLLAR_VOLUME = float(os.getenv("SCREENER_MIN_DOLLAR_VOL", "50000000"))
+MIN_VOL = float(os.getenv("SCREENER_MIN_VOL", "0.015"))
+MAX_VOL = float(os.getenv("SCREENER_MAX_VOL", "0.06"))
 
+# =========================================================
+# CORE ASYNC — NO CAMBIA FIRMA
+# =========================================================
+async def run_screener_async() -> Dict[str, Any]:
+
+    symbols = DEFAULT_UNIVERSE
     logger.info(f"Universe size: {len(symbols)}")
 
     raw_data = fetch_multiple_symbols(symbols)
 
     evaluated: List[Dict[str, Any]] = []
 
-    # =====================================================
-    # Evaluación cuantitativa
-    # =====================================================
     for item in raw_data:
         if not item:
             continue
@@ -81,50 +72,43 @@ async def run_screener_async(symbols: List[str]) -> Dict[str, Any]:
         if not score_data:
             continue
 
-        result = {
+        evaluated.append({
             "ticker": item["symbol"],
             **score_data
-        }
+        })
 
-        evaluated.append(result)
-
-    # =====================================================
-    # Top 20 global (SIEMPRE)
-    # =====================================================
+    # =============================
+    # TOP GLOBAL (SIEMPRE)
+    # =============================
     top20_global = sorted(
         evaluated,
         key=lambda x: x["score"],
         reverse=True
     )[:TOP_GLOBAL]
 
-    # =====================================================
-    # Candidatos estrictos (puede ser 0)
-    # =====================================================
+    # =============================
+    # FILTRO ESTRICTO
+    # =============================
     candidates_strict = [
         r for r in evaluated
         if (
+            r["score"] >= MIN_SCORE and
             r["avg_dollar_volume"] >= MIN_DOLLAR_VOLUME and
-            MIN_VOLATILITY <= r["volatility"] <= MAX_VOLATILITY and
-            r["score"] >= MIN_SCORE
+            MIN_VOL <= r["volatility"] <= MAX_VOL
         )
     ]
 
     candidates_strict.sort(key=lambda x: x["score"], reverse=True)
 
-    # =====================================================
-    # IA SOLO SOBRE candidatos estrictos
-    # =====================================================
+    # =============================
+    # IA SOLO A CANDIDATOS
+    # =============================
     if candidates_strict:
         try:
-            candidates_strict = await enrich_screener_candidates_batch(
-                candidates_strict
-            )
+            candidates_strict = await enrich_screener_candidates_batch(candidates_strict)
         except Exception as e:
             logger.warning(f"IA enrichment failed: {e}")
 
-    # =====================================================
-    # OUTPUT (CONTRATO ESTABLE)
-    # =====================================================
     output = {
         "generated_at": datetime.utcnow().isoformat(),
         "n_universe": len(symbols),
@@ -138,13 +122,11 @@ async def run_screener_async(symbols: List[str]) -> Dict[str, Any]:
 
 
 # =========================================================
-# WRAPPER CRON (NO CAMBIAR NOMBRE ARCHIVO)
+# WRAPPER SYNC — NO CAMBIA
 # =========================================================
-def run_screener(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
+def run_screener() -> Dict[str, Any]:
 
-    symbols = symbols or DEFAULT_UNIVERSE
-
-    result = asyncio.run(run_screener_async(symbols))
+    result = asyncio.run(run_screener_async())
 
     DATA_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -152,7 +134,7 @@ def run_screener(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     tmp.write_text(json.dumps(result, indent=2))
     tmp.replace(OUTPUT_FILE)
 
-    logger.info(f"Saved screener output → {OUTPUT_FILE}")
+    logger.info(f"Screener saved → {OUTPUT_FILE}")
 
     return result
 
@@ -161,10 +143,4 @@ def run_screener(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
 # CLI
 # =========================================================
 if __name__ == "__main__":
-    result = run_screener()
-
-    print("\nStrict Candidates:")
-    print(json.dumps(result["candidates_strict"][:5], indent=2))
-
-    print("\nTop 20 Global:")
-    print(json.dumps(result["top20_global"][:5], indent=2))
+    run_screener()
