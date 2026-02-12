@@ -1,12 +1,11 @@
 # =========================================================
-# screener.py — COORDINADOR CANÓNICO
+# screener.py — COORDINADOR CANÓNICO FINAL
 # =========================================================
 # ✔ No cambia contratos
-# ✔ No cambia nombre JSON
-# ✔ No define universo
-# ✔ No fallback
-# ✔ run_screener_async() SIN argumentos
-# ✔ Usa fetch_multiple_symbols() tal cual
+# ✔ Usa screener_data_layer
+# ✔ Usa compute_score existente
+# ✔ Usa screener_ia_module si está disponible
+# ✔ MISMO JSON de salida
 # =========================================================
 
 import os
@@ -18,7 +17,7 @@ from datetime import datetime
 from typing import Dict, Any
 
 from screener_data_layer import fetch_multiple_symbols
-from screener_engine import compute_score
+from screener_data_layer import compute_score
 
 try:
     from screener_ia_module import enrich_screener_candidates_batch
@@ -54,18 +53,21 @@ MAX_VOL = float(os.getenv("SCREENER_MAX_VOL", "0.06"))
 
 
 # =========================================================
-# CORE ASYNC — FIRMA ORIGINAL
+# CORE ASYNC — FIRMA ORIGINAL (NO CAMBIAR)
 # =========================================================
 
 async def run_screener_async() -> Dict[str, Any]:
 
-    # El universo NO se define aquí.
-    # Se espera que screener_data_layer o entorno lo maneje.
+    # Universo definido externamente
     symbols = os.getenv("SCREENER_UNIVERSE")
     if not symbols:
         raise RuntimeError("SCREENER_UNIVERSE not defined")
 
     symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+
+    # ============================================
+    # DATA LAYER
+    # ============================================
 
     raw_data = fetch_multiple_symbols(symbols)
 
@@ -88,9 +90,9 @@ async def run_screener_async() -> Dict[str, Any]:
             **score_data
         })
 
-    # =============================
-    # TOP GLOBAL
-    # =============================
+    # ============================================
+    # TOP GLOBAL (SIN FILTRO)
+    # ============================================
 
     top_global = sorted(
         evaluated,
@@ -98,9 +100,9 @@ async def run_screener_async() -> Dict[str, Any]:
         reverse=True
     )[:TOP_GLOBAL]
 
-    # =============================
+    # ============================================
     # FILTRO ESTRICTO
-    # =============================
+    # ============================================
 
     candidates_strict = [
         r for r in evaluated
@@ -113,9 +115,9 @@ async def run_screener_async() -> Dict[str, Any]:
 
     candidates_strict.sort(key=lambda x: x["score"], reverse=True)
 
-    # =============================
+    # ============================================
     # IA OPCIONAL
-    # =============================
+    # ============================================
 
     if IA_AVAILABLE and candidates_strict:
         try:
@@ -124,6 +126,10 @@ async def run_screener_async() -> Dict[str, Any]:
             )
         except Exception as e:
             logger.warning(f"IA failed: {e}")
+
+    # ============================================
+    # OUTPUT CONTRACTUAL
+    # ============================================
 
     result = {
         "generated_at": datetime.utcnow().isoformat(),
@@ -138,7 +144,7 @@ async def run_screener_async() -> Dict[str, Any]:
 
 
 # =========================================================
-# WRAPPER SYNC — ESTE USA EL PIPELINE
+# WRAPPER SYNC — PIPELINE CRON
 # =========================================================
 
 def run_screener() -> Dict[str, Any]:
