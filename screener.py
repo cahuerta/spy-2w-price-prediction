@@ -293,7 +293,7 @@ async def fetch_symbol_data(
                 limit=LOOKBACK_DAYS,
             )
             bars = data_client.get_stock_bars(req).data.get(symbol)
-            if not bars or len(bars) < 60:
+            if not bars or len(bars) < 20:
                 return None
 
             closes = np.array([b.close for b in bars], float)
