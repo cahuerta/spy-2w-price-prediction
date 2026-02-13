@@ -2,8 +2,8 @@
 # screener_data_layer.py
 # Data Layer AUTOSUFICIENTE — Screener Profesional
 # Descubre universo limpio + descarga datos
+# SOLO Most Actives (máx 300)
 # Alpaca → Yahoo fallback
-# MAX 300 activos reales
 # =========================================================
 
 from typing import Dict, Any, Optional, List
@@ -39,7 +39,7 @@ MAX_UNIVERSE = min(int(os.getenv("SCREENER_MAX_UNIVERSE", "300")), 300)
 # =========================================================
 _rate_lock = Lock()
 _last_fetch = 0.0
-_min_interval = 0.05  # 50ms (más rápido pero seguro)
+_min_interval = 0.05  # 50ms
 
 def _rate_limit():
     global _last_fetch
@@ -56,149 +56,91 @@ def _rate_limit():
 ALPACA_AVAILABLE = True
 
 try:
-    from alpaca.trading.client import TradingClient
-    from alpaca.trading.enums import AssetClass
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
-
-    try:
-        from alpaca.data.screener import ScreenerClient
-        SCREENER_AVAILABLE = True
-    except Exception:
-        SCREENER_AVAILABLE = False
-
+    from alpaca.data.screener import ScreenerClient
+    SCREENER_AVAILABLE = True
 except Exception:
     ALPACA_AVAILABLE = False
     SCREENER_AVAILABLE = False
 
-
 # =========================================================
 # CLIENT SINGLETON
 # =========================================================
-_trading_client = None
 _data_client = None
+_screener_client = None
 _client_lock = Lock()
 
-def _init_alpaca_clients():
-    global _trading_client, _data_client
+def _init_clients():
+    global _data_client, _screener_client
 
     if not ALPACA_AVAILABLE:
         return None, None
 
-    if _trading_client and _data_client:
-        return _trading_client, _data_client
+    if _data_client and _screener_client:
+        return _data_client, _screener_client
 
     with _client_lock:
-        if _trading_client and _data_client:
-            return _trading_client, _data_client
+        if _data_client and _screener_client:
+            return _data_client, _screener_client
 
         key = os.getenv("ALPACA_API_KEY")
         secret = os.getenv("ALPACA_SECRET_KEY")
-        paper = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
         if not key or not secret:
             logger.warning("⚠️ Alpaca credentials missing")
             return None, None
 
         try:
-            _trading_client = TradingClient(key, secret, paper=paper)
             _data_client = StockHistoricalDataClient(key, secret)
+            _screener_client = ScreenerClient(key, secret)
             logger.info("✅ Alpaca clients initialized")
         except Exception as e:
             logger.error(f"❌ Alpaca init failed: {e}")
             return None, None
 
-    return _trading_client, _data_client
-
+    return _data_client, _screener_client
 
 # =========================================================
 # SYMBOL FILTER
 # =========================================================
 def _is_clean_symbol(symbol: str) -> bool:
     s = symbol.upper()
-
-    # excluir preferred / warrants / series
-    if "." in s:
+    if "." in s or "-" in s or "/" in s:
         return False
-    if "-" in s:
-        return False
-    if "/" in s:
-        return False
-
-    # excluir demasiado largos (generalmente basura)
     if len(s) > 5:
         return False
-
     return True
 
-
 # =========================================================
-# DISCOVER UNIVERSE
+# DISCOVER UNIVERSE (SOLO MOST ACTIVES)
 # =========================================================
 def _discover_universe(limit: int = MAX_UNIVERSE) -> List[str]:
 
-    trading, data = _init_alpaca_clients()
+    data, screener = _init_clients()
 
-    if not trading:
-        logger.warning("⚠️ No Alpaca → universe empty")
+    if not screener:
+        logger.warning("⚠️ Screener not available")
         return []
 
-    limit = min(limit, 300)
-
-    # 1️⃣ MOST ACTIVES (PRIORIDAD)
-    if SCREENER_AVAILABLE:
-        try:
-            screener = ScreenerClient(
-                os.getenv("ALPACA_API_KEY"),
-                os.getenv("ALPACA_SECRET_KEY")
-            )
-            actives = screener.get_most_actives()
-
-            symbols = []
-            for a in actives:
-                s = a["symbol"]
-                if _is_clean_symbol(s):
-                    symbols.append(s)
-                if len(symbols) >= limit:
-                    break
-
-            logger.info(f"📊 Universe: {len(symbols)} most actives")
-            return symbols
-
-        except Exception as e:
-            logger.warning(f"Most actives failed → fallback: {e}")
-
-    # 2️⃣ FALLBACK CONTROLADO
     try:
-        assets = trading.get_all_assets()
+        actives = screener.get_most_actives()
 
         symbols = []
-        for a in assets:
-            if not a.tradable:
-                continue
-            if a.asset_class != AssetClass.US_EQUITY:
-                continue
-            if a.exchange not in ("NYSE", "NASDAQ"):
-                continue
-
-            s = a.symbol.upper()
-
-            if not _is_clean_symbol(s):
-                continue
-
-            symbols.append(s)
-
+        for a in actives:
+            s = a["symbol"]
+            if _is_clean_symbol(s):
+                symbols.append(s)
             if len(symbols) >= limit:
                 break
 
-        logger.info(f"📊 Universe fallback filtered: {len(symbols)}")
+        logger.info(f"📊 Universe: {len(symbols)} most actives")
         return symbols
 
     except Exception as e:
-        logger.error(f"Universe fallback failed: {e}")
+        logger.error(f"❌ Most actives failed: {e}")
         return []
-
 
 # =========================================================
 # SANITIZE + VALIDATE
@@ -216,7 +158,6 @@ def _sanitize_arrays(closes: np.ndarray, volumes: np.ndarray):
 
     return closes, volumes
 
-
 def _validate_arrays(closes: np.ndarray, volumes: np.ndarray):
     if closes is None or volumes is None:
         return False
@@ -230,13 +171,12 @@ def _validate_arrays(closes: np.ndarray, volumes: np.ndarray):
         return False
     return True
 
-
 # =========================================================
-# FETCH ALPACA
+# FETCH ALPACA DATA
 # =========================================================
 def _fetch_from_alpaca(symbol: str):
 
-    trading, data = _init_alpaca_clients()
+    data, _ = _init_clients()
     if not data:
         return None
 
@@ -262,9 +202,8 @@ def _fetch_from_alpaca(symbol: str):
     except Exception:
         return None
 
-
 # =========================================================
-# FETCH YAHOO (fallback limpio)
+# FETCH YAHOO (fallback histórico)
 # =========================================================
 import yfinance as yf
 
@@ -294,7 +233,6 @@ def _fetch_from_yahoo(symbol: str):
     except Exception:
         return None
 
-
 # =========================================================
 # PUBLIC API
 # =========================================================
@@ -323,9 +261,8 @@ def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
         "days": len(closes),
     }
 
-
 # =========================================================
-# BATCH — AUTOSUFICIENTE Y LIMITADO
+# BATCH — LIMITADO Y SEGURO
 # =========================================================
 def fetch_multiple_symbols(
     symbols: Optional[List[str]] = None,
