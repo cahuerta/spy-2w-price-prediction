@@ -13,6 +13,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 import time
 from threading import Lock
+import pandas as pd
+import yfinance as yf
 
 # =========================================================
 # LOGGING
@@ -112,22 +114,38 @@ def _is_clean_symbol(symbol: str) -> bool:
     return True
 
 # =========================================================
-# SP500 + NASDAQ100 vía Yahoo
+# SP500 vía Wikipedia (ESTABLE)
 # =========================================================
-import yfinance as yf
-
 def _get_sp500() -> Set[str]:
     try:
-        table = yf.Ticker("^GSPC").constituents
-        return {s for s in table if _is_clean_symbol(s)}
-    except Exception:
+        table = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        )[0]
+        return {
+            s.replace(".", "-")
+            for s in table["Symbol"]
+            if _is_clean_symbol(s)
+        }
+    except Exception as e:
+        logger.warning(f"SP500 fetch failed: {e}")
         return set()
 
+# =========================================================
+# NASDAQ100 vía Wikipedia (ESTABLE)
+# =========================================================
 def _get_nasdaq100() -> Set[str]:
     try:
-        table = yf.Ticker("^NDX").constituents
-        return {s for s in table if _is_clean_symbol(s)}
-    except Exception:
+        tables = pd.read_html(
+            "https://en.wikipedia.org/wiki/Nasdaq-100"
+        )
+        table = tables[4]  # tabla de componentes
+        return {
+            s.replace(".", "-")
+            for s in table["Ticker"]
+            if _is_clean_symbol(s)
+        }
+    except Exception as e:
+        logger.warning(f"Nasdaq100 fetch failed: {e}")
         return set()
 
 # =========================================================
@@ -152,7 +170,8 @@ def _get_most_actives(limit=150) -> Set[str]:
 
         return symbols
 
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Most actives failed: {e}")
         return set()
 
 # =========================================================
@@ -167,7 +186,6 @@ def _discover_universe() -> List[str]:
     actives = _get_most_actives()
 
     universe = list(sp500 | nasdaq | actives)
-
     universe = sorted(universe)[:MAX_UNIVERSE]
 
     logger.info(f"📊 Universe final size: {len(universe)}")
