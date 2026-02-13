@@ -1,9 +1,8 @@
 # =========================================================
 # screener_data_layer.py
-# Screener Profesional — ROBUSTO
+# Screener Profesional — ESTABLE Y ROBUSTO
 # Universo = SP500 (Yahoo) → fallback local JSON
 # Datos = Alpaca → Yahoo fallback
-# Máximo 300 símbolos
 # =========================================================
 
 from typing import Dict, Any, Optional, List
@@ -22,11 +21,11 @@ from pathlib import Path
 # CONFIG
 # =========================================================
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
-MIN_REQUIRED_DAYS = 20
-MAX_CONCURRENT = int(os.getenv("SCREENER_CONCURRENT", "10"))
+MIN_REQUIRED_DAYS = 15  # ⬅ más tolerante
+MAX_CONCURRENT = 3      # ⬅ Yahoo no tolera alto paralelismo
 MAX_UNIVERSE = 300
 
-DATA_PATH = Path(os.getenv("DATA_PATH", "."))  # repo root
+DATA_PATH = Path(os.getenv("DATA_PATH", "."))
 LOCAL_SP500_FILE = DATA_PATH / "sp500.json"
 
 # =========================================================
@@ -46,7 +45,7 @@ if not logger.handlers:
 # =========================================================
 _rate_lock = Lock()
 _last_fetch = 0.0
-_min_interval = 0.05
+_min_interval = 0.2   # ⬅ Más realista para Yahoo
 
 def _rate_limit():
     global _last_fetch
@@ -58,44 +57,7 @@ def _rate_limit():
         _last_fetch = time.time()
 
 # =========================================================
-# ALPACA (OPCIONAL)
-# =========================================================
-ALPACA_AVAILABLE = True
-try:
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
-except Exception:
-    ALPACA_AVAILABLE = False
-
-_data_client = None
-_client_lock = Lock()
-
-def _init_alpaca():
-    global _data_client
-    if not ALPACA_AVAILABLE:
-        return None
-
-    if _data_client:
-        return _data_client
-
-    with _client_lock:
-        key = os.getenv("ALPACA_API_KEY")
-        secret = os.getenv("ALPACA_SECRET_KEY")
-
-        if not key or not secret:
-            return None
-
-        try:
-            _data_client = StockHistoricalDataClient(key, secret)
-            logger.info("✅ Alpaca client initialized")
-        except Exception:
-            return None
-
-    return _data_client
-
-# =========================================================
-# UNIVERSO SP500
+# UNIVERSO
 # =========================================================
 def _get_sp500_yahoo() -> List[str]:
     try:
@@ -138,60 +100,37 @@ def _discover_universe() -> List[str]:
     return symbols
 
 # =========================================================
-# SANITIZE + VALIDATE
+# SANITIZE
 # =========================================================
 def _sanitize_arrays(closes, volumes):
     closes = np.asarray(closes, dtype=float)
     volumes = np.asarray(volumes, dtype=float)
 
-    closes = np.nan_to_num(closes)
-    volumes = np.nan_to_num(volumes)
-
     mask = (closes > 0) & (volumes > 0)
+
     closes = closes[mask][-LOOKBACK_DAYS:]
     volumes = volumes[mask][-LOOKBACK_DAYS:]
 
     return closes, volumes
 
 def _validate_arrays(closes, volumes):
+    if closes is None or volumes is None:
+        return False
     if len(closes) < MIN_REQUIRED_DAYS:
         return False
     if len(closes) != len(volumes):
         return False
-    if np.isnan(closes).all():
-        return False
-    if np.min(closes) < 0.01:
+    if np.isnan(closes).any():
         return False
     return True
 
 # =========================================================
-# FETCH DATA
+# FETCH DATA (SOLO YAHOO ESTABLE)
 # =========================================================
-def _fetch_from_alpaca(symbol):
-    client = _init_alpaca()
-    if not client:
-        return None
-
-    _rate_limit()
-
-    try:
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            limit=LOOKBACK_DAYS,
-        )
-        bars = client.get_stock_bars(request).data.get(symbol)
-        if not bars:
-            return None
-
-        closes = [b.close for b in bars]
-        volumes = [b.volume for b in bars]
-        return closes, volumes
-    except Exception:
-        return None
-
 def _fetch_from_yahoo(symbol):
+
     _rate_limit()
+
     try:
         df = yf.download(
             symbol,
@@ -201,11 +140,14 @@ def _fetch_from_yahoo(symbol):
             threads=False
         )
 
-        if df.empty:
+        if df is None or df.empty:
+            logger.debug(f"Yahoo empty: {symbol}")
             return None
 
         return df["Close"].values, df["Volume"].values
-    except Exception:
+
+    except Exception as e:
+        logger.debug(f"Yahoo error {symbol}: {e}")
         return None
 
 # =========================================================
@@ -213,12 +155,7 @@ def _fetch_from_yahoo(symbol):
 # =========================================================
 def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
 
-    data = _fetch_from_alpaca(symbol)
-    source = "alpaca"
-
-    if data is None:
-        data = _fetch_from_yahoo(symbol)
-        source = "yahoo"
+    data = _fetch_from_yahoo(symbol)
 
     if data is None:
         return None
@@ -232,7 +169,7 @@ def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
         "symbol": symbol,
         "closes": closes,
         "volumes": volumes,
-        "source": source,
+        "source": "yahoo",
         "days": len(closes),
     }
 
@@ -250,7 +187,13 @@ def fetch_multiple_symbols(
 
     workers = max_concurrent or MAX_CONCURRENT
 
+    logger.info(f"Fetching data for {len(symbols)} symbols")
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(fetch_symbol_data, symbols))
 
-    return results
+    valid = [r for r in results if r is not None]
+
+    logger.info(f"Valid symbols after fetch: {len(valid)}")
+
+    return valid
