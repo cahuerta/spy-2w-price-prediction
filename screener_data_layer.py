@@ -1,8 +1,9 @@
 # =========================================================
 # screener_data_layer.py
-# Data Layer AUTOSUFICIENTE para Screener
-# Descubre universo + descarga datos
+# Data Layer AUTOSUFICIENTE — Screener Profesional
+# Descubre universo limpio + descarga datos
 # Alpaca → Yahoo fallback
+# MAX 300 activos reales
 # =========================================================
 
 from typing import Dict, Any, Optional, List
@@ -31,14 +32,14 @@ if not logger.handlers:
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
 MIN_REQUIRED_DAYS = 20
 MAX_CONCURRENT = int(os.getenv("SCREENER_CONCURRENT", "10"))
-MAX_UNIVERSE = int(os.getenv("SCREENER_MAX_UNIVERSE", "300"))
+MAX_UNIVERSE = min(int(os.getenv("SCREENER_MAX_UNIVERSE", "300")), 300)
 
 # =========================================================
 # RATE LIMITING
 # =========================================================
 _rate_lock = Lock()
 _last_fetch = 0.0
-_min_interval = 0.1
+_min_interval = 0.05  # 50ms (más rápido pero seguro)
 
 def _rate_limit():
     global _last_fetch
@@ -73,7 +74,7 @@ except Exception:
 
 
 # =========================================================
-# CLIENTS SINGLETON
+# CLIENT SINGLETON
 # =========================================================
 _trading_client = None
 _data_client = None
@@ -112,6 +113,27 @@ def _init_alpaca_clients():
 
 
 # =========================================================
+# SYMBOL FILTER
+# =========================================================
+def _is_clean_symbol(symbol: str) -> bool:
+    s = symbol.upper()
+
+    # excluir preferred / warrants / series
+    if "." in s:
+        return False
+    if "-" in s:
+        return False
+    if "/" in s:
+        return False
+
+    # excluir demasiado largos (generalmente basura)
+    if len(s) > 5:
+        return False
+
+    return True
+
+
+# =========================================================
 # DISCOVER UNIVERSE
 # =========================================================
 def _discover_universe(limit: int = MAX_UNIVERSE) -> List[str]:
@@ -122,7 +144,9 @@ def _discover_universe(limit: int = MAX_UNIVERSE) -> List[str]:
         logger.warning("⚠️ No Alpaca → universe empty")
         return []
 
-    # 1️⃣ Intentar Most Actives
+    limit = min(limit, 300)
+
+    # 1️⃣ MOST ACTIVES (PRIORIDAD)
     if SCREENER_AVAILABLE:
         try:
             screener = ScreenerClient(
@@ -130,25 +154,45 @@ def _discover_universe(limit: int = MAX_UNIVERSE) -> List[str]:
                 os.getenv("ALPACA_SECRET_KEY")
             )
             actives = screener.get_most_actives()
-            symbols = [a["symbol"] for a in actives[:limit]]
+
+            symbols = []
+            for a in actives:
+                s = a["symbol"]
+                if _is_clean_symbol(s):
+                    symbols.append(s)
+                if len(symbols) >= limit:
+                    break
+
             logger.info(f"📊 Universe: {len(symbols)} most actives")
             return symbols
-        except Exception as e:
-            logger.warning(f"Most actives failed: {e}")
 
-    # 2️⃣ Fallback assets
+        except Exception as e:
+            logger.warning(f"Most actives failed → fallback: {e}")
+
+    # 2️⃣ FALLBACK CONTROLADO
     try:
         assets = trading.get_all_assets()
 
-        symbols = [
-            a.symbol
-            for a in assets
-            if a.tradable
-            and a.asset_class == AssetClass.US_EQUITY
-            and a.exchange in ("NYSE", "NASDAQ")
-        ][:limit]
+        symbols = []
+        for a in assets:
+            if not a.tradable:
+                continue
+            if a.asset_class != AssetClass.US_EQUITY:
+                continue
+            if a.exchange not in ("NYSE", "NASDAQ"):
+                continue
 
-        logger.info(f"📊 Universe fallback: {len(symbols)} assets")
+            s = a.symbol.upper()
+
+            if not _is_clean_symbol(s):
+                continue
+
+            symbols.append(s)
+
+            if len(symbols) >= limit:
+                break
+
+        logger.info(f"📊 Universe fallback filtered: {len(symbols)}")
         return symbols
 
     except Exception as e:
@@ -188,7 +232,7 @@ def _validate_arrays(closes: np.ndarray, volumes: np.ndarray):
 
 
 # =========================================================
-# FETCH ALPACA DATA
+# FETCH ALPACA
 # =========================================================
 def _fetch_from_alpaca(symbol: str):
 
@@ -220,7 +264,7 @@ def _fetch_from_alpaca(symbol: str):
 
 
 # =========================================================
-# FETCH YAHOO
+# FETCH YAHOO (fallback limpio)
 # =========================================================
 import yfinance as yf
 
@@ -281,14 +325,13 @@ def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 # =========================================================
-# BATCH — AUTOSUFICIENTE
+# BATCH — AUTOSUFICIENTE Y LIMITADO
 # =========================================================
 def fetch_multiple_symbols(
     symbols: Optional[List[str]] = None,
     max_concurrent: Optional[int] = None
 ) -> List[Optional[Dict[str, Any]]]:
 
-    # 🔥 Si no pasan símbolos → descubre universo
     if symbols is None:
         symbols = _discover_universe()
 
@@ -298,8 +341,7 @@ def fetch_multiple_symbols(
 
     workers = max_concurrent or MAX_CONCURRENT
 
-    if workers == 1:
-        return [fetch_symbol_data(s) for s in symbols]
-
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(fetch_symbol_data, symbols))
+        results = list(executor.map(fetch_symbol_data, symbols))
+
+    return results
