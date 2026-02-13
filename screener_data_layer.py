@@ -25,8 +25,8 @@ MIN_REQUIRED_DAYS = 15  # ⬅ más tolerante
 MAX_CONCURRENT = 3      # ⬅ Yahoo no tolera alto paralelismo
 MAX_UNIVERSE = 300
 
-DATA_PATH = Path(os.getenv("DATA_PATH", "."))
-LOCAL_SP500_FILE = DATA_PATH / "sp500.json"
+BASE_DIR = Path(__file__).resolve().parent
+LOCAL_SP500_FILE = BASE_DIR / "sp500.json"
 
 # =========================================================
 # LOGGING
