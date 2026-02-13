@@ -1,12 +1,12 @@
 # =========================================================
 # screener_data_layer.py
-# Data Layer AUTOSUFICIENTE — Screener Profesional
-# Descubre universo limpio + descarga datos
-# SOLO Most Actives (máx 300)
+# Data Layer AUTOSUFICIENTE — Screener Profesional vFinal
+# Universo = SP500 + Nasdaq100 + Most Actives
+# Máximo 300 símbolos
 # Alpaca → Yahoo fallback
 # =========================================================
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 import os
 import numpy as np
 import logging
@@ -32,14 +32,14 @@ if not logger.handlers:
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
 MIN_REQUIRED_DAYS = 20
 MAX_CONCURRENT = int(os.getenv("SCREENER_CONCURRENT", "10"))
-MAX_UNIVERSE = min(int(os.getenv("SCREENER_MAX_UNIVERSE", "300")), 300)
+MAX_UNIVERSE = 300  # 🔒 HARD LIMIT
 
 # =========================================================
 # RATE LIMITING
 # =========================================================
 _rate_lock = Lock()
 _last_fetch = 0.0
-_min_interval = 0.05  # 50ms
+_min_interval = 0.05
 
 def _rate_limit():
     global _last_fetch
@@ -82,9 +82,6 @@ def _init_clients():
         return _data_client, _screener_client
 
     with _client_lock:
-        if _data_client and _screener_client:
-            return _data_client, _screener_client
-
         key = os.getenv("ALPACA_API_KEY")
         secret = os.getenv("ALPACA_SECRET_KEY")
 
@@ -94,7 +91,8 @@ def _init_clients():
 
         try:
             _data_client = StockHistoricalDataClient(key, secret)
-            _screener_client = ScreenerClient(key, secret)
+            if SCREENER_AVAILABLE:
+                _screener_client = ScreenerClient(key, secret)
             logger.info("✅ Alpaca clients initialized")
         except Exception as e:
             logger.error(f"❌ Alpaca init failed: {e}")
@@ -114,33 +112,67 @@ def _is_clean_symbol(symbol: str) -> bool:
     return True
 
 # =========================================================
-# DISCOVER UNIVERSE (SOLO MOST ACTIVES)
+# SP500 + NASDAQ100 vía Yahoo
 # =========================================================
-def _discover_universe(limit: int = MAX_UNIVERSE) -> List[str]:
+import yfinance as yf
 
-    data, screener = _init_clients()
+def _get_sp500() -> Set[str]:
+    try:
+        table = yf.Ticker("^GSPC").constituents
+        return {s for s in table if _is_clean_symbol(s)}
+    except Exception:
+        return set()
 
+def _get_nasdaq100() -> Set[str]:
+    try:
+        table = yf.Ticker("^NDX").constituents
+        return {s for s in table if _is_clean_symbol(s)}
+    except Exception:
+        return set()
+
+# =========================================================
+# MOST ACTIVES (ALPACA)
+# =========================================================
+def _get_most_actives(limit=150) -> Set[str]:
+
+    _, screener = _init_clients()
     if not screener:
-        logger.warning("⚠️ Screener not available")
-        return []
+        return set()
 
     try:
         actives = screener.get_most_actives()
+        symbols = set()
 
-        symbols = []
         for a in actives:
             s = a["symbol"]
             if _is_clean_symbol(s):
-                symbols.append(s)
+                symbols.add(s)
             if len(symbols) >= limit:
                 break
 
-        logger.info(f"📊 Universe: {len(symbols)} most actives")
         return symbols
 
-    except Exception as e:
-        logger.error(f"❌ Most actives failed: {e}")
-        return []
+    except Exception:
+        return set()
+
+# =========================================================
+# DISCOVER UNIVERSE
+# =========================================================
+def _discover_universe() -> List[str]:
+
+    logger.info("🔍 Discovering universe...")
+
+    sp500 = _get_sp500()
+    nasdaq = _get_nasdaq100()
+    actives = _get_most_actives()
+
+    universe = list(sp500 | nasdaq | actives)
+
+    universe = sorted(universe)[:MAX_UNIVERSE]
+
+    logger.info(f"📊 Universe final size: {len(universe)}")
+
+    return universe
 
 # =========================================================
 # SANITIZE + VALIDATE
@@ -172,7 +204,7 @@ def _validate_arrays(closes: np.ndarray, volumes: np.ndarray):
     return True
 
 # =========================================================
-# FETCH ALPACA DATA
+# FETCH ALPACA
 # =========================================================
 def _fetch_from_alpaca(symbol: str):
 
@@ -203,10 +235,8 @@ def _fetch_from_alpaca(symbol: str):
         return None
 
 # =========================================================
-# FETCH YAHOO (fallback histórico)
+# FETCH YAHOO (FALLBACK)
 # =========================================================
-import yfinance as yf
-
 def _fetch_from_yahoo(symbol: str):
 
     _rate_limit()
@@ -262,7 +292,7 @@ def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
     }
 
 # =========================================================
-# BATCH — LIMITADO Y SEGURO
+# BATCH
 # =========================================================
 def fetch_multiple_symbols(
     symbols: Optional[List[str]] = None,
