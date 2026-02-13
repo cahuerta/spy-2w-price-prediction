@@ -1,12 +1,12 @@
 # =========================================================
 # screener_data_layer.py
-# Data Layer AUTOSUFICIENTE — Screener Profesional vFinal
-# Universo = SP500 + Nasdaq100 + Most Actives
+# Screener Profesional — ROBUSTO
+# Universo = SP500 (Yahoo) → fallback local JSON
+# Datos = Alpaca → Yahoo fallback
 # Máximo 300 símbolos
-# Alpaca → Yahoo fallback
 # =========================================================
 
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, Optional, List
 import os
 import numpy as np
 import logging
@@ -15,6 +15,19 @@ import time
 from threading import Lock
 import pandas as pd
 import yfinance as yf
+import json
+from pathlib import Path
+
+# =========================================================
+# CONFIG
+# =========================================================
+LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
+MIN_REQUIRED_DAYS = 20
+MAX_CONCURRENT = int(os.getenv("SCREENER_CONCURRENT", "10"))
+MAX_UNIVERSE = 300
+
+DATA_PATH = Path(os.getenv("DATA_PATH", "."))  # repo root
+LOCAL_SP500_FILE = DATA_PATH / "sp500.json"
 
 # =========================================================
 # LOGGING
@@ -27,14 +40,6 @@ if not logger.handlers:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S"
     )
-
-# =========================================================
-# CONFIG
-# =========================================================
-LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
-MIN_REQUIRED_DAYS = 20
-MAX_CONCURRENT = int(os.getenv("SCREENER_CONCURRENT", "10"))
-MAX_UNIVERSE = 300  # 🔒 HARD LIMIT
 
 # =========================================================
 # RATE LIMITING
@@ -53,149 +58,89 @@ def _rate_limit():
         _last_fetch = time.time()
 
 # =========================================================
-# ALPACA IMPORTS
+# ALPACA (OPCIONAL)
 # =========================================================
 ALPACA_AVAILABLE = True
-
 try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
-    from alpaca.data.screener import ScreenerClient
-    SCREENER_AVAILABLE = True
 except Exception:
     ALPACA_AVAILABLE = False
-    SCREENER_AVAILABLE = False
 
-# =========================================================
-# CLIENT SINGLETON
-# =========================================================
 _data_client = None
-_screener_client = None
 _client_lock = Lock()
 
-def _init_clients():
-    global _data_client, _screener_client
-
+def _init_alpaca():
+    global _data_client
     if not ALPACA_AVAILABLE:
-        return None, None
+        return None
 
-    if _data_client and _screener_client:
-        return _data_client, _screener_client
+    if _data_client:
+        return _data_client
 
     with _client_lock:
         key = os.getenv("ALPACA_API_KEY")
         secret = os.getenv("ALPACA_SECRET_KEY")
 
         if not key or not secret:
-            logger.warning("⚠️ Alpaca credentials missing")
-            return None, None
+            return None
 
         try:
             _data_client = StockHistoricalDataClient(key, secret)
-            if SCREENER_AVAILABLE:
-                _screener_client = ScreenerClient(key, secret)
-            logger.info("✅ Alpaca clients initialized")
-        except Exception as e:
-            logger.error(f"❌ Alpaca init failed: {e}")
-            return None, None
+            logger.info("✅ Alpaca client initialized")
+        except Exception:
+            return None
 
-    return _data_client, _screener_client
+    return _data_client
 
 # =========================================================
-# SYMBOL FILTER
+# UNIVERSO SP500
 # =========================================================
-def _is_clean_symbol(symbol: str) -> bool:
-    s = symbol.upper()
-    if "." in s or "-" in s or "/" in s:
-        return False
-    if len(s) > 5:
-        return False
-    return True
-
-# =========================================================
-# SP500 vía Wikipedia (ESTABLE)
-# =========================================================
-def _get_sp500() -> Set[str]:
+def _get_sp500_yahoo() -> List[str]:
     try:
         table = pd.read_html(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         )[0]
-        return {
-            s.replace(".", "-")
-            for s in table["Symbol"]
-            if _is_clean_symbol(s)
-        }
-    except Exception as e:
-        logger.warning(f"SP500 fetch failed: {e}")
-        return set()
-
-# =========================================================
-# NASDAQ100 vía Wikipedia (ESTABLE)
-# =========================================================
-def _get_nasdaq100() -> Set[str]:
-    try:
-        tables = pd.read_html(
-            "https://en.wikipedia.org/wiki/Nasdaq-100"
-        )
-        table = tables[4]  # tabla de componentes
-        return {
-            s.replace(".", "-")
-            for s in table["Ticker"]
-            if _is_clean_symbol(s)
-        }
-    except Exception as e:
-        logger.warning(f"Nasdaq100 fetch failed: {e}")
-        return set()
-
-# =========================================================
-# MOST ACTIVES (ALPACA)
-# =========================================================
-def _get_most_actives(limit=150) -> Set[str]:
-
-    _, screener = _init_clients()
-    if not screener:
-        return set()
-
-    try:
-        actives = screener.get_most_actives()
-        symbols = set()
-
-        for a in actives:
-            s = a["symbol"]
-            if _is_clean_symbol(s):
-                symbols.add(s)
-            if len(symbols) >= limit:
-                break
-
+        symbols = table["Symbol"].tolist()
+        symbols = [s.replace(".", "-") for s in symbols]
+        logger.info(f"SP500 Yahoo loaded: {len(symbols)}")
         return symbols
-
     except Exception as e:
-        logger.warning(f"Most actives failed: {e}")
-        return set()
+        logger.warning(f"SP500 Yahoo failed: {e}")
+        return []
 
-# =========================================================
-# DISCOVER UNIVERSE
-# =========================================================
+def _get_sp500_local() -> List[str]:
+    if not LOCAL_SP500_FILE.exists():
+        logger.warning("Local SP500 JSON not found")
+        return []
+
+    try:
+        with open(LOCAL_SP500_FILE, "r") as f:
+            symbols = json.load(f)
+        logger.info(f"SP500 local loaded: {len(symbols)}")
+        return symbols
+    except Exception:
+        return []
+
 def _discover_universe() -> List[str]:
-
     logger.info("🔍 Discovering universe...")
 
-    sp500 = _get_sp500()
-    nasdaq = _get_nasdaq100()
-    actives = _get_most_actives()
+    symbols = _get_sp500_yahoo()
 
-    universe = list(sp500 | nasdaq | actives)
-    universe = sorted(universe)[:MAX_UNIVERSE]
+    if not symbols:
+        symbols = _get_sp500_local()
 
-    logger.info(f"📊 Universe final size: {len(universe)}")
+    symbols = sorted(set(symbols))[:MAX_UNIVERSE]
 
-    return universe
+    logger.info(f"📊 Universe final size: {len(symbols)}")
+
+    return symbols
 
 # =========================================================
 # SANITIZE + VALIDATE
 # =========================================================
-def _sanitize_arrays(closes: np.ndarray, volumes: np.ndarray):
+def _sanitize_arrays(closes, volumes):
     closes = np.asarray(closes, dtype=float)
     volumes = np.asarray(volumes, dtype=float)
 
@@ -208,9 +153,7 @@ def _sanitize_arrays(closes: np.ndarray, volumes: np.ndarray):
 
     return closes, volumes
 
-def _validate_arrays(closes: np.ndarray, volumes: np.ndarray):
-    if closes is None or volumes is None:
-        return False
+def _validate_arrays(closes, volumes):
     if len(closes) < MIN_REQUIRED_DAYS:
         return False
     if len(closes) != len(volumes):
@@ -222,12 +165,11 @@ def _validate_arrays(closes: np.ndarray, volumes: np.ndarray):
     return True
 
 # =========================================================
-# FETCH ALPACA
+# FETCH DATA
 # =========================================================
-def _fetch_from_alpaca(symbol: str):
-
-    data, _ = _init_clients()
-    if not data:
+def _fetch_from_alpaca(symbol):
+    client = _init_alpaca()
+    if not client:
         return None
 
     _rate_limit()
@@ -238,27 +180,18 @@ def _fetch_from_alpaca(symbol: str):
             timeframe=TimeFrame.Day,
             limit=LOOKBACK_DAYS,
         )
-
-        bars = data.get_stock_bars(request).data.get(symbol)
-
-        if not bars or len(bars) < MIN_REQUIRED_DAYS:
+        bars = client.get_stock_bars(request).data.get(symbol)
+        if not bars:
             return None
 
-        closes = np.array([b.close for b in bars], dtype=float)
-        volumes = np.array([b.volume for b in bars], dtype=float)
-
+        closes = [b.close for b in bars]
+        volumes = [b.volume for b in bars]
         return closes, volumes
-
     except Exception:
         return None
 
-# =========================================================
-# FETCH YAHOO (FALLBACK)
-# =========================================================
-def _fetch_from_yahoo(symbol: str):
-
+def _fetch_from_yahoo(symbol):
     _rate_limit()
-
     try:
         df = yf.download(
             symbol,
@@ -268,16 +201,10 @@ def _fetch_from_yahoo(symbol: str):
             threads=False
         )
 
-        if df is None or df.empty or len(df) < MIN_REQUIRED_DAYS:
+        if df.empty:
             return None
 
-        df = df[["Close", "Volume"]].dropna()
-
-        closes = df["Close"].values
-        volumes = df["Volume"].values
-
-        return closes, volumes
-
+        return df["Close"].values, df["Volume"].values
     except Exception:
         return None
 
@@ -309,13 +236,10 @@ def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
         "days": len(closes),
     }
 
-# =========================================================
-# BATCH
-# =========================================================
 def fetch_multiple_symbols(
     symbols: Optional[List[str]] = None,
     max_concurrent: Optional[int] = None
-) -> List[Optional[Dict[str, Any]]]:
+):
 
     if symbols is None:
         symbols = _discover_universe()
