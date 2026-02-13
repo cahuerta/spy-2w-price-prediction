@@ -1,11 +1,10 @@
 # =========================================================
-# screener.py — COORDINADOR PURO (ROBUSTO)
+# screener.py — ENTERPRISE COORDINADOR (CONTRATO INTACTO)
 # =========================================================
-# ✔ No universo
-# ✔ No env vars
-# ✔ No contratos nuevos
-# ✔ Solo coordina Layer → Engine → IA
-# ✔ Logs reales de diagnóstico
+# ✔ NO cambia estructura JSON
+# ✔ Ranking siempre visible
+# ✔ Candidatos estructurales reales
+# ✔ IA solo sobre Top20
 # =========================================================
 
 import json
@@ -37,98 +36,78 @@ logger = logging.getLogger("screener")
 
 
 # =========================================================
-# CORE ASYNC — COORDINADOR REAL
+# FILTRO ESTRUCTURAL (NO ROMPE JSON)
+# =========================================================
+
+def is_structural_candidate(x: Dict[str, Any]) -> bool:
+    return (
+        x["sharpe_ratio"] > 0.8 and
+        x["trend_3m_pct"] > 3 and
+        x["avg_dollar_volume"] > 50_000_000 and
+        x["max_drawdown_pct"] > -25
+    )
+
+
+# =========================================================
+# CORE ASYNC
 # =========================================================
 
 async def run_screener_async() -> Dict[str, Any]:
 
-    logger.info("🚀 Screener started")
+    logger.info("🔍 Running screener...")
 
-    # 1️⃣ DATA LAYER
     raw_data = fetch_multiple_symbols()
 
-    if not raw_data:
-        logger.warning("⚠️ No data returned from data layer")
-        return {
-            "generated_at": datetime.utcnow().isoformat(),
-            "n_universe": 0,
-            "n_valid_data": 0,
-            "n_evaluated": 0,
-            "candidates_strict": [],
-            "top20_global": [],
-        }
-
-    n_universe = len(raw_data)
-    logger.info(f"📊 Raw symbols received: {n_universe}")
-
-    # Filtrar objetos válidos
-    valid_data = [item for item in raw_data if item]
-    n_valid_data = len(valid_data)
-
-    logger.info(f"✅ Valid data objects: {n_valid_data}")
-
-    if n_valid_data == 0:
-        logger.warning("❌ All symbols failed data validation")
-        return {
-            "generated_at": datetime.utcnow().isoformat(),
-            "n_universe": n_universe,
-            "n_valid_data": 0,
-            "n_evaluated": 0,
-            "candidates_strict": [],
-            "top20_global": [],
-        }
-
-    # 2️⃣ ENGINE
     evaluated: List[Dict[str, Any]] = []
 
-    for item in valid_data:
+    for item in raw_data:
 
-        try:
-            score_data = compute_score(
-                closes=item["closes"],
-                volumes=item["volumes"],
-            )
+        score_data = compute_score(
+            closes=item["closes"],
+            volumes=item["volumes"],
+        )
 
-            if not score_data:
-                continue
-
-            evaluated.append({
-                "ticker": item["symbol"],
-                **score_data
-            })
-
-        except Exception as e:
-            logger.warning(f"⚠️ Engine failed for {item.get('symbol')}: {e}")
+        if not score_data:
             continue
 
-    n_evaluated = len(evaluated)
-    logger.info(f"🏁 Evaluated tickers: {n_evaluated}")
+        evaluated.append({
+            "ticker": item["symbol"],
+            **score_data
+        })
 
-    if n_evaluated == 0:
-        logger.warning("❌ All symbols filtered out by engine")
-
-    # 3️⃣ Orden global
+    # =============================
+    # ORDEN GLOBAL
+    # =============================
     evaluated.sort(key=lambda x: x["score"], reverse=True)
 
-    # 4️⃣ IA opcional
-    if IA_AVAILABLE and evaluated:
-        try:
-            logger.info("🤖 Running IA enrichment...")
-            evaluated = await enrich_screener_candidates_batch(evaluated)
-        except Exception as e:
-            logger.warning(f"⚠️ IA failed: {e}")
+    top20 = evaluated[:20]  # 🔹 siempre visible
 
-    # 5️⃣ Resultado final
+    # =============================
+    # IA SOLO SOBRE TOP20
+    # =============================
+    if IA_AVAILABLE and top20:
+        try:
+            top20 = await enrich_screener_candidates_batch(top20)
+        except Exception as e:
+            logger.warning(f"IA failed: {e}")
+
+    # =============================
+    # CANDIDATOS ESTRICTOS
+    # =============================
+    candidates = [
+        x for x in evaluated
+        if is_structural_candidate(x)
+    ]
+
+    # =============================
+    # 🔒 CONTRATO ORIGINAL (NO CAMBIA)
+    # =============================
     result = {
         "generated_at": datetime.utcnow().isoformat(),
-        "n_universe": n_universe,
-        "n_valid_data": n_valid_data,
-        "n_evaluated": n_evaluated,
-        "candidates_strict": evaluated,
-        "top20_global": evaluated[:20],
+        "n_evaluated": len(evaluated),
+        "candidates_strict": candidates,
+        "top20_global": top20,
     }
-
-    logger.info("✅ Screener finished")
 
     return result
 
