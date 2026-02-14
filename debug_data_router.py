@@ -1,28 +1,29 @@
 # =========================================================
 # debug_data_router.py
-# DIAGNÓSTICO PROFUNDO DE /data
-# NO afecta pipeline
-# SOLO lectura
+# DIAGNÓSTICO REAL DE /data EN RENDER
 # =========================================================
 
 from fastapi import APIRouter
 from pathlib import Path
 import json
-from typing import Any
+import os
 
 router = APIRouter(prefix="/internal/debug", tags=["debug"])
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(os.getenv("DATA_PATH", "/data"))
 
 
 # =========================================================
-# 1️⃣ LISTAR TODO EN /data
+# 1️⃣ LISTAR TODO EN /data REAL
 # =========================================================
 @router.get("/files")
 def list_data_files():
 
     if not DATA_DIR.exists():
-        return {"error": "data directory not found"}
+        return {
+            "error": "data directory not found",
+            "checked_path": str(DATA_DIR)
+        }
 
     files = []
 
@@ -34,13 +35,14 @@ def list_data_files():
         })
 
     return {
+        "checked_path": str(DATA_DIR),
         "total": len(files),
         "files": files
     }
 
 
 # =========================================================
-# 2️⃣ VER CONTENIDO DE UN JSON
+# 2️⃣ VER JSON ESPECÍFICO
 # =========================================================
 @router.get("/json")
 def read_json(path: str):
@@ -48,7 +50,7 @@ def read_json(path: str):
     file_path = Path(path)
 
     if not file_path.exists():
-        return {"error": "file not found"}
+        return {"error": "file not found", "checked_path": str(file_path)}
 
     try:
         with open(file_path, "r") as f:
@@ -58,7 +60,7 @@ def read_json(path: str):
             "path": str(file_path),
             "type": type(data).__name__,
             "keys": list(data.keys()) if isinstance(data, dict) else None,
-            "preview": data if isinstance(data, (dict, list)) else str(data)
+            "preview": data
         }
 
     except Exception as e:
@@ -74,28 +76,15 @@ def list_predictions():
     predictions_dir = DATA_DIR / "predictions"
 
     if not predictions_dir.exists():
-        return {"error": "predictions folder not found"}
+        return {
+            "error": "predictions folder not found",
+            "checked_path": str(predictions_dir)
+        }
 
     files = list(predictions_dir.glob("*.json"))
 
     return {
+        "checked_path": str(predictions_dir),
         "count": len(files),
         "files": [str(f) for f in files]
     }
-
-
-# =========================================================
-# 4️⃣ VER PREDICCIÓN ESPECÍFICA
-# =========================================================
-@router.get("/prediction/{ticker}")
-def read_prediction(ticker: str):
-
-    file_path = DATA_DIR / "predictions" / f"{ticker}.json"
-
-    if not file_path.exists():
-        return {"error": f"prediction not found for {ticker}"}
-
-    with open(file_path, "r") as f:
-        data = json.load(f)
-
-    return data
