@@ -1,10 +1,11 @@
 # =========================================================
-# screener.py — ENTERPRISE COORDINADOR (CONTRATO INTACTO)
+# screener.py — ENTERPRISE SCREENER (FAST + STRUCTURAL)
 # =========================================================
-# ✔ NO cambia estructura JSON
+# ✔ Screener real (rápido)
+# ✔ Filtro liviano inicial
+# ✔ Engine completo SOLO sobre shortlist
 # ✔ Ranking siempre visible
-# ✔ Candidatos estructurales reales
-# ✔ IA solo sobre Top20
+# ✔ Contrato JSON intacto
 # =========================================================
 
 import json
@@ -36,7 +37,36 @@ logger = logging.getLogger("screener")
 
 
 # =========================================================
-# FILTRO ESTRUCTURAL (NO ROMPE JSON)
+# ⚡ FAST PRE-FILTER (ULTRA LIVIANO)
+# =========================================================
+
+def fast_filter(item: Dict[str, Any]) -> bool:
+    """
+    Filtro rápido:
+    - Tendencia simple 20d positiva
+    - Volumen promedio suficiente
+    """
+
+    closes = item["closes"]
+    volumes = item["volumes"]
+
+    if len(closes) < 20:
+        return False
+
+    # Retorno 20 días
+    ret_20 = (closes[-1] / closes[-20]) - 1
+
+    # Volumen promedio
+    avg_dollar_volume = sum(closes[-20:] * volumes[-20:]) / 20
+
+    return (
+        ret_20 > 0.02 and                 # +2% en 20d
+        avg_dollar_volume > 20_000_000    # liquidez mínima básica
+    )
+
+
+# =========================================================
+# FILTRO ESTRUCTURAL FINAL (PASAN A MODEL)
 # =========================================================
 
 def is_structural_candidate(x: Dict[str, Any]) -> bool:
@@ -54,13 +84,30 @@ def is_structural_candidate(x: Dict[str, Any]) -> bool:
 
 async def run_screener_async() -> Dict[str, Any]:
 
-    logger.info("🔍 Running screener...")
+    logger.info("🔍 Running FAST screener...")
 
     raw_data = fetch_multiple_symbols()
 
+    if not raw_data:
+        logger.warning("⚠️ No data returned from data layer")
+
+    # =====================================================
+    # 1️⃣ FAST FILTER (reduce universo)
+    # =====================================================
+    pre_filtered = [x for x in raw_data if fast_filter(x)]
+
+    logger.info(f"Universe raw: {len(raw_data)}")
+    logger.info(f"After fast filter: {len(pre_filtered)}")
+
+    # Limitar shortlist para engine pesado
+    shortlist = pre_filtered[:60]  # máximo 60
+
     evaluated: List[Dict[str, Any]] = []
 
-    for item in raw_data:
+    # =====================================================
+    # 2️⃣ ENGINE ENTERPRISE SOLO SOBRE SHORTLIST
+    # =====================================================
+    for item in shortlist:
 
         score_data = compute_score(
             closes=item["closes"],
@@ -75,39 +122,42 @@ async def run_screener_async() -> Dict[str, Any]:
             **score_data
         })
 
-    # =============================
-    # ORDEN GLOBAL
-    # =============================
+    # =====================================================
+    # 3️⃣ RANKING GLOBAL
+    # =====================================================
     evaluated.sort(key=lambda x: x["score"], reverse=True)
 
-    top20 = evaluated[:20]  # 🔹 siempre visible
+    ranking_top20 = evaluated[:20]
 
-    # =============================
-    # IA SOLO SOBRE TOP20
-    # =============================
-    if IA_AVAILABLE and top20:
+    # =====================================================
+    # 4️⃣ IA SOLO SOBRE TOP20
+    # =====================================================
+    if IA_AVAILABLE and ranking_top20:
         try:
-            top20 = await enrich_screener_candidates_batch(top20)
+            ranking_top20 = await enrich_screener_candidates_batch(ranking_top20)
         except Exception as e:
             logger.warning(f"IA failed: {e}")
 
-    # =============================
-    # CANDIDATOS ESTRICTOS
-    # =============================
+    # =====================================================
+    # 5️⃣ CANDIDATOS REALES
+    # =====================================================
     candidates = [
         x for x in evaluated
         if is_structural_candidate(x)
     ]
 
-    # =============================
-    # 🔒 CONTRATO ORIGINAL (NO CAMBIA)
-    # =============================
+    # =====================================================
+    # 6️⃣ CONTRATO JSON (NO CAMBIA)
+    # =====================================================
     result = {
         "generated_at": datetime.utcnow().isoformat(),
         "n_evaluated": len(evaluated),
         "candidates_strict": candidates,
-        "top20_global": top20,
+        "top20_global": ranking_top20,
     }
+
+    logger.info(f"Evaluated (engine): {len(evaluated)}")
+    logger.info(f"Candidates: {len(candidates)}")
 
     return result
 
