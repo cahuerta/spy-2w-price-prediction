@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 from typing import List, Any
 from fastapi import APIRouter, HTTPException, Request
+from fastapi import Header
+
 
 router = APIRouter(prefix="/internal/admin", tags=["admin"])
 
@@ -65,10 +67,12 @@ def save_atomic(path: Path, tickers: List[str]):
 # =========================================================
 # ENDPOINT: SANITIZE
 # =========================================================
-@router.post("/tickers/sanitize")
-async def sanitize_tickers(request: Request):
 
-    if request.headers.get("X-PIPELINE-KEY") != PIPELINE_KEY:
+@router.post("/tickers/sanitize")
+async def sanitize_tickers(
+    x_pipeline_key: str = Header(...)
+):
+    if x_pipeline_key != PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
     raw = load_raw(TICKERS_FILE)
@@ -84,7 +88,6 @@ async def sanitize_tickers(request: Request):
         "status": "sanitized",
         "total": len(set(tickers))
     }
-
 
 # =========================================================
 # ENDPOINT: WIPE TOTAL
