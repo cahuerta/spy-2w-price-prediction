@@ -22,7 +22,6 @@ from typing import Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Header
 
 from signals_router import router as signals_router
 from dashboard import router as dashboard_router
@@ -144,26 +143,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@router.post("/tickers/sanitize")
-async def sanitize_tickers(
-    x_pipeline_key: str = Header(...)
-):
-    if x_pipeline_key != PIPELINE_KEY:
-        raise HTTPException(403, "Invalid pipeline key")
-
-    raw = load_raw(TICKERS_FILE)
-
-    try:
-        tickers = extract_tickers(raw)
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
-    save_atomic(TICKERS_FILE, tickers)
-
-    return {
-        "status": "sanitized",
-        "total": len(set(tickers))
-    }
 # =========================================================
 # ROUTERS
 # =========================================================
