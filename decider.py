@@ -1,11 +1,12 @@
 # =========================================================
-# decider.py — SCREENER → TICKERS MEMORY DECIDER (AUTO-ADD) v2.2
+# decider.py — SCREENER → TICKERS MEMORY DECIDER v3.0
 # =========================================================
-# ✅ Lee screener_candidates.json DESDE DISCO
-# ✅ AGREGA automáticamente a tickers.json
-# ✅ CONCURRENCIA: Atomic write + backup
-# ❌ NUNCA borra tickers
-# ❌ NO decide trades | NO toca señales ni broker
+# ✅ Lee screener_candidates.json
+# ✅ Usa candidates_strict (contrato real)
+# ✅ Soporta emojis en quality
+# ✅ Guarda tickers.json como LISTA PURA
+# ✅ Limpia estructura inválida automáticamente
+# ❌ Nunca borra tickers válidos
 # =========================================================
 
 import json
@@ -16,146 +17,153 @@ from datetime import datetime
 from typing import Dict, Any, List
 
 # =========================
-# Configuración
+# CONFIG
 # =========================
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 
 SCREENER_FILE = DATA_PATH / "screener_candidates.json"
 TICKERS_FILE = DATA_PATH / "tickers.json"
 
-# Criterios conservadores
 MIN_SCORE = 0.75
-ALLOWED_QUALITIES = {"STRONG", "GOOD"}
 
 # =========================
-# Logging
+# LOGGING
 # =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)-7s] %(message)s"
 )
-logger = logging.getLogger("decider")
+logger = logging.getLogger("decider_v3")
 
-# =========================
-# Helpers CONCURRENCIA
-# =========================
-def load_json(path: Path) -> Dict[str, Any]:
+# =========================================================
+# HELPERS
+# =========================================================
+
+def load_json(path: Path):
     if not path.exists():
         raise RuntimeError(f"Archivo requerido no existe: {path}")
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        logger.error(f"❌ JSON corrupto: {path}")
-        raise
+    return json.loads(path.read_text())
 
 
-def save_json_atomic(path: Path, data: Dict[str, Any]):
-    if path.exists():
-        backup = path.with_suffix(".backup")
-        backup.write_text(path.read_text())
-        logger.debug(f"📦 Backup creado: {backup}")
-
+def save_json_atomic(path: Path, data: List[str]):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
 
 
 def normalize_tickers(data: Any) -> List[str]:
+    """
+    Garantiza que tickers.json sea lista limpia.
+    Elimina basura estructural.
+    """
     if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "tickers" in data and isinstance(data["tickers"], list):
-        return data["tickers"]
-    raise RuntimeError("Formato inválido en tickers.json")
+        return [str(x) for x in data if isinstance(x, str)]
 
-# =========================
-# Core logic
-# =========================
+    if isinstance(data, dict):
+        # si viene formato viejo con metadata
+        if "tickers" in data and isinstance(data["tickers"], list):
+            return [str(x) for x in data["tickers"] if isinstance(x, str)]
+
+    logger.warning("⚠️ tickers.json corrupto → se reinicializa limpio")
+    return []
+
+
+def quality_is_valid(q: str) -> bool:
+    if not q:
+        return False
+    return "STRONG" in q or "INSTITUTIONAL" in q
+
+
+# =========================================================
+# CORE
+# =========================================================
+
 def run_decider() -> Dict[str, Any]:
+
+    logger.info("🧠 Decider v3.0 iniciado")
+
     # -------------------------
-    # Leer screener DESDE DISCO
+    # Leer screener
     # -------------------------
     screener = load_json(SCREENER_FILE)
-    candidates = screener.get("candidates", [])
+
+    candidates = screener.get("candidates_strict", [])
 
     if not isinstance(candidates, list):
         raise RuntimeError("Formato inválido en screener_candidates.json")
 
     # -------------------------
-    # Cargar tickers.json existente
+    # Cargar tickers actuales
     # -------------------------
     if TICKERS_FILE.exists():
-        tickers_data = load_json(TICKERS_FILE)
-        tickers_list = normalize_tickers(tickers_data)
-        logger.info(f"📂 Cargados {len(tickers_list)} tickers existentes")
+        raw = load_json(TICKERS_FILE)
+        tickers_list = normalize_tickers(raw)
+        logger.info(f"📂 {len(tickers_list)} tickers cargados")
     else:
-        logger.warning("⚠️ tickers.json no existe, se creará")
         tickers_list = []
+        logger.info("📦 tickers.json no existía → se creará")
 
     tickers_set = set(tickers_list)
-    added: List[str] = []
+    added = []
 
     # -------------------------
-    # Evaluar candidatos (MISMA LÓGICA)
+    # Evaluar candidatos
     # -------------------------
     for c in candidates:
         try:
             ticker = c.get("ticker")
             score = float(c.get("score", 0))
-            quality = c.get("quality")
+            quality = c.get("quality", "")
 
             if not ticker:
                 continue
-            if quality not in ALLOWED_QUALITIES:
-                continue
             if score < MIN_SCORE:
+                continue
+            if not quality_is_valid(quality):
                 continue
 
             if ticker not in tickers_set:
                 tickers_set.add(ticker)
                 added.append(ticker)
-                logger.info(f"➕ AGREGADO: {ticker} ({quality}, score={score:.3f})")
+                logger.info(f"➕ AGREGADO: {ticker} | score={score:.3f}")
 
         except Exception as e:
             logger.debug(f"Skip candidato: {e}")
 
     # -------------------------
-    # Guardar ATÓMICAMENTE
+    # Guardar lista limpia
     # -------------------------
-    output = {
-        "generated_at": datetime.utcnow().isoformat(),
-        "source": "screener_decider_v2.2",
-        "total_tickers": len(tickers_set),
-        "added_today": len(added),
-        "tickers": sorted(tickers_set),
-    }
+    final_list = sorted(tickers_set)
 
-    save_json_atomic(TICKERS_FILE, output)
+    save_json_atomic(TICKERS_FILE, final_list)
 
     logger.info(
-        f"✅ Decider v2.2 | nuevos={len(added)} | total={len(tickers_set)}"
+        f"✅ Decider finalizado | nuevos={len(added)} | total={len(final_list)}"
     )
 
     return {
         "ok": True,
         "added": added,
-        "total": len(tickers_set),
+        "total": len(final_list),
         "file": str(TICKERS_FILE),
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
-# =========================
-# CLI (debug manual)
-# =========================
+
+# =========================================================
+# CLI
+# =========================================================
 if __name__ == "__main__":
     try:
         result = run_decider()
-        print("\n🧠 TICKERS NUEVOS AGREGADOS:")
+        print("\n🧠 NUEVOS TICKERS:")
         if result["added"]:
             for t in result["added"]:
                 print(f"➕ {t}")
         else:
-            print("ℹ️  Ningún nuevo candidato calificado")
+            print("ℹ️ Ningún nuevo ticker agregado")
 
-        print(f"\n📦 Total tickers en memoria: {result['total']}")
+        print(f"\n📦 Total tickers: {result['total']}")
         print(f"💾 Archivo: {result['file']}")
 
     except Exception as e:
