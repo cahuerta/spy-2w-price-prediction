@@ -88,19 +88,27 @@ def merge_tickers_on_startup():
     disk_tickers: List[str] = load_json(TICKERS_FILE, [])
 
     # --- tickers base desde el repo ---
-if REPO_TICKERS_FILE.exists():
-    try:
-        repo_raw = json.loads(REPO_TICKERS_FILE.read_text())
-        if isinstance(repo_raw, list):
-            base_tickers = [str(t).strip() for t in repo_raw if isinstance(t, str)]
-        elif isinstance(repo_raw, dict) and "tickers" in repo_raw:
-            base_tickers = [str(t).strip() for t in repo_raw["tickers"] if isinstance(t, str)]
-        else:
+    if REPO_TICKERS_FILE.exists():
+        try:
+            repo_raw = json.loads(REPO_TICKERS_FILE.read_text())
+            if isinstance(repo_raw, list):
+                base_tickers = [
+                    str(t).strip()
+                    for t in repo_raw
+                    if isinstance(t, str)
+                ]
+            elif isinstance(repo_raw, dict) and "tickers" in repo_raw:
+                base_tickers = [
+                    str(t).strip()
+                    for t in repo_raw["tickers"]
+                    if isinstance(t, str)
+                ]
+            else:
+                base_tickers = []
+        except Exception:
             base_tickers = []
-    except Exception:
+    else:
         base_tickers = []
-else:
-    base_tickers = []
 
     merged = sorted(set(disk_tickers) | set(base_tickers))
 
@@ -235,4 +243,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         log_level="error",
-    )
+        )
