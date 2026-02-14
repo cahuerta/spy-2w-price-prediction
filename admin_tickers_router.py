@@ -1,20 +1,20 @@
 # =========================================================
-# admin_tickers_router.py — TICKERS ADMIN CONTROL v3.0
+# admin_tickers_router.py — TICKERS ADMIN CONTROL v4.0
 # =========================================================
 # ✔ tickers.json SIEMPRE es List[str]
+# ✔ Limpieza REAL (elimina metadata contaminada)
 # ✔ Permite WIPE total
-# ✔ Permite SANITIZE (limpia metadata)
+# ✔ Validación estricta de ticker
 # ✔ Escritura atómica
 # ✔ Protegido con X-PIPELINE-KEY
-# ✔ NO rompe contrato del sistema
+# ✔ Nunca vuelve a mezclar dict keys como tickers
 # =========================================================
 
 import json
 import os
 from pathlib import Path
 from typing import List, Any
-from fastapi import APIRouter, HTTPException, Request
-from fastapi import Header
+from fastapi import APIRouter, HTTPException, Request, Header
 
 
 router = APIRouter(prefix="/internal/admin", tags=["admin"])
@@ -51,13 +51,40 @@ def extract_tickers(data: Any) -> List[str]:
     raise RuntimeError("Formato inválido en tickers.json")
 
 
+# ---------------------------------------------------------
+# VALIDACIÓN ESTRICTA DE TICKER
+# ---------------------------------------------------------
+def is_valid_ticker(t: str) -> bool:
+
+    if not isinstance(t, str):
+        return False
+
+    t = t.strip().upper()
+
+    if len(t) < 1 or len(t) > 15:
+        return False
+
+    if " " in t:
+        return False
+
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ.")
+    return all(c in allowed for c in t)
+
+
+# ---------------------------------------------------------
+# ESCRITURA ATÓMICA SEGURA
+# ---------------------------------------------------------
 def save_atomic(path: Path, tickers: List[str]):
-    """
-    GUARDA SIEMPRE COMO LISTA PURA
-    """
+
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    clean = sorted(set(str(t).strip().upper() for t in tickers if t))
+    clean = sorted(
+        set(
+            t.strip().upper()
+            for t in tickers
+            if is_valid_ticker(t)
+        )
+    )
 
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(clean, indent=2))
@@ -65,7 +92,7 @@ def save_atomic(path: Path, tickers: List[str]):
 
 
 # =========================================================
-# ENDPOINT: SANITIZE
+# ENDPOINT: SANITIZE (LIMPIEZA INTELIGENTE)
 # =========================================================
 
 @router.post("/tickers/sanitize")
@@ -86,16 +113,24 @@ async def sanitize_tickers(
 
     return {
         "status": "sanitized",
-        "total": len(set(tickers))
+        "total": len(
+            [
+                t for t in tickers
+                if is_valid_ticker(t)
+            ]
+        )
     }
+
 
 # =========================================================
 # ENDPOINT: WIPE TOTAL
 # =========================================================
-@router.post("/tickers/wipe")
-async def wipe_tickers(request: Request):
 
-    if request.headers.get("X-PIPELINE-KEY") != PIPELINE_KEY:
+@router.post("/tickers/wipe")
+async def wipe_tickers(
+    x_pipeline_key: str = Header(...)
+):
+    if x_pipeline_key != PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
     save_atomic(TICKERS_FILE, [])
@@ -109,6 +144,7 @@ async def wipe_tickers(request: Request):
 # =========================================================
 # ENDPOINT: VIEW
 # =========================================================
+
 @router.get("/tickers/view")
 async def view_tickers():
 
