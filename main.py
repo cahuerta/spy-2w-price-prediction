@@ -92,17 +92,9 @@ def merge_tickers_on_startup():
         try:
             repo_raw = json.loads(REPO_TICKERS_FILE.read_text())
             if isinstance(repo_raw, list):
-                base_tickers = [
-                    str(t).strip()
-                    for t in repo_raw
-                    if isinstance(t, str)
-                ]
+                base_tickers = [str(t).strip() for t in repo_raw if isinstance(t, str)]
             elif isinstance(repo_raw, dict) and "tickers" in repo_raw:
-                base_tickers = [
-                    str(t).strip()
-                    for t in repo_raw["tickers"]
-                    if isinstance(t, str)
-                ]
+                base_tickers = [str(t).strip() for t in repo_raw["tickers"] if isinstance(t, str)]
             else:
                 base_tickers = []
         except Exception:
@@ -136,10 +128,7 @@ def load_market_context() -> MarketOrchestrationContext:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Trading Suite v2.9.0 START")
-
-    # 🔥 ÚNICO CAMBIO REAL
     merge_tickers_on_startup()
-
     yield
     logger.info("🛑 Trading Suite v2.9.0 STOP")
 
@@ -243,4 +232,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         log_level="error",
-        )
+    )
