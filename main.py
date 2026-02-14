@@ -29,6 +29,7 @@ from pipeline_router import router as pipeline_router
 
 from market_orchestrator import MarketOrchestrationContext
 from trading_orchestrator import TradingOrchestrator
+from debug_data_router import router as debug_router
 
 # =========================================================
 # CONFIG
@@ -147,6 +148,7 @@ app.add_middleware(
 app.include_router(dashboard_router)
 app.include_router(pipeline_router)
 app.include_router(signals_router)
+app.include_router(debug_router)
 
 # =========================================================
 # PIPELINE COMMIT
