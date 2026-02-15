@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query
 from signals import compute_all_signals
+from signals import FUNDAMENTAL_AVAILABLE
 
 router = APIRouter()
 
@@ -18,4 +19,5 @@ async def debug_signals():
     return {
         "DATA_PATH": DATA_PATH,
         "tickers": load_universe()
+        "fundamental_available":FUNDAMENTAL_AVAILABLE
     }
