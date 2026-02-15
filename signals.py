@@ -89,7 +89,7 @@ def list_json_files(path: str | Path) -> List[str]:
     return sorted(f.name for f in path.glob("*.json"))
 
 def load_universe() -> List[str]:
-    p = Path("tickers.json")
+    p = Path(DATA_PATH) / "tickers.json"
     if not p.exists():
         return []
     d = load_json(p)
