@@ -18,6 +18,6 @@ async def debug_signals():
     from signals import DATA_PATH, load_universe
     return {
         "DATA_PATH": DATA_PATH,
-        "tickers": load_universe()
+        "tickers": load_universe(),
         "fundamental_available":FUNDAMENTAL_AVAILABLE
     }
