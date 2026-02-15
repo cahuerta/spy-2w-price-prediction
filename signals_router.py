@@ -12,3 +12,10 @@ async def get_signals(min_confidence: float = 0.0):
             if (s.get("confidence") or 0) >= min_confidence
         ]
     return {"signals": signals}
+@router.get("/signals/debug")
+async def debug_signals():
+    from signals import DATA_PATH, load_universe
+    return {
+        "DATA_PATH": DATA_PATH,
+        "tickers": load_universe()
+    }
