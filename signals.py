@@ -23,7 +23,7 @@ from threading import Lock
 # FUNDAMENTAL CONTEXT (SAFE IMPORT)
 # =====================================================
 try:
-    from model2_improved import fundamental_signal_context
+    from model2 import fundamental_signal_context
     FUNDAMENTAL_AVAILABLE = True
 except Exception:
     FUNDAMENTAL_AVAILABLE = False
