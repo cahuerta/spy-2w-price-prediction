@@ -70,13 +70,30 @@ def fast_filter(item: Dict[str, Any]) -> bool:
 # =========================================================
 
 def is_structural_candidate(x: Dict[str, Any]) -> bool:
-    return (
-        x["sharpe_ratio"] > 0.8 and
-        x["trend_3m_pct"] > 3 and
-        x["avg_dollar_volume"] > 50_000_000 and
-        x["max_drawdown_pct"] > -25
-    )
+    """
+    Filtro estructural más exigente.
+    Reduce ruido y evita MODERATE / NOISE.
+    """
 
+    if x.get("quality") != "✅ STRONG":
+        return False
+
+    if x.get("score", 0) < 0.72:
+        return False
+
+    if x.get("sharpe_ratio", 0) < 1.5:
+        return False
+
+    if x.get("trend_3m_pct", 0) < 10:
+        return False
+
+    if x.get("avg_dollar_volume", 0) < 100_000_000:
+        return False
+
+    if x.get("max_drawdown_pct", 0) < -20:
+        return False
+
+    return True
 
 # =========================================================
 # CORE ASYNC
