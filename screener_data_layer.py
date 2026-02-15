@@ -1,8 +1,8 @@
 # =========================================================
 # screener_data_layer.py
-# Screener Profesional — ESTABLE Y ROBUSTO
-# Universo = SP500 (Yahoo) → fallback local JSON
-# Datos = Alpaca → Yahoo fallback
+# Screener Profesional — ESTABLE Y OPTIMIZADO
+# Universo = SP500 local (primario)
+# Datos = Yahoo (rápido y concurrente)
 # =========================================================
 
 from typing import Dict, Any, Optional, List
@@ -12,7 +12,6 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 import time
 from threading import Lock
-import pandas as pd
 import yfinance as yf
 import json
 from pathlib import Path
@@ -21,8 +20,8 @@ from pathlib import Path
 # CONFIG
 # =========================================================
 LOOKBACK_DAYS = int(os.getenv("SCREENER_LOOKBACK", "90"))
-MIN_REQUIRED_DAYS = 15  # ⬅ más tolerante
-MAX_CONCURRENT = 3      # ⬅ Yahoo no tolera alto paralelismo
+MIN_REQUIRED_DAYS = 15
+MAX_CONCURRENT = 8               # ⬅ aumentado
 MAX_UNIVERSE = 300
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,11 +40,11 @@ if not logger.handlers:
     )
 
 # =========================================================
-# RATE LIMITING
+# RATE LIMIT (MUCHO MÁS LIVIANO)
 # =========================================================
 _rate_lock = Lock()
 _last_fetch = 0.0
-_min_interval = 0.2   # ⬅ Más realista para Yahoo
+_min_interval = 0.05   # ⬅ antes 0.2 (muy lento)
 
 def _rate_limit():
     global _last_fetch
@@ -57,21 +56,8 @@ def _rate_limit():
         _last_fetch = time.time()
 
 # =========================================================
-# UNIVERSO
+# UNIVERSO (LOCAL PRIMARIO)
 # =========================================================
-def _get_sp500_yahoo() -> List[str]:
-    try:
-        table = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        )[0]
-        symbols = table["Symbol"].tolist()
-        symbols = [s.replace(".", "-") for s in symbols]
-        logger.info(f"SP500 Yahoo loaded: {len(symbols)}")
-        return symbols
-    except Exception as e:
-        logger.warning(f"SP500 Yahoo failed: {e}")
-        return []
-
 def _get_sp500_local() -> List[str]:
     if not LOCAL_SP500_FILE.exists():
         logger.warning("Local SP500 JSON not found")
@@ -82,21 +68,22 @@ def _get_sp500_local() -> List[str]:
             symbols = json.load(f)
         logger.info(f"SP500 local loaded: {len(symbols)}")
         return symbols
-    except Exception:
+    except Exception as e:
+        logger.warning(f"SP500 local read failed: {e}")
         return []
 
 def _discover_universe() -> List[str]:
-    logger.info("🔍 Discovering universe...")
+    logger.info("🔍 Discovering universe (LOCAL)...")
 
-    symbols = _get_sp500_yahoo()
+    symbols = _get_sp500_local()
 
     if not symbols:
-        symbols = _get_sp500_local()
+        logger.warning("⚠️ No SP500 symbols available")
+        return []
 
     symbols = sorted(set(symbols))[:MAX_UNIVERSE]
 
     logger.info(f"📊 Universe final size: {len(symbols)}")
-
     return symbols
 
 # =========================================================
@@ -125,7 +112,7 @@ def _validate_arrays(closes, volumes):
     return True
 
 # =========================================================
-# FETCH DATA (SOLO YAHOO ESTABLE)
+# FETCH DATA (YAHOO OPTIMIZADO)
 # =========================================================
 def _fetch_from_yahoo(symbol):
 
@@ -141,17 +128,15 @@ def _fetch_from_yahoo(symbol):
         )
 
         if df is None or df.empty:
-            logger.debug(f"Yahoo empty: {symbol}")
             return None
 
         return df["Close"].values, df["Volume"].values
 
-    except Exception as e:
-        logger.debug(f"Yahoo error {symbol}: {e}")
+    except Exception:
         return None
 
 # =========================================================
-# PUBLIC API
+# PUBLIC API (NO CAMBIA CONTRATO)
 # =========================================================
 def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
 
@@ -187,7 +172,7 @@ def fetch_multiple_symbols(
 
     workers = max_concurrent or MAX_CONCURRENT
 
-    logger.info(f"Fetching data for {len(symbols)} symbols")
+    logger.info(f"Fetching data for {len(symbols)} symbols (workers={workers})")
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(fetch_symbol_data, symbols))
