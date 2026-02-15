@@ -74,11 +74,10 @@ _cache_lock = Lock()
 # =====================================================
 # Utils
 # =====================================================
-def load_json(path: str | Path) -> Dict[str, Any]:
+def load_json(path: str | Path):
     try:
         with open(path, "r") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
+            return json.load(f)
     except Exception:
         return {}
 
