@@ -43,12 +43,9 @@ from capital_governor import CapitalGovernor
 # =========================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)-7s] 🧭 %(message)s",
-    handlers=[
-        logging.FileHandler("/var/log/trading_orchestrator.log"),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s [%(levelname)-7s] 🧭 %(message)s"
 )
+
 logger = logging.getLogger("trading_orchestrator")
 
 # =========================================================
