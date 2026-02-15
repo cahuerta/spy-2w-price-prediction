@@ -269,12 +269,37 @@ def _run_full_math_engine(
 
     y_ens = w * y_knn + (1 - w) * y_global
 
+    # ======================================================
+    # THETA DINÁMICO (NO rompe contrato externo)
+    # ======================================================
+
+    # 1️⃣ Volatilidad reciente REAL (60 días)
+    recent_vol = float(feat["rv_60"].iloc[-1])
+
+    if not np.isfinite(recent_vol) or recent_vol <= 0:
+        recent_vol = 0.02  # fallback técnico mínimo seguro
+
+    # 2️⃣ Calidad histórica del modelo
+    hit_rate = hist.hit_rate_mean if hist.hit_rate_mean is not None else 0.5
+
+    # 3️⃣ Ajuste dinámico
+    # Base: theta original (ej 0.75%)
+    base_theta = theta
+
+    # Vol alta → exige más convicción
+    vol_adjustment = np.clip(recent_vol * 50, 0.5, 2.0)
+
+    # Modelo bueno → permite menor theta
+    quality_adjustment = np.clip(1.0 - (hit_rate - 0.5), 0.8, 1.2)
+
+    theta_dynamic = base_theta * vol_adjustment * quality_adjustment
+
     price_now = float(last_row["Close"])
     price_pred = float(price_now * np.exp(y_ens))
 
     recommendation = (
-        "COMPRA" if y_ens * 100 >= theta else
-        "VENDE" if y_ens * 100 <= -theta else
+        "COMPRA" if y_ens * 100 >= theta_dynamic else
+        "VENDE" if y_ens * 100 <= -theta_dynamic else
         "MANTÉN"
     )
 
