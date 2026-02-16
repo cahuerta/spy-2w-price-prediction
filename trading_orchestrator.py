@@ -25,7 +25,7 @@ from pm_neutral import PMNeutral
 from pm_defensive import PMDefensive
 
 # 🆕 ALPHA ENGINE
-from alpha_engine_v4 import compute_batch
+from alpha_engine_v4 import compute_and_persist_alpha
 
 
 logging.basicConfig(
@@ -104,10 +104,12 @@ class TradingOrchestrator:
 
             if universe:
                 logger.info("🧠 Calculando AlphaEngine...")
-                alpha_results = await asyncio.to_thread(
-                    compute_batch,
-                    universe
-                )
+                payload = await asyncio.to_thread(
+    compute_and_persist_alpha,
+    universe
+)
+
+alpha_results = payload["results"]
 
                 alpha_filtered = {
                     t: a for t, a in alpha_results.items()
