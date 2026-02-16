@@ -214,7 +214,7 @@ class TradingOrchestrator:
                     logger.info(
                         f"🧠 Alpha OK {ticker} | "
                         f"{alpha_info['alpha_score']} "
-                        f"{alpha_info['quality']}"
+                        
                     )
 
                 logger.info(
