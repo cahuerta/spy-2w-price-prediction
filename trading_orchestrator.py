@@ -29,7 +29,6 @@ from pm_defensive import PMDefensive
 # 🆕 ALPHA ENGINE
 from alpha_engine_v4 import compute_and_persist_alpha
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)-7s] 🧭 %(message)s"
@@ -102,6 +101,7 @@ class TradingOrchestrator:
             # =====================================================
             # 2️⃣ ALPHA ENGINE (PRE-FILTER)
             # =====================================================
+
             DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
             TICKERS_FILE = DATA_PATH / "tickers.json"
 
@@ -128,8 +128,32 @@ class TradingOrchestrator:
                     f"⭐ {len(alpha_filtered)} tickers superan alpha "
                     f"{self._alpha_threshold}"
                 )
+
             else:
                 logger.warning("⚠️ tickers.json vacío o inexistente")
+                alpha_filtered = {}
+
+            # --- BLOQUE DUPLICADO (lo mantengo igual como pediste) ---
+            if universe:
+                logger.info("🧠 Calculando AlphaEngine...")
+                payload = await asyncio.to_thread(
+                    compute_and_persist_alpha,
+                    universe
+                )
+
+                alpha_results = payload["results"]
+
+                alpha_filtered = {
+                    t: a for t, a in alpha_results.items()
+                    if a and a["alpha_score"] >= self._alpha_threshold
+                }
+
+                logger.info(
+                    f"⭐ {len(alpha_filtered)} tickers superan alpha "
+                    f"{self._alpha_threshold}"
+                )
+            else:
+                logger.warning("⚠️ Universe vacío en market_ctx")
                 alpha_filtered = {}
 
             # =====================================================
@@ -185,7 +209,6 @@ class TradingOrchestrator:
                 decisions = self._run_defensive(
                     pm, positions, anchor_universe or []
                 )
-
             else:
                 raise ValueError(f"❌ market_mode desconocido: {mode}")
 
@@ -220,7 +243,7 @@ class TradingOrchestrator:
 
                     logger.info(
                         f"🧠 Alpha OK {ticker} | "
-                        f"{alpha_info['alpha_score']}"
+                        f"{alpha_info['alpha_score']} "
                     )
 
                 logger.info(
@@ -272,7 +295,6 @@ class TradingOrchestrator:
     # =====================================================
     # PM WRAPPERS
     # =====================================================
-
     def _run_growth(self, pm: PMGrowth, positions, signals):
         out = []
         for pos in positions:
@@ -292,7 +314,6 @@ class TradingOrchestrator:
     # =====================================================
     # EXECUTION
     # =====================================================
-
     async def _execute_and_persist(
         self,
         decision: Dict[str, Any],
@@ -350,4 +371,4 @@ class TradingOrchestrator:
         return {
             "decision": decision,
             "result": result.model_dump(),
-        }
+    }
