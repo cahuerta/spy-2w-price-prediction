@@ -105,11 +105,11 @@ class TradingOrchestrator:
             if universe:
                 logger.info("🧠 Calculando AlphaEngine...")
                 payload = await asyncio.to_thread(
-    compute_and_persist_alpha,
-    universe
-)
+                    compute_and_persist_alpha,
+                    universe
+                )
 
-alpha_results = payload["results"]
+                alpha_results = payload["results"]
 
                 alpha_filtered = {
                     t: a for t, a in alpha_results.items()
