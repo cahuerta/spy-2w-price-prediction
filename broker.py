@@ -18,6 +18,7 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
+from fastapi import Header
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, validator
@@ -48,6 +49,7 @@ DATA_PATH = os.getenv("DATA_PATH", "/data")
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+BROKER_EXECUTION_KEY = os.getenv("BROKER_EXECUTION_KEY")
 
 TRADES_DIR = Path(DATA_PATH) / "trades"
 TRADES_DIR.mkdir(parents=True, exist_ok=True)
@@ -312,7 +314,16 @@ def get_trading_engine() -> TradingEngine:
 # =========================================================
 @router.post("/execute", response_model=TradeResultModel)
 @rate_limit(30)
-async def execute_trade(decision: DecisionInput):
+async def execute_trade(
+    decision: DecisionInput,
+    x_api_key: str = Header(None)
+):
+    if not BROKER_EXECUTION_KEY:
+        raise HTTPException(status_code=500, detail="Broker key not configured")
+
+    if x_api_key != BROKER_EXECUTION_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     engine = get_trading_engine()
     return await engine.execute_decision(decision.model_dump())
 
