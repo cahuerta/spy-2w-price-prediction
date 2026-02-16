@@ -1,15 +1,20 @@
 # =========================================================
-# alpha_engine_v4.py — PRODUCTION ALPHA ENGINE
+# alpha_engine_v4.py — PRODUCTION ALPHA ENGINE (ADAPTIVE)
 # =========================================================
 # ✔ Lee JSON si existen (model / signals ya lo hacen)
 # ✔ Si no existen → calcula
 # ✔ Si no puede calcular → descarta
 # ✔ Totalmente desacoplado del orchestrator
 # ✔ Sin dependencias inventadas
+# ✔ NUEVO: Adaptativo según performance real (evaluator)
 # =========================================================
 
 import os
+import json
 from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -24,7 +29,6 @@ DATA_PATH = os.getenv("DATA_PATH", "/data")
 
 # =========================================================
 # ================== STRUCTURAL ENGINE ====================
-# (Tu compute_score real integrado aquí)
 # =========================================================
 
 def pct_returns(prices: np.ndarray) -> np.ndarray:
@@ -91,7 +95,6 @@ def compute_score(
         return None
 
     volatility = float(np.std(returns))
-
     trend = float((closes[-1] / closes[0]) - 1)
     trend_score = float(np.clip(trend / 0.20, 0, 1))
 
@@ -138,6 +141,48 @@ def compute_score(
 
 
 # =========================================================
+# ================= ADAPTIVE PERFORMANCE ==================
+# =========================================================
+
+def compute_performance_multiplier(ticker: str, days: int = 60) -> float:
+
+    eval_dir = Path(DATA_PATH) / "evaluations" / ticker
+    if not eval_dir.exists():
+        return 1.0
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    hits = []
+    errors = []
+
+    for f in eval_dir.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+            dt = datetime.fromisoformat(d["evaluated_at"])
+            if dt < cutoff:
+                continue
+
+            hits.append(1 if d.get("decision_correct") else 0)
+            errors.append(abs(d.get("error_return_pct", 0)))
+
+        except Exception:
+            continue
+
+    if len(hits) < 5:
+        return 1.0
+
+    hit_rate = sum(hits) / len(hits)
+    avg_error = sum(errors) / len(errors)
+
+    hit_component = np.clip((hit_rate - 0.5) / 0.25, -1, 1)
+    error_component = np.clip(1 - avg_error / 10.0, 0, 1)
+
+    multiplier = 1 + 0.4 * hit_component + 0.2 * (error_component - 0.5)
+
+    return float(np.clip(multiplier, 0.6, 1.4))
+
+
+# =========================================================
 # ===================== ALPHA CORE ========================
 # =========================================================
 
@@ -165,10 +210,6 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
 
     try:
         model_result = run_model(ticker=ticker, horizon=horizon)
-    except Exception:
-        return None
-
-    try:
         ret_pct = model_result["prediction"]["ret_ens_pct"]
         hit_rate = model_result["historical"]["hit_rate_mean"]
         n_windows = model_result["historical"]["n_windows"]
@@ -214,6 +255,12 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
 
     alpha = clip01(alpha)
 
+    # =============================
+    # ADAPTIVE MULTIPLIER
+    # =============================
+    performance_multiplier = compute_performance_multiplier(ticker)
+    alpha = clip01(alpha * performance_multiplier)
+
     return {
         "ticker": ticker,
         "alpha_score": round(alpha, 3),
@@ -222,6 +269,7 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
         "structural_score": structural_score,
         "hit_rate": hit_rate,
         "walkforward_windows": n_windows,
+        "performance_multiplier": round(performance_multiplier, 3),
     }
 
 
@@ -233,22 +281,15 @@ def compute_batch(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
             results[ticker] = r
     return results
 
+
 # =========================================================
 # ================== PERSISTENCE LAYER ====================
 # =========================================================
-
-import json
-from datetime import datetime
-from pathlib import Path
 
 ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
 
 
 def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
-    """
-    Calcula alpha para el universo recibido
-    y guarda el resultado en disco.
-    """
 
     results = compute_batch(tickers)
 
