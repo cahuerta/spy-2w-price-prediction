@@ -53,40 +53,59 @@ def load_universe() -> List[str]:
 
 
 # =========================================================
-# GET /alpha
+# alpha_router.py — ALPHA SNAPSHOT API
+# =========================================================
+
+import os
+import json
+from pathlib import Path
+from typing import Dict
+
+from fastapi import APIRouter, HTTPException
+
+from alpha_engine_v4 import compute_and_persist_alpha
+
+
+router = APIRouter()
+
+DATA_PATH = os.getenv("DATA_PATH", "/data")
+ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
+TICKERS_FILE = Path(DATA_PATH) / "tickers.json"
+
+
+# =========================================================
+# GET /alpha  (solo lectura snapshot)
 # =========================================================
 @router.get("/alpha")
-def get_alpha_universe() -> Dict:
+def get_alpha_snapshot() -> Dict:
 
-    universe = load_universe()
+    if not ALPHA_FILE.exists():
+        return {
+            "status": "no_alpha_calculated"
+        }
+
+    return json.loads(ALPHA_FILE.read_text())
+
+
+# =========================================================
+# POST /internal/alpha/recompute
+# (Protegido si quieres)
+# =========================================================
+@router.post("/internal/alpha/recompute")
+def recompute_alpha() -> Dict:
+
+    if not TICKERS_FILE.exists():
+        raise HTTPException(400, "tickers.json not found")
+
+    universe = json.loads(TICKERS_FILE.read_text())
 
     if not universe:
-        return {
-            "status": "error",
-            "reason": "tickers.json not found or empty",
-        }
+        raise HTTPException(400, "tickers.json vacío")
 
-    results = compute_batch(universe)
-
-    if not results:
-        return {
-            "status": "error",
-            "reason": "no alpha calculable",
-            "universe_size": len(universe),
-        }
-
-    # Ordenado por alpha desc
-    ranked = dict(
-        sorted(
-            results.items(),
-            key=lambda x: x[1]["alpha_score"],
-            reverse=True
-        )
-    )
+    payload = compute_and_persist_alpha(universe)
 
     return {
-        "status": "ok",
-        "universe_size": len(universe),
-        "calculated": len(ranked),
-        "results": ranked,
+        "status": "recomputed",
+        "calculated": payload["calculated"],
+        "timestamp": payload["timestamp"],
     }
