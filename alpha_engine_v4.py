@@ -232,3 +232,42 @@ def compute_batch(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
         if r:
             results[ticker] = r
     return results
+
+# =========================================================
+# ================== PERSISTENCE LAYER ====================
+# =========================================================
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
+
+
+def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
+    """
+    Calcula alpha para el universo recibido
+    y guarda el resultado en disco.
+    """
+
+    results = compute_batch(tickers)
+
+    ranked = dict(
+        sorted(
+            results.items(),
+            key=lambda x: x[1]["alpha_score"],
+            reverse=True
+        )
+    )
+
+    payload = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "universe_size": len(tickers),
+        "calculated": len(ranked),
+        "results": ranked
+    }
+
+    ALPHA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ALPHA_FILE.write_text(json.dumps(payload, indent=2))
+
+    return payload
