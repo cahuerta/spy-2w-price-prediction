@@ -133,28 +133,7 @@ class TradingOrchestrator:
                 logger.warning("⚠️ tickers.json vacío o inexistente")
                 alpha_filtered = {}
 
-            # --- BLOQUE DUPLICADO (lo mantengo igual como pediste) ---
-            if universe:
-                logger.info("🧠 Calculando AlphaEngine...")
-                payload = await asyncio.to_thread(
-                    compute_and_persist_alpha,
-                    universe
-                )
-
-                alpha_results = payload["results"]
-
-                alpha_filtered = {
-                    t: a for t, a in alpha_results.items()
-                    if a and a["alpha_score"] >= self._alpha_threshold
-                }
-
-                logger.info(
-                    f"⭐ {len(alpha_filtered)} tickers superan alpha "
-                    f"{self._alpha_threshold}"
-                )
-            else:
-                logger.warning("⚠️ Universe vacío en market_ctx")
-                alpha_filtered = {}
+            
 
             # =====================================================
             # 3️⃣ CAPITAL GOVERNOR
