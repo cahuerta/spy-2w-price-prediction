@@ -59,3 +59,21 @@ def recompute_alpha() -> Dict:
         "calculated": payload["calculated"],
         "timestamp": payload["timestamp"],
     }
+# =========================================================
+# GET /alpha/test/{ticker}
+# DEBUG endpoint (no afecta producción)
+# =========================================================
+from alpha_engine_v4 import compute_alpha_for_ticker
+
+@router.get("/alpha/test/{ticker}")
+def test_alpha_ticker(ticker: str) -> Dict:
+
+    result = compute_alpha_for_ticker(ticker.upper())
+
+    if not result:
+        return {
+            "ticker": ticker.upper(),
+            "status": "alpha_returned_none"
+        }
+
+    return result
