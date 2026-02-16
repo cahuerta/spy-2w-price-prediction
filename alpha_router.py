@@ -77,3 +77,10 @@ def test_alpha_ticker(ticker: str) -> Dict:
         }
 
     return result
+@router.get("/alpha/debug/history/{ticker}")
+def debug_history(ticker: str):
+    from data_provider import get_price_history
+    raw = get_price_history(ticker, period="1y", interval="1d")
+    if raw is None:
+        return {"status": "raw_none"}
+    return {"rows": len(raw)}
