@@ -120,8 +120,12 @@ class TradingOrchestrator:
             # ==================================================
             # 2️⃣ CAPITAL GOVERNOR (IGUAL)
             # ==================================================
-            governor = CapitalGovernor()
-            capital_state = governor.evaluate(positions)
+            if positions:
+    governor = CapitalGovernor()
+    capital_state = governor.evaluate(positions)
+else:
+    logger.info("📭 Portfolio vacío → riesgo inicial neutral")
+    capital_state = None
 
             logger.info(
                 f"🏛 RISK | Vol={capital_state.volatility_annual:.2%} | "
@@ -143,7 +147,7 @@ class TradingOrchestrator:
                 logger.warning("🛑 Beta alto en DEFENSIVE → bloqueando aperturas")
                 signals = {}
 
-            if capital_state.volatility_annual > 0.60:
+            if capital_state.volatility_annual > 0.45:
                 logger.warning("🛑 Volatilidad extrema → bloqueando nuevas posiciones")
                 signals = {}
 
