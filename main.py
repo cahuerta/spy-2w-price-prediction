@@ -199,7 +199,53 @@ async def trading_run(request: Request):
         "result": result,
         "timestamp": datetime.utcnow().isoformat(),
     }
+# =========================================================
+# INTERNAL INSPECTION (para frontend / debug)
+# =========================================================
 
+@app.get("/internal/pipeline-last")
+async def internal_pipeline_last(request: Request):
+    # Protegido con PIPELINE_KEY
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    # last_pipeline.json
+    return load_json(PIPELINE_AUDIT_FILE, {})
+
+
+@app.get("/internal/trades-today")
+async def internal_trades_today(request: Request):
+    # Protegido con PIPELINE_KEY
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    fp = DATA_PATH / "trades" / f"trades_{today}.jsonl"
+
+    if not fp.exists():
+        return []
+
+    out = []
+    for line in fp.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            # si hay una línea corrupta, la ignoramos
+            continue
+    return out
+
+
+@app.get("/internal/positions")
+async def internal_positions(request: Request):
+    # Protegido con PIPELINE_KEY
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    from portfolio_store import load_positions
+    return load_positions()
 # =========================================================
 # HEALTH
 # =========================================================
