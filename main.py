@@ -260,7 +260,12 @@ def root():
         "service": "spy-2w-price-prediction",
         "env": "production"
     }
+@app.get("/internal/pipeline/last")
+async def get_last_pipeline():
+    if not PIPELINE_AUDIT_FILE.exists():
+        return {"status": "no_pipeline_executed"}
 
+    return load_json(PIPELINE_AUDIT_FILE, {})
 # =========================================================
 # SHUTDOWN
 # =========================================================
