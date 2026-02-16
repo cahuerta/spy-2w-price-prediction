@@ -1,11 +1,10 @@
 # =========================================================
 # pipeline_router.py — PIPELINE ROUTER (PRODUCCIÓN)
 # =========================================================
-# ✔ Vive dentro de Main (FastAPI)
-# ✔ Ejecuta pipeline completo vía HTTP
-# ✔ Permisos de escritura heredados de Main
-# ✔ Orden EXACTO del pipeline_daily.py
-# ✔ Un solo punto de activación (cron → HTTP)
+# ✔ Responde inmediato al cron
+# ✔ Ejecuta pipeline en background
+# ✔ NO rompe lógica existente
+# ✔ Trading intacto
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -14,6 +13,7 @@ import logging
 import traceback
 import os
 import httpx
+import asyncio
 
 # =========================
 # IMPORTS — CAPAS REALES
@@ -34,20 +34,15 @@ from trading_orchestrator import TradingOrchestrator
 router = APIRouter()
 logger = logging.getLogger("pipeline")
 
-# =========================
-# PIPELINE ENDPOINT
-# =========================
-@router.post("/internal/pipeline/run")
-async def run_pipeline(request: Request):
-    """
-    Ejecuta el pipeline completo.
-    Cron llama a ESTE endpoint.
-    Main es el dueño de permisos y disco.
-    """
+
+# =========================================================
+# BACKGROUND PIPELINE LOGIC
+# =========================================================
+async def _run_pipeline_logic(request: Request):
 
     start_ts = datetime.utcnow().isoformat()
     logger.info("=" * 60)
-    logger.info(f"🚀 PIPELINE START (HTTP) | {start_ts}")
+    logger.info(f"🚀 PIPELINE START (BG) | {start_ts}")
     logger.info("=" * 60)
 
     try:
@@ -78,21 +73,21 @@ async def run_pipeline(request: Request):
         logger.info("✅ Model runner OK")
 
         # -------------------------------------------------
-        # 4️⃣ EVALUATOR (SIDE-EFFECT ONLY)
+        # 4️⃣ EVALUATOR
         # -------------------------------------------------
-        logger.info("📊 [4/8] Evaluator (background only)...")
+        logger.info("📊 [4/8] Evaluator...")
         evaluate_all()
-        logger.info("ℹ️ Evaluator executed (no downstream dependency)")
+        logger.info("ℹ️ Evaluator executed")
 
         # -------------------------------------------------
-        # 5️⃣ MARKET QUANT (AUTÓNOMO)
+        # 5️⃣ MARKET QUANT
         # -------------------------------------------------
         logger.info("📉 [5/8] Market quantitative context...")
         quant_ctx = run_market_state()
         logger.info(f"✅ Market quant OK | regime={quant_ctx.regime}")
 
         # -------------------------------------------------
-        # 6️⃣ MARKET QUALITATIVE (IA)
+        # 6️⃣ MARKET QUALITATIVE
         # -------------------------------------------------
         logger.info("🧠 [6/8] Market qualitative context...")
         qual_ctx = evaluate_qualitative_market(
@@ -132,13 +127,11 @@ async def run_pipeline(request: Request):
             f"✅ Trading OK | mode={trade_out.get('mode')} "
             f"| decisions={len(trade_out.get('decisions', []))}"
         )
+
         # -------------------------------------------------
-        # 9️⃣ COMMIT A DISCO (FUENTE ÚNICA)
+        # 9️⃣ COMMIT A DISCO
         # -------------------------------------------------
         logger.info("💾 [9/9] Committing pipeline results...")
-
-        import os
-        import httpx
 
         PIPELINE_KEY = os.getenv("PIPELINE_KEY")
         BASE_URL = str(request.base_url).rstrip("/")
@@ -169,33 +162,32 @@ async def run_pipeline(request: Request):
 
         logger.info("✅ Pipeline committed to disk")
 
-        # -------------------------------------------------
-        # RESPONSE
-        # -------------------------------------------------
-        return {
-            "status": "ok",
-            "timestamp": datetime.utcnow().isoformat(),
-            "market_mode": market_ctx.market_mode,
-            "confidence": market_ctx.confidence,
-            "decisions": len(trade_out.get("decisions", [])),
-        }
-
     except Exception as e:
         logger.error("❌ PIPELINE FAILED")
         logger.error(str(e))
         traceback.print_exc()
 
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "status": "error",
-                "error": str(e),
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-        )
-
     finally:
         end_ts = datetime.utcnow().isoformat()
         logger.info("=" * 60)
-        logger.info(f"🏁 PIPELINE END | {end_ts}")
+        logger.info(f"🏁 PIPELINE END (BG) | {end_ts}")
         logger.info("=" * 60)
+
+
+# =========================================================
+# PIPELINE ENDPOINT (RESPUESTA INMEDIATA)
+# =========================================================
+@router.post("/internal/pipeline/run")
+async def run_pipeline(request: Request):
+
+    if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
+        raise HTTPException(403, "Invalid pipeline key")
+
+    # Lanza pipeline en background
+    asyncio.create_task(_run_pipeline_logic(request))
+
+    # Responde inmediato al cron
+    return {
+        "status": "accepted",
+        "timestamp": datetime.utcnow().isoformat()
+        }
