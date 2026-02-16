@@ -32,6 +32,7 @@ from trading_orchestrator import TradingOrchestrator
 from debug_data_router import router as debug_router
 from admin_tickers_router import router as admin_router
 from broker import router as trading_router
+from alpha_router import router as alpha_router
 
 # =========================================================
 # CONFIG
@@ -155,6 +156,7 @@ app.include_router(signals_router)
 app.include_router(debug_router)
 app.include_router(admin_router)
 app.include_router(trading_router)
+app.include_router(alpha_router)
 
 # =========================================================
 # PIPELINE COMMIT
