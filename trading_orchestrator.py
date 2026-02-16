@@ -1,5 +1,5 @@
 # =========================================================
-# trading_orchestrator.py — V2.1 CRON_DAILY PRODUCTION
+# trading_orchestrator.py — V2.2 CRON_DAILY + ALPHA FILTER
 # =========================================================
 
 import logging
@@ -18,12 +18,14 @@ from portfolio_store import (
 )
 
 from broker import get_trading_engine
+from capital_governor import CapitalGovernor
 
 from pm_growth import PMGrowth
 from pm_neutral import PMNeutral
 from pm_defensive import PMDefensive
 
-from capital_governor import CapitalGovernor
+# 🆕 ALPHA ENGINE
+from alpha_engine_v4 import compute_batch
 
 
 logging.basicConfig(
@@ -40,9 +42,14 @@ class TradingOrchestrator:
         self.broker = get_trading_engine()
         self._last_run_file = Path("/tmp/trading_last_run.flag")
         self._daily_limit = int(os.getenv("MAX_ORDERS_DAY", "10"))
+        self._alpha_threshold = float(os.getenv("ALPHA_THRESHOLD", "0.70"))
         self._executed_today = 0
-        logger.info("🧭 TradingOrchestrator V2.1 CRON_DAILY iniciado")
 
+        logger.info("🧭 TradingOrchestrator V2.2 ALPHA integrado iniciado")
+
+    # =====================================================
+    # DAILY CHECK
+    # =====================================================
     def _check_daily_run(self) -> bool:
         now = datetime.utcnow()
 
@@ -59,6 +66,9 @@ class TradingOrchestrator:
 
         return True
 
+    # =====================================================
+    # MAIN RUN
+    # =====================================================
     async def run(
         self,
         market_ctx: Dict[str, Any],
@@ -77,15 +87,44 @@ class TradingOrchestrator:
             raise ValueError("❌ market_ctx inválido")
 
         mode = market_ctx["market_mode"]
-        logger.info(f"🚦 MARKET MODE = {mode.upper()} | Ejecutando cron diario")
+        logger.info(f"🚦 MARKET MODE = {mode.upper()}")
 
         try:
 
-            # 1️⃣ LOAD PORTFOLIO
+            # =====================================================
+            # 1️⃣ PORTFOLIO
+            # =====================================================
             positions = load_positions()
             logger.info(f"📊 Portfolio: {len(positions)} posiciones")
 
-            # 2️⃣ CAPITAL GOVERNOR (FIX ARRANQUE VACÍO)
+            # =====================================================
+            # 2️⃣ ALPHA ENGINE (PRE-FILTER)
+            # =====================================================
+            universe = market_ctx.get("universe", [])
+
+            if universe:
+                logger.info("🧠 Calculando AlphaEngine...")
+                alpha_results = await asyncio.to_thread(
+                    compute_batch,
+                    universe
+                )
+
+                alpha_filtered = {
+                    t: a for t, a in alpha_results.items()
+                    if a and a["alpha_score"] >= self._alpha_threshold
+                }
+
+                logger.info(
+                    f"⭐ {len(alpha_filtered)} tickers superan alpha "
+                    f"{self._alpha_threshold}"
+                )
+            else:
+                logger.warning("⚠️ Universe vacío en market_ctx")
+                alpha_filtered = {}
+
+            # =====================================================
+            # 3️⃣ CAPITAL GOVERNOR
+            # =====================================================
             if positions:
                 governor = CapitalGovernor()
                 capital_state = governor.evaluate(positions)
@@ -97,26 +136,30 @@ class TradingOrchestrator:
                     f"Beta={capital_state.beta_vs_spy:.2f}"
                 )
             else:
-                logger.info("📭 Portfolio vacío → riesgo inicial neutral")
                 capital_state = None
+                logger.info("📭 Portfolio vacío → riesgo neutral")
 
-            # 3️⃣ HARD RISK CONTROLS
+            # =====================================================
+            # 4️⃣ HARD RISK CONTROLS
+            # =====================================================
             signals = signals or {}
 
             if capital_state:
                 if capital_state.expected_shortfall_95_annual > 0.45:
-                    logger.warning("🛑 Expected Shortfall crítico → solo CIERRES")
+                    logger.warning("🛑 ES crítico → solo CIERRES")
                     signals = {}
 
                 if mode == "defensive" and capital_state.beta_vs_spy > 1.20:
-                    logger.warning("🛑 Beta alto en DEFENSIVE → bloqueando aperturas")
+                    logger.warning("🛑 Beta alto DEFENSIVE → bloqueando OPEN")
                     signals = {}
 
                 if capital_state.volatility_annual > 0.45:
-                    logger.warning("🛑 Volatilidad extrema → bloqueando nuevas posiciones")
+                    logger.warning("🛑 Vol extrema → bloqueando OPEN")
                     signals = {}
 
-            # 4️⃣ PM SEGÚN REGIME
+            # =====================================================
+            # 5️⃣ PM SEGÚN REGIME
+            # =====================================================
             decisions: List[Dict[str, Any]] = []
 
             if mode == "growth":
@@ -138,38 +181,59 @@ class TradingOrchestrator:
 
             logger.info(f"🤖 PM generó {len(decisions)} decisiones")
 
-            # 5️⃣ EJECUCIÓN
+            # =====================================================
+            # 6️⃣ EJECUCIÓN CON FILTRO ALPHA
+            # =====================================================
             executed = []
 
             for i, decision in enumerate(decisions[:self._daily_limit]):
 
-                if signals == {} and decision.get("action") == "OPEN":
-                    logger.info(f"⛔ OPEN bloqueado: {decision.get('ticker')}")
-                    executed.append({
-                        "decision": decision,
-                        "result": {
-                            "status": "blocked_risk",
-                            "reason": "high_risk_mode",
-                        }
-                    })
-                    continue
+                ticker = decision.get("ticker")
+                action = decision.get("action")
+
+                # 🔥 ALPHA FILTER SOLO PARA OPEN
+                if action == "OPEN":
+
+                    alpha_info = alpha_filtered.get(ticker)
+
+                    if not alpha_info:
+                        logger.info(
+                            f"⛔ OPEN bloqueado por Alpha: {ticker}"
+                        )
+                        executed.append({
+                            "decision": decision,
+                            "result": {
+                                "status": "blocked_alpha",
+                                "reason": "alpha_below_threshold"
+                            }
+                        })
+                        continue
+
+                    logger.info(
+                        f"🧠 Alpha OK {ticker} | "
+                        f"{alpha_info['alpha_score']} "
+                        f"{alpha_info['quality']}"
+                    )
 
                 logger.info(
                     f"▶️ [{i+1}/{min(len(decisions), self._daily_limit)}] "
-                    f"{decision.get('action')} {decision.get('ticker')}"
+                    f"{action} {ticker}"
                 )
 
                 result = await self._execute_and_persist(
-                    decision, market_ctx
+                    decision,
+                    market_ctx
                 )
 
                 executed.append(result)
-                self._executed_today += 1
+
+                if result["result"]["status"] == "executed":
+                    self._executed_today += 1
+
                 await asyncio.sleep(1.0)
 
             summary = portfolio_summary()
 
-            # 6️⃣ FLAG
             self._last_run_file.write_text(
                 datetime.utcnow().isoformat()
             )
@@ -190,14 +254,16 @@ class TradingOrchestrator:
             }
 
         except Exception as e:
-            logger.error(f"💥 Orquestador falló: {e}", exc_info=True)
+            logger.error("💥 Orquestador falló", exc_info=True)
             return {
                 "status": "error",
                 "error": str(e),
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
-    # --------------------------------------------------
+    # =====================================================
+    # PM WRAPPERS
+    # =====================================================
 
     def _run_growth(self, pm: PMGrowth, positions, signals):
         out = []
@@ -215,7 +281,9 @@ class TradingOrchestrator:
         decisions = pm.evaluate_portfolio(positions, anchor_universe)
         return [{**d.to_dict(), "pm": "PMDEFENSIVE"} for d in decisions]
 
-    # --------------------------------------------------
+    # =====================================================
+    # EXECUTION
+    # =====================================================
 
     async def _execute_and_persist(
         self,
@@ -226,27 +294,16 @@ class TradingOrchestrator:
         action = decision.get("action")
         ticker = decision.get("ticker")
 
-        client_order_id = (
+        decision["client_order_id"] = (
             f"{action}_{ticker}_{int(datetime.utcnow().timestamp())}"
         )
-        decision["client_order_id"] = client_order_id
 
         try:
             result = await asyncio.wait_for(
                 self.broker.execute_decision(decision),
                 timeout=60.0
             )
-        except asyncio.TimeoutError:
-            logger.error(f"⏰ Timeout 60s: {ticker}")
-            return {
-                "decision": decision,
-                "result": {
-                    "status": "timeout",
-                    "reason": "execution_timeout_60s"
-                }
-            }
         except Exception as e:
-            logger.error(f"❌ Broker error {ticker}: {e}")
             return {
                 "decision": decision,
                 "result": {
@@ -256,7 +313,6 @@ class TradingOrchestrator:
             }
 
         if result.status != "executed":
-            logger.warning(f"⛔ Broker rechazó: {result.reason}")
             return {
                 "decision": decision,
                 "result": result.model_dump()
