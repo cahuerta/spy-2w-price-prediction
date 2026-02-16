@@ -1,4 +1,3 @@
-# =========================================================
 # alpha_engine_v4.py — PRODUCTION ALPHA ENGINE (ADAPTIVE)
 # =========================================================
 # ✔ Lee JSON si existen (model / signals ya lo hacen)
