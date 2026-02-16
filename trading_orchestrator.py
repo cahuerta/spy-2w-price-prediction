@@ -100,9 +100,9 @@ class TradingOrchestrator:
             logger.info(f"📊 Portfolio: {len(positions)} posiciones")
 
             # =====================================================
-            # 2️⃣ ALPHA ENGINE (PRE-FILTER)
-            # =====================================================
-            
+# 2️⃣ ALPHA ENGINE (PRE-FILTER)
+# =====================================================
+
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 TICKERS_FILE = DATA_PATH / "tickers.json"
 
@@ -113,6 +113,7 @@ else:
 
 if universe:
     logger.info("🧠 Calculando AlphaEngine...")
+
     payload = await asyncio.to_thread(
         compute_and_persist_alpha,
         universe
@@ -132,27 +133,7 @@ if universe:
 else:
     logger.warning("⚠️ tickers.json vacío o inexistente")
     alpha_filtered = {}
-            if universe:
-                logger.info("🧠 Calculando AlphaEngine...")
-                payload = await asyncio.to_thread(
-                    compute_and_persist_alpha,
-                    universe
-                )
 
-                alpha_results = payload["results"]
-
-                alpha_filtered = {
-                    t: a for t, a in alpha_results.items()
-                    if a and a["alpha_score"] >= self._alpha_threshold
-                }
-
-                logger.info(
-                    f"⭐ {len(alpha_filtered)} tickers superan alpha "
-                    f"{self._alpha_threshold}"
-                )
-            else:
-                logger.warning("⚠️ Universe vacío en market_ctx")
-                alpha_filtered = {}
 
             # =====================================================
             # 3️⃣ CAPITAL GOVERNOR
