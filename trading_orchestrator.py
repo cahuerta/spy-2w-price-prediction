@@ -100,40 +100,37 @@ class TradingOrchestrator:
             logger.info(f"📊 Portfolio: {len(positions)} posiciones")
 
             # =====================================================
-# 2️⃣ ALPHA ENGINE (PRE-FILTER)
-# =====================================================
+            # 2️⃣ ALPHA ENGINE (PRE-FILTER)
+            # =====================================================
+            DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+            TICKERS_FILE = DATA_PATH / "tickers.json"
 
-DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
-TICKERS_FILE = DATA_PATH / "tickers.json"
+            if TICKERS_FILE.exists():
+                universe = json.loads(TICKERS_FILE.read_text())
+            else:
+                universe = []
 
-if TICKERS_FILE.exists():
-    universe = json.loads(TICKERS_FILE.read_text())
-else:
-    universe = []
+            if universe:
+                logger.info("🧠 Calculando AlphaEngine...")
+                payload = await asyncio.to_thread(
+                    compute_and_persist_alpha,
+                    universe
+                )
 
-if universe:
-    logger.info("🧠 Calculando AlphaEngine...")
+                alpha_results = payload["results"]
 
-    payload = await asyncio.to_thread(
-        compute_and_persist_alpha,
-        universe
-    )
+                alpha_filtered = {
+                    t: a for t, a in alpha_results.items()
+                    if a and a["alpha_score"] >= self._alpha_threshold
+                }
 
-    alpha_results = payload["results"]
-
-    alpha_filtered = {
-        t: a for t, a in alpha_results.items()
-        if a and a["alpha_score"] >= self._alpha_threshold
-    }
-
-    logger.info(
-        f"⭐ {len(alpha_filtered)} tickers superan alpha "
-        f"{self._alpha_threshold}"
-    )
-else:
-    logger.warning("⚠️ tickers.json vacío o inexistente")
-    alpha_filtered = {}
-
+                logger.info(
+                    f"⭐ {len(alpha_filtered)} tickers superan alpha "
+                    f"{self._alpha_threshold}"
+                )
+            else:
+                logger.warning("⚠️ tickers.json vacío o inexistente")
+                alpha_filtered = {}
 
             # =====================================================
             # 3️⃣ CAPITAL GOVERNOR
@@ -204,7 +201,6 @@ else:
                 ticker = decision.get("ticker")
                 action = decision.get("action")
 
-                # 🔥 ALPHA FILTER SOLO PARA OPEN
                 if action == "OPEN":
 
                     alpha_info = alpha_filtered.get(ticker)
@@ -224,8 +220,7 @@ else:
 
                     logger.info(
                         f"🧠 Alpha OK {ticker} | "
-                        f"{alpha_info['alpha_score']} "
-                        
+                        f"{alpha_info['alpha_score']}"
                     )
 
                 logger.info(
@@ -355,4 +350,4 @@ else:
         return {
             "decision": decision,
             "result": result.model_dump(),
-            }
+        }
