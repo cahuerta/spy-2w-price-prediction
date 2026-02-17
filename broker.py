@@ -140,36 +140,45 @@ def rate_limit(calls_per_min: int = 30):
 # =========================================================
 class TradingEngine:
     def __init__(self):
-        # -------------------------
-    # Account snapshot
-    # -------------------------
-    async def get_account(self):
-        """
-        Devuelve snapshot actual de la cuenta Alpaca.
-        """
-        try:
-            acc = self.client.get_account()
-            return acc
-        except Exception as e:
-            logger.error(f"Account fetch failed: {e}")
-            raise
+
         if not ALPACA_AVAILABLE:
             raise ValueError("alpaca-py no instalado")
+
         if not ALPACA_KEY or not ALPACA_SECRET:
             raise ValueError("Credenciales Alpaca faltantes")
 
-        self.client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER_TRADING)
-        self.data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+        self.client = TradingClient(
+            ALPACA_KEY,
+            ALPACA_SECRET,
+            paper=PAPER_TRADING
+        )
+
+        self.data_client = StockHistoricalDataClient(
+            ALPACA_KEY,
+            ALPACA_SECRET
+        )
 
         acc = self.client.get_account()
+
         if acc.trading_blocked:
             raise ValueError("🚫 Trading blocked en cuenta")
 
         self.equity = float(acc.equity)
+
         logger.info(
             f"🚀 Broker {'PAPER' if PAPER_TRADING else 'LIVE'} "
             f"(equity=${self.equity:.0f})"
         )
+
+    # -------------------------
+    # Account snapshot
+    # -------------------------
+    async def get_account(self):
+        try:
+            return self.client.get_account()
+        except Exception as e:
+            logger.error(f"Account fetch failed: {e}")
+            raise
 
     # -------------------------
     # Position sizing
