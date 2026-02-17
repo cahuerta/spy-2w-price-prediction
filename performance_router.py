@@ -1,5 +1,5 @@
 # =========================================================
-# performance_router.py — REAL PERFORMANCE (ALPACA)
+# performance_router.py — REAL PERFORMANCE (SAFE VERSION)
 # =========================================================
 
 import os
@@ -8,9 +8,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
-from broker import get_trading_engine  # Ya existe en tu sistema
+from broker import get_trading_engine
 
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 META_FILE = DATA_PATH / "account_meta.json"
@@ -36,19 +36,55 @@ def load_json(path: Path):
 
 
 # =========================================================
-# PERFORMANCE ENDPOINT
+# PERFORMANCE ENDPOINT (SAFE)
 # =========================================================
 
 @router.get("/performance")
 async def performance():
 
-    engine = get_trading_engine()
-    account = await engine.get_account()
+    try:
+        engine = get_trading_engine()
 
-    equity = float(account.equity)
+        if not engine:
+            return {
+                "error": "Trading engine not available",
+                "equity": None,
+                "total_return_pct": None,
+                "drawdown_pct": None,
+                "high_water_mark": None,
+                "since": None,
+            }
 
-    # Primera vez → guardar capital inicial
+        account = await engine.get_account()
+
+        if not account or not hasattr(account, "equity"):
+            return {
+                "error": "Account data unavailable",
+                "equity": None,
+                "total_return_pct": None,
+                "drawdown_pct": None,
+                "high_water_mark": None,
+                "since": None,
+            }
+
+        equity = float(account.equity)
+
+    except Exception as e:
+        return {
+            "error": f"Performance engine failure: {str(e)}",
+            "equity": None,
+            "total_return_pct": None,
+            "drawdown_pct": None,
+            "high_water_mark": None,
+            "since": None,
+        }
+
+    # =====================================================
+    # META STORAGE
+    # =====================================================
+
     meta = load_json(META_FILE)
+
     if not meta:
         meta = {
             "initial_equity": equity,
@@ -60,7 +96,7 @@ async def performance():
     initial_equity = float(meta["initial_equity"])
     high_water_mark = float(meta.get("high_water_mark", equity))
 
-    # Actualizar HWM si corresponde
+    # Update HWM
     if equity > high_water_mark:
         high_water_mark = equity
         meta["high_water_mark"] = equity
@@ -82,4 +118,5 @@ async def performance():
         "drawdown_pct": drawdown_pct,
         "high_water_mark": round(high_water_mark, 2),
         "since": meta["start_date"],
+        "error": None,
     }
