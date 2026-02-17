@@ -140,6 +140,19 @@ def rate_limit(calls_per_min: int = 30):
 # =========================================================
 class TradingEngine:
     def __init__(self):
+        # -------------------------
+    # Account snapshot
+    # -------------------------
+    async def get_account(self):
+        """
+        Devuelve snapshot actual de la cuenta Alpaca.
+        """
+        try:
+            acc = self.client.get_account()
+            return acc
+        except Exception as e:
+            logger.error(f"Account fetch failed: {e}")
+            raise
         if not ALPACA_AVAILABLE:
             raise ValueError("alpaca-py no instalado")
         if not ALPACA_KEY or not ALPACA_SECRET:
