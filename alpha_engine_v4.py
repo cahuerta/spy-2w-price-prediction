@@ -1,11 +1,10 @@
 # alpha_engine_v4.py — PRODUCTION ALPHA ENGINE (ADAPTIVE)
 # =========================================================
-# ✔ Lee JSON si existen (model / signals ya lo hacen)
-# ✔ Si no existen → calcula
+# ✔ NO borra lógica histórica (se mantiene TODO)
+# ✔ NUEVO: PRIORIZA leer JSON ya persistido en /data/predictions/{ticker}/*.json
+# ✔ Si NO existe JSON usable → recién ahí calcula (fallback legacy)
 # ✔ Si no puede calcular → descarta
 # ✔ Totalmente desacoplado del orchestrator
-# ✔ Sin dependencias inventadas
-# ✔ NUEVO: Adaptativo según performance real (evaluator)
 # =========================================================
 
 import os
@@ -205,8 +204,93 @@ def normalize_fundamental(mispricing: Optional[float]) -> float:
     return clip01(abs(mispricing) / 40.0)
 
 
-def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[str, Any]]:
+def _read_latest_prediction_json(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    Lee SOLO desde:
+      /data/predictions/{ticker}/*.json
+    Devuelve dict con ret_pct, hit_rate, n_windows si es usable.
+    """
+    pred_dir = Path(DATA_PATH) / "predictions" / ticker
+    if not pred_dir.exists():
+        return None
 
+    files = sorted(pred_dir.glob("*.json"))
+    if not files:
+        return None
+
+    try:
+        last = json.loads(files[-1].read_text())
+        prediction = last.get("prediction", {}) or {}
+        historical = last.get("historical", {}) or {}
+
+        ret_pct = prediction.get("ret_ens_pct")
+        hit_rate = historical.get("hit_rate_mean")
+        n_windows = historical.get("n_windows")
+
+        if ret_pct is None:
+            return None
+
+        return {
+            "ret_pct": ret_pct,
+            "hit_rate": hit_rate,
+            "n_windows": n_windows,
+        }
+    except Exception:
+        return None
+
+
+def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[str, Any]]:
+    """
+    ✅ NUEVO comportamiento (sin borrar nada):
+      1) Primero intenta leer JSON persistido en /data/predictions
+      2) Si no existe / no es usable → fallback legacy (calcula)
+    """
+
+    ticker = ticker.upper()
+
+    # =====================================================
+    # 1) JSON-FIRST (NO recalcula modelo)
+    # =====================================================
+    json_snapshot = _read_latest_prediction_json(ticker)
+    if json_snapshot is not None:
+        ret_pct = json_snapshot["ret_pct"]
+        hit_rate = json_snapshot.get("hit_rate")
+        n_windows = json_snapshot.get("n_windows")
+
+        # En modo JSON-only, no dependemos de signals / price_history
+        confidence = 0.5
+        structural_score = 0.5
+        fundamental_score = 0.5
+
+        alpha = (
+            0.30 * normalize_return(ret_pct) +
+            0.20 * clip01(confidence) +
+            0.15 * normalize_hit_rate(hit_rate) +
+            0.20 * structural_score +
+            0.10 * fundamental_score +
+            0.05 * clip01((n_windows or 0) / 10.0)
+        )
+
+        alpha = clip01(alpha)
+
+        performance_multiplier = compute_performance_multiplier(ticker)
+        alpha = clip01(alpha * performance_multiplier)
+
+        return {
+            "ticker": ticker,
+            "alpha_score": round(alpha, 3),
+            "ret_pct": ret_pct,
+            "confidence": confidence,
+            "structural_score": structural_score,
+            "hit_rate": hit_rate,
+            "walkforward_windows": n_windows,
+            "performance_multiplier": round(performance_multiplier, 3),
+            "source": "predictions_json",
+        }
+
+    # =====================================================
+    # 2) FALLBACK LEGACY (si no hay JSON usable)
+    # =====================================================
     try:
         model_result = run_model(ticker=ticker, horizon=horizon)
         ret_pct = model_result["prediction"]["ret_ens_pct"]
@@ -254,9 +338,6 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
 
     alpha = clip01(alpha)
 
-    # =============================
-    # ADAPTIVE MULTIPLIER
-    # =============================
     performance_multiplier = compute_performance_multiplier(ticker)
     alpha = clip01(alpha * performance_multiplier)
 
@@ -269,6 +350,7 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
         "hit_rate": hit_rate,
         "walkforward_windows": n_windows,
         "performance_multiplier": round(performance_multiplier, 3),
+        "source": "legacy_compute",
     }
 
 
@@ -311,3 +393,4 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
     ALPHA_FILE.write_text(json.dumps(payload, indent=2))
 
     return payload
+```0
