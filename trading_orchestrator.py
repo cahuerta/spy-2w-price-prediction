@@ -133,8 +133,6 @@ class TradingOrchestrator:
                 logger.warning("⚠️ tickers.json vacío o inexistente")
                 alpha_filtered = {}
 
-            
-
             # =====================================================
             # 3️⃣ CAPITAL GOVERNOR
             # =====================================================
@@ -350,85 +348,75 @@ class TradingOrchestrator:
         return {
             "decision": decision,
             "result": result.model_dump(),
-    }
-# =====================================================
-# PREVIEW EXECUTABILITY (NO EXECUTION)
-# =====================================================
-async def preview_executability(
-    self,
-    market_ctx: Dict[str, Any],
-    signals: Dict[str, Dict[str, Any]] | None = None,
-    anchor_universe: List[Dict[str, Any]] | None = None,
-) -> Dict[str, Any]:
-
-    signals = signals or {}
-    result_map = {}
-
-    positions = load_positions()
-
-    # -------------------------
-    # CAPITAL GOVERNOR
-    # -------------------------
-    capital_state = None
-    if positions:
-        governor = CapitalGovernor()
-        capital_state = governor.evaluate(positions)
-
-    # -------------------------
-    # ALPHA SNAPSHOT (YA CALCULADO)
-    # -------------------------
-    DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
-    alpha_file = DATA_PATH / "alpha_last.json"
-
-    alpha_results = {}
-    if alpha_file.exists():
-        payload = json.loads(alpha_file.read_text())
-        alpha_results = payload.get("results", {})
-
-    # -------------------------
-    # TICKERS
-    # -------------------------
-    tickers_file = DATA_PATH / "tickers.json"
-    universe = json.loads(tickers_file.read_text()) if tickers_file.exists() else []
-
-    for ticker in universe:
-
-        reason = None
-        executable = True
-
-        # 1️⃣ Alpha
-        alpha_info = alpha_results.get(ticker)
-        if not alpha_info or alpha_info["alpha_score"] < self._alpha_threshold:
-            executable = False
-            reason = "alpha_below_threshold"
-
-        # 2️⃣ Capital risk
-        if executable and capital_state:
-
-            if capital_state.expected_shortfall_95_annual > 0.45:
-                executable = False
-                reason = "expected_shortfall_block"
-
-            elif capital_state.volatility_annual > 0.45:
-                executable = False
-                reason = "volatility_block"
-
-            elif (
-                market_ctx.get("market_mode") == "defensive"
-                and capital_state.beta_vs_spy > 1.20
-            ):
-                executable = False
-                reason = "beta_defensive_block"
-
-        result_map[ticker] = {
-            "executable": executable,
-            "reason": reason,
         }
 
-    return {
-        "market_mode": market_ctx.get("market_mode"),
-        "alpha_threshold": self._alpha_threshold,
-        "capital_state": capital_state.to_dict() if capital_state else None,
-        "results": result_map,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
+    # =====================================================
+    # PREVIEW EXECUTABILITY (NO EXECUTION)
+    # =====================================================
+    async def preview_executability(
+        self,
+        market_ctx: Dict[str, Any],
+        signals: Dict[str, Dict[str, Any]] | None = None,
+        anchor_universe: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
+
+        signals = signals or {}
+        result_map = {}
+
+        positions = load_positions()
+
+        capital_state = None
+        if positions:
+            governor = CapitalGovernor()
+            capital_state = governor.evaluate(positions)
+
+        DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+        alpha_file = DATA_PATH / "alpha_last.json"
+
+        alpha_results = {}
+        if alpha_file.exists():
+            payload = json.loads(alpha_file.read_text())
+            alpha_results = payload.get("results", {})
+
+        tickers_file = DATA_PATH / "tickers.json"
+        universe = json.loads(tickers_file.read_text()) if tickers_file.exists() else []
+
+        for ticker in universe:
+
+            reason = None
+            executable = True
+
+            alpha_info = alpha_results.get(ticker)
+            if not alpha_info or alpha_info["alpha_score"] < self._alpha_threshold:
+                executable = False
+                reason = "alpha_below_threshold"
+
+            if executable and capital_state:
+
+                if capital_state.expected_shortfall_95_annual > 0.45:
+                    executable = False
+                    reason = "expected_shortfall_block"
+
+                elif capital_state.volatility_annual > 0.45:
+                    executable = False
+                    reason = "volatility_block"
+
+                elif (
+                    market_ctx.get("market_mode") == "defensive"
+                    and capital_state.beta_vs_spy > 1.20
+                ):
+                    executable = False
+                    reason = "beta_defensive_block"
+
+            result_map[ticker] = {
+                "executable": executable,
+                "reason": reason,
+            }
+
+        return {
+            "market_mode": market_ctx.get("market_mode"),
+            "alpha_threshold": self._alpha_threshold,
+            "capital_state": capital_state.to_dict() if capital_state else None,
+            "results": result_map,
+            "timestamp": datetime.utcnow().isoformat(),
+            }
