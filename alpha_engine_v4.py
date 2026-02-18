@@ -1,10 +1,8 @@
 # alpha_engine_v4.py
 # PRODUCTION ALPHA ENGINE (ADAPTIVE, JSON-FIRST)
 # =========================================================
-# - NO borra lógica histórica
-# - Prioriza leer JSON persistido en /data/predictions/{ticker}
-# - Si no existe JSON usable -> fallback legacy (calcula)
-# - Totalmente desacoplado del orchestrator
+# MISMA LÓGICA
+# SOLO AGREGA DEBUG DETALLADO EN EL JSON FINAL
 # =========================================================
 
 import os
@@ -21,9 +19,8 @@ from signals import compute_signal
 from model2 import fundamental_signal_context
 from data_provider import get_price_history
 
-
 DATA_PATH = os.getenv("DATA_PATH", "/data")
-
+ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
 
 # =========================================================
 # STRUCTURAL ENGINE
@@ -38,7 +35,6 @@ def pct_returns(prices: np.ndarray) -> np.ndarray:
 
     prev = prices[:-1]
     prev = np.where(prev == 0, 1e-9, prev)
-
     return np.diff(prices) / prev
 
 
@@ -50,7 +46,6 @@ def compute_rsi_wilder(prices: np.ndarray, period: int = 14) -> float:
         return 50.0
 
     deltas = np.diff(prices)
-
     gains = pd.Series(np.clip(deltas, 0, None))
     losses = pd.Series(np.clip(-deltas, 0, None))
 
@@ -71,12 +66,9 @@ def compute_max_drawdown(prices: np.ndarray) -> float:
     return float(np.min(drawdowns))
 
 
-def compute_score(
-    closes: np.ndarray,
-    volumes: np.ndarray,
-    rsi_period: int = 14,
-    min_dollar_volume: float = 50_000_000,
-) -> Optional[Dict[str, Any]]:
+def compute_score(closes: np.ndarray, volumes: np.ndarray,
+                  rsi_period: int = 14,
+                  min_dollar_volume: float = 50_000_000) -> Optional[Dict[str, Any]]:
 
     closes = np.asarray(closes, dtype=float)
     volumes = np.asarray(volumes, dtype=float)
@@ -134,8 +126,17 @@ def compute_score(
         0.07 * liquidity_score
     )
 
-    return {"score": float(np.clip(score, 0, 1))}
-
+    return {
+        "score": float(np.clip(score, 0, 1)),
+        "trend_score": trend_score,
+        "momentum": momentum,
+        "rsi_score": rsi_score,
+        "sharpe_score": sharpe_score,
+        "sortino_score": sortino_score,
+        "dd_score": dd_score,
+        "vol_score": vol_score,
+        "liquidity_score": liquidity_score
+    }
 
 # =========================================================
 # ADAPTIVE MULTIPLIER
@@ -148,7 +149,6 @@ def compute_performance_multiplier(ticker: str, days: int = 60) -> float:
         return 1.0
 
     cutoff = datetime.utcnow() - timedelta(days=days)
-
     hits = []
     errors = []
 
@@ -161,7 +161,6 @@ def compute_performance_multiplier(ticker: str, days: int = 60) -> float:
 
             hits.append(1 if d.get("decision_correct") else 0)
             errors.append(abs(d.get("error_return_pct", 0)))
-
         except Exception:
             continue
 
@@ -178,30 +177,25 @@ def compute_performance_multiplier(ticker: str, days: int = 60) -> float:
 
     return float(np.clip(multiplier, 0.6, 1.4))
 
-
 # =========================================================
-# NORMALIZADORES
+# NORMALIZERS
 # =========================================================
 
 def clip01(x: float) -> float:
     return float(np.clip(x, 0.0, 1.0))
 
-
 def normalize_return(ret_pct: float) -> float:
     return clip01(abs(ret_pct) / 3.0)
-
 
 def normalize_hit_rate(hit: Optional[float]) -> float:
     if hit is None:
         return 0.5
     return clip01((hit - 0.5) / 0.3)
 
-
 def normalize_fundamental(mispricing: Optional[float]) -> float:
     if mispricing is None:
         return 0.5
     return clip01(abs(mispricing) / 40.0)
-
 
 # =========================================================
 # JSON READER
@@ -234,21 +228,21 @@ def _read_latest_prediction_json(ticker: str) -> Optional[Dict[str, Any]]:
             "hit_rate": hit_rate,
             "n_windows": n_windows,
         }
-
     except Exception:
         return None
 
-
 # =========================================================
-# CORE ALPHA
+# CORE ALPHA (MISMA LÓGICA + DEBUG)
 # =========================================================
 
 def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[str, Any]]:
 
     ticker = ticker.upper()
+    debug = {}
 
     # JSON FIRST
     json_snapshot = _read_latest_prediction_json(ticker)
+
     if json_snapshot is not None:
 
         ret_pct = json_snapshot["ret_pct"]
@@ -269,9 +263,18 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
         )
 
         alpha = clip01(alpha)
-
         performance_multiplier = compute_performance_multiplier(ticker)
         alpha = clip01(alpha * performance_multiplier)
+
+        debug["json_mode"] = True
+        debug["ret_pct"] = ret_pct
+        debug["hit_rate"] = hit_rate
+        debug["n_windows"] = n_windows
+        debug["confidence"] = confidence
+        debug["structural_score"] = structural_score
+        debug["fundamental_score"] = fundamental_score
+        debug["performance_multiplier"] = performance_multiplier
+        debug["alpha_final"] = alpha
 
         return {
             "ticker": ticker,
@@ -281,6 +284,7 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
             "walkforward_windows": n_windows,
             "performance_multiplier": round(performance_multiplier, 3),
             "source": "predictions_json",
+            "debug": debug
         }
 
     # LEGACY FALLBACK
@@ -330,9 +334,18 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
     )
 
     alpha = clip01(alpha)
-
     performance_multiplier = compute_performance_multiplier(ticker)
     alpha = clip01(alpha * performance_multiplier)
+
+    debug["json_mode"] = False
+    debug["ret_pct"] = ret_pct
+    debug["hit_rate"] = hit_rate
+    debug["n_windows"] = n_windows
+    debug["confidence"] = confidence
+    debug["structural_score"] = structural_score
+    debug["fundamental_score"] = fundamental_score
+    debug["performance_multiplier"] = performance_multiplier
+    debug["alpha_final"] = alpha
 
     return {
         "ticker": ticker,
@@ -342,8 +355,12 @@ def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[st
         "walkforward_windows": n_windows,
         "performance_multiplier": round(performance_multiplier, 3),
         "source": "legacy_compute",
+        "debug": debug
     }
 
+# =========================================================
+# BATCH + PERSIST
+# =========================================================
 
 def compute_batch(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
     results = {}
@@ -354,19 +371,14 @@ def compute_batch(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
     return results
 
 
-ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
-
-
 def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
 
     results = compute_batch(tickers)
 
     ranked = dict(
-        sorted(
-            results.items(),
-            key=lambda x: x[1]["alpha_score"],
-            reverse=True
-        )
+        sorted(results.items(),
+               key=lambda x: x[1]["alpha_score"],
+               reverse=True)
     )
 
     payload = {
