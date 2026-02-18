@@ -19,7 +19,7 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict, deque
 from functools import lru_cache
-
+from trading_orchestrator import TradingOrchestrator
 from fastapi import (
     APIRouter,
     Query,
@@ -232,3 +232,19 @@ async def market_context():
         raise HTTPException(500, "Invalid market context file")
 
     return data
+
+@router.get("/executability-preview")
+async def executability_preview():
+    from trading_orchestrator import TradingOrchestrator
+
+    orchestrator = TradingOrchestrator()
+
+    market_ctx_path = Path(DATA_PATH) / "market_context.json"
+    if not market_ctx_path.exists():
+        raise HTTPException(404, "market_context.json not found")
+
+    market_ctx = json.loads(market_ctx_path.read_text())
+
+    return await orchestrator.preview_executability(
+        market_ctx=market_ctx
+    )
