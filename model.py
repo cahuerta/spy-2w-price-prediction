@@ -210,8 +210,10 @@ def _run_full_math_engine(
     ]
 
     # Walk-forward
+    wf_df = feat.dropna(subset=["y_fwd"])
+
     res_df = walk_forward_train_test(
-        feat, feature_cols, "y_fwd", pca_target=pca_target
+        wf_df, feature_cols, "y_fwd", pca_target=pca_target
     )
 
     if res_df is None or len(res_df) == 0:
@@ -243,7 +245,7 @@ def _run_full_math_engine(
         ("ridge", Ridge(alpha=1.0))
     ])
 
-    feat = make_features(df, horizon=horizon)
+    
 
     # 🔹 SOLO filas entrenables
     train_df = feat.dropna(subset=["y_fwd"])
