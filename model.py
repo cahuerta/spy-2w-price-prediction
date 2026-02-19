@@ -3,7 +3,8 @@
 # Salidas 100% compatibles con el sistema actual
 
 import numpy as np
-import pandas as pd
+import pandas as pf
+from datetime import datetime
 from data_provider import get_price_history
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -92,7 +93,7 @@ def make_features(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     # Target futuro (correcto)
     out["y_fwd"] = np.log(out["Close"].shift(-horizon) / out["Close"])
 
-    return out.dropna()
+    return out 
 
 
 # ======================================================
@@ -242,10 +243,16 @@ def _run_full_math_engine(
         ("ridge", Ridge(alpha=1.0))
     ])
 
-    X = feat[feature_cols].values
-    y = feat["y_fwd"].values
+    feat = make_features(df, horizon=horizon)
+
+    # 🔹 SOLO filas entrenables
+    train_df = feat.dropna(subset=["y_fwd"])
+
+    X = train_df[feature_cols].values
+    y = train_df["y_fwd"].values
     model.fit(X, y)
 
+    # 🔹 Última fila REAL (hoy)
     last_row = feat.iloc[-1]
     X_last = last_row[feature_cols].values.reshape(1, -1)
 
@@ -316,7 +323,7 @@ def _run_full_math_engine(
             "n_windows": hist.n_windows,
         },
         "prediction": {
-            "date_base": str(pd.to_datetime(last_row.name).date()),
+            "date_base": datetime.utcnow().date().isoformat(),
             "ret_global_pct": y_global * 100.0,
             "ret_knn_pct": y_knn * 100.0,
             "ret_ens_pct": y_ens * 100.0,
