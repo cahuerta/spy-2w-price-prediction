@@ -120,7 +120,7 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
     p = pred["prediction"]
 
     ticker = meta["ticker"]
-    horizon = int(meta.get("horizon_days", 10))
+    horizon = int(meta.get("horizon_days", 1))
     theta = float(meta.get("theta", 0.75))
 
     base_date = parse_date(p["date_base"])
