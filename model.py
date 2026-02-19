@@ -331,8 +331,7 @@ def format_report(result: dict) -> str:
         f"RECOMENDACIÓN FINAL : {p['recommendation']}",
     ])
     
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 # ======================================================
 # TEST RÁPIDO
