@@ -3,7 +3,7 @@
 # Salidas 100% compatibles con el sistema actual
 
 import numpy as np
-import pandas as pf
+import pandas as pd
 from datetime import datetime
 from data_provider import get_price_history
 from typing import Dict, List, Optional
