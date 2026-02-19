@@ -11,3 +11,4 @@ tenacity==8.2.3
 openai>=1.0.0
 pytz
 lxml
+feedparser==6.0.11
