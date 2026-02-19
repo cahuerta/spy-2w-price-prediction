@@ -90,12 +90,10 @@ async def _run_pipeline_logic(request: Request):
         # 6️⃣ MARKET QUALITATIVE
         # -------------------------------------------------
         logger.info("🧠 [6/8] Market qualitative context...")
-        qual_ctx = evaluate_qualitative_market(
-            quant_ctx.to_dict()
-        )
+        qual_ctx = evaluate_qualitative_market()
         logger.info(
-            f"✅ Market qual OK | bias={qual_ctx.macro_bias} "
-            f"| conf={qual_ctx.confidence:.2f}"
+            f"✅ Market qual OK | impact={qual_ctx.impact_score:.3f} "
+            f"| conf={qual_ctx.aggregated_confidence:.2f}"
         )
 
         # -------------------------------------------------
