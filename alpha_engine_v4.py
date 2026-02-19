@@ -1,394 +1,262 @@
-# alpha_engine_v4.py
-# PRODUCTION ALPHA ENGINE (ADAPTIVE, JSON-FIRST)
 # =========================================================
-# MISMA LÓGICA
-# SOLO AGREGA DEBUG DETALLADO EN EL JSON FINAL
+# alpha_engine_enterprise_strict.py
+# =========================================================
+# ✔ ALFA = Resumen estructural del sistema completo
+# ✔ NO adaptativo
+# ✔ Mercado es componente interno
+# ✔ Lee SOLO datos persistidos
+# ✔ Calcula SOLO lo faltante
+# ✔ Sin fallback silencioso
+# ✔ Debug estructural completo
 # =========================================================
 
 import os
 import json
-from typing import Dict, Any, Optional, List
-from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import numpy as np
-import pandas as pd
 
-from model import run_model
 from signals import compute_signal
-from model2 import fundamental_signal_context
 from data_provider import get_price_history
 
-DATA_PATH = os.getenv("DATA_PATH", "/data")
-ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
-
 # =========================================================
-# STRUCTURAL ENGINE
+# PATHS
 # =========================================================
 
-def pct_returns(prices: np.ndarray) -> np.ndarray:
-    prices = np.asarray(prices, dtype=float)
-    prices = np.nan_to_num(prices)
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+PRED_DIR = DATA_PATH / "predictions"
+EVAL_DIR = DATA_PATH / "evaluations"
+MARKET_FILE = DATA_PATH / "market_context.json"
+ALPHA_FILE = DATA_PATH / "alpha_last.json"
 
-    if len(prices) < 2:
-        return np.array([], dtype=float)
+# =========================================================
+# JSON HELPERS
+# =========================================================
 
-    prev = prices[:-1]
-    prev = np.where(prev == 0, 1e-9, prev)
-    return np.diff(prices) / prev
-
-
-def compute_rsi_wilder(prices: np.ndarray, period: int = 14) -> float:
-    prices = np.asarray(prices, dtype=float)
-    prices = np.nan_to_num(prices)
-
-    if len(prices) < period + 1:
-        return 50.0
-
-    deltas = np.diff(prices)
-    gains = pd.Series(np.clip(deltas, 0, None))
-    losses = pd.Series(np.clip(-deltas, 0, None))
-
-    avg_gain = gains.ewm(span=period, adjust=False).mean().iloc[-1]
-    avg_loss = losses.ewm(span=period, adjust=False).mean().iloc[-1]
-
-    if avg_loss == 0:
-        return 70.0
-
-    rs = avg_gain / avg_loss
-    return float(100 - (100 / (1 + rs)))
-
-
-def compute_max_drawdown(prices: np.ndarray) -> float:
-    prices = np.asarray(prices, dtype=float)
-    cumulative_max = np.maximum.accumulate(prices)
-    drawdowns = (prices - cumulative_max) / cumulative_max
-    return float(np.min(drawdowns))
-
-
-def compute_score(closes: np.ndarray, volumes: np.ndarray,
-                  rsi_period: int = 14,
-                  min_dollar_volume: float = 50_000_000) -> Optional[Dict[str, Any]]:
-
-    closes = np.asarray(closes, dtype=float)
-    volumes = np.asarray(volumes, dtype=float)
-
-    closes = np.nan_to_num(closes)
-    volumes = np.nan_to_num(volumes)
-
-    if len(closes) < 30:
+def load_json(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
         return None
 
-    returns = pct_returns(closes)
-    if len(returns) < 20:
-        return None
 
-    volatility = float(np.std(returns))
-    trend = float((closes[-1] / closes[0]) - 1)
-    trend_score = float(np.clip(trend / 0.20, 0, 1))
+def save_json(path: Path, data: Dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
 
-    closes_pd = pd.Series(closes)
-    ma20 = float(closes_pd.tail(20).mean())
-    ma50 = float(closes_pd.tail(50).mean()) if len(closes) >= 50 else ma20
 
-    momentum_short = max((closes[-1] - ma20) / ma20, 0) if ma20 > 0 else 0.0
-    momentum_long = max((closes[-1] - ma50) / ma50, 0) if ma50 > 0 else 0.0
-    momentum = float(np.clip(0.6 * momentum_short + 0.4 * momentum_long, 0, 1))
+def get_latest_prediction_file(ticker: str) -> Path:
+    d = PRED_DIR / ticker
+    if not d.exists():
+        raise FileNotFoundError(f"No predictions folder for {ticker}")
 
-    rsi = compute_rsi_wilder(closes, rsi_period)
-    rsi_score = float(1 - abs(rsi - 50) / 50)
+    files = sorted(d.glob("*.json"))
+    if not files:
+        raise FileNotFoundError(f"No prediction files for {ticker}")
 
-    sharpe = float(np.mean(returns) / volatility * np.sqrt(252)) if volatility > 0 else 0.0
-    sharpe_score = float(np.clip((sharpe - 0.5) / 1.5, 0, 1))
-
-    downside = returns[returns < 0]
-    downside_std = np.std(downside) if len(downside) > 5 else volatility
-    sortino = float(np.mean(returns) / downside_std * np.sqrt(252)) if downside_std > 0 else 0.0
-    sortino_score = float(np.clip(sortino / 2.0, 0, 1))
-
-    max_dd = compute_max_drawdown(closes)
-    dd_score = float(np.clip(1 + max_dd, 0, 1))
-
-    optimal_vol = 0.03
-    vol_score = float(np.clip(1 - abs(volatility - optimal_vol) / optimal_vol, 0, 1))
-
-    dollar_volume = float(np.mean(closes * volumes))
-    liquidity_score = float(np.clip(dollar_volume / min_dollar_volume, 0, 1))
-
-    score = (
-        0.20 * trend_score +
-        0.15 * momentum +
-        0.10 * rsi_score +
-        0.15 * sharpe_score +
-        0.10 * sortino_score +
-        0.10 * dd_score +
-        0.10 * vol_score +
-        0.07 * liquidity_score
-    )
-
-    return {
-        "score": float(np.clip(score, 0, 1)),
-        "trend_score": trend_score,
-        "momentum": momentum,
-        "rsi_score": rsi_score,
-        "sharpe_score": sharpe_score,
-        "sortino_score": sortino_score,
-        "dd_score": dd_score,
-        "vol_score": vol_score,
-        "liquidity_score": liquidity_score
-    }
+    return files[-1]
 
 # =========================================================
-# ADAPTIVE MULTIPLIER
-# =========================================================
-
-def compute_performance_multiplier(ticker: str, days: int = 60) -> float:
-
-    eval_dir = Path(DATA_PATH) / "evaluations" / ticker
-    if not eval_dir.exists():
-        return 1.0
-
-    cutoff = datetime.utcnow() - timedelta(days=days)
-    hits = []
-    errors = []
-
-    for f in eval_dir.glob("*.json"):
-        try:
-            d = json.loads(f.read_text())
-            dt = datetime.fromisoformat(d["evaluated_at"])
-            if dt < cutoff:
-                continue
-
-            hits.append(1 if d.get("decision_correct") else 0)
-            errors.append(abs(d.get("error_return_pct", 0)))
-        except Exception:
-            continue
-
-    if len(hits) < 5:
-        return 1.0
-
-    hit_rate = sum(hits) / len(hits)
-    avg_error = sum(errors) / len(errors)
-
-    hit_component = np.clip((hit_rate - 0.5) / 0.25, -1, 1)
-    error_component = np.clip(1 - avg_error / 10.0, 0, 1)
-
-    multiplier = 1 + 0.4 * hit_component + 0.2 * (error_component - 0.5)
-
-    return float(np.clip(multiplier, 0.6, 1.4))
-
-# =========================================================
-# NORMALIZERS
+# NORMALIZACIONES
 # =========================================================
 
 def clip01(x: float) -> float:
     return float(np.clip(x, 0.0, 1.0))
 
+
 def normalize_return(ret_pct: float) -> float:
     return clip01(abs(ret_pct) / 3.0)
 
-def normalize_hit_rate(hit: Optional[float]) -> float:
-    if hit is None:
-        return 0.5
+
+def normalize_hit_rate(hit: float) -> float:
     return clip01((hit - 0.5) / 0.3)
 
-def normalize_fundamental(mispricing: Optional[float]) -> float:
-    if mispricing is None:
-        return 0.5
+
+def normalize_error(mae_pct: float) -> float:
+    return clip01(1.0 / (1.0 + mae_pct / 10.0))
+
+
+def normalize_fundamental(mispricing: float) -> float:
     return clip01(abs(mispricing) / 40.0)
 
-# =========================================================
-# JSON READER
-# =========================================================
 
-def _read_latest_prediction_json(ticker: str) -> Optional[Dict[str, Any]]:
-
-    pred_dir = Path(DATA_PATH) / "predictions" / ticker
-    if not pred_dir.exists():
-        return None
-
-    files = sorted(pred_dir.glob("*.json"))
-    if not files:
-        return None
-
-    try:
-        last = json.loads(files[-1].read_text())
-        prediction = last.get("prediction", {}) or {}
-        historical = last.get("historical", {}) or {}
-
-        ret_pct = prediction.get("ret_ens_pct")
-        hit_rate = historical.get("hit_rate_mean")
-        n_windows = historical.get("n_windows")
-
-        if ret_pct is None:
-            return None
-
-        return {
-            "ret_pct": ret_pct,
-            "hit_rate": hit_rate,
-            "n_windows": n_windows,
-        }
-    except Exception:
-        return None
+def normalize_market(volatility: float, drawdown: float) -> float:
+    vol_component = clip01(1 - abs(volatility - 0.03) / 0.03)
+    dd_component = clip01(1 + drawdown)
+    return clip01(0.6 * vol_component + 0.4 * dd_component)
 
 # =========================================================
-# CORE ALPHA (MISMA LÓGICA + DEBUG)
+# STRUCTURAL SCORE (SI NO EXISTE)
 # =========================================================
 
-def compute_alpha_for_ticker(ticker: str, horizon: int = 10) -> Optional[Dict[str, Any]]:
+def compute_structural_score(ticker: str) -> float:
 
-    ticker = ticker.upper()
-    debug = {}
+    raw = get_price_history(ticker, period="1y", interval="1d")
+    if raw is None or len(raw) < 60:
+        raise ValueError("Not enough history for structural")
 
-    # JSON FIRST
-    json_snapshot = _read_latest_prediction_json(ticker)
+    closes = raw["Close"].values
+    volumes = raw["Volume"].values
 
-    if json_snapshot is not None:
+    returns = np.diff(closes) / closes[:-1]
+    volatility = np.std(returns)
+    trend = (closes[-1] / closes[0]) - 1
+    liquidity = np.mean(closes * volumes)
 
-        ret_pct = json_snapshot["ret_pct"]
-        hit_rate = json_snapshot.get("hit_rate")
-        n_windows = json_snapshot.get("n_windows")
+    trend_score = clip01(trend / 0.20)
+    vol_score = clip01(1 - abs(volatility - 0.03) / 0.03)
+    liquidity_score = clip01(liquidity / 50_000_000)
 
-        confidence = 0.5
-        structural_score = 0.5
-        fundamental_score = 0.5
+    return clip01(0.4 * trend_score + 0.3 * vol_score + 0.3 * liquidity_score)
 
-        alpha = (
-            0.30 * normalize_return(ret_pct) +
-            0.20 * clip01(confidence) +
-            0.15 * normalize_hit_rate(hit_rate) +
-            0.20 * structural_score +
-            0.10 * fundamental_score +
-            0.05 * clip01((n_windows or 0) / 10.0)
-        )
+# =========================================================
+# PERFORMANCE HISTÓRICA
+# =========================================================
 
-        alpha = clip01(alpha)
-        performance_multiplier = compute_performance_multiplier(ticker)
-        alpha = clip01(alpha * performance_multiplier)
+def compute_performance_metrics(ticker: str, days: int = 60):
 
-        debug["json_mode"] = True
-        debug["ret_pct"] = ret_pct
-        debug["hit_rate"] = hit_rate
-        debug["n_windows"] = n_windows
-        debug["confidence"] = confidence
-        debug["structural_score"] = structural_score
-        debug["fundamental_score"] = fundamental_score
-        debug["performance_multiplier"] = performance_multiplier
-        debug["alpha_final"] = alpha
+    folder = EVAL_DIR / ticker
+    if not folder.exists():
+        raise FileNotFoundError("No evaluation folder")
 
-        return {
-            "ticker": ticker,
-            "alpha_score": round(alpha, 3),
-            "ret_pct": ret_pct,
-            "hit_rate": hit_rate,
-            "walkforward_windows": n_windows,
-            "performance_multiplier": round(performance_multiplier, 3),
-            "source": "predictions_json",
-            "debug": debug
-        }
+    cutoff = datetime.utcnow() - timedelta(days=days)
 
-    # LEGACY FALLBACK
-    try:
-        model_result = run_model(ticker=ticker, horizon=horizon)
-        ret_pct = model_result["prediction"]["ret_ens_pct"]
-        hit_rate = model_result["historical"]["hit_rate_mean"]
-        n_windows = model_result["historical"]["n_windows"]
-    except Exception:
-        return None
+    hits = []
+    errors = []
 
-    signal_data = compute_signal(ticker)
-    confidence = signal_data.get("confidence", 0.0)
+    for f in folder.glob("*.json"):
+        d = load_json(f)
+        if not d:
+            continue
 
-    try:
-        raw = get_price_history(ticker, period="1y", interval="1d")
-        if raw is None or len(raw) < 60:
-            return None
+        dt = datetime.fromisoformat(d["evaluated_at"])
+        if dt < cutoff:
+            continue
 
-        closes = raw["Close"].values
-        volumes = raw["Volume"].values
+        hits.append(1 if d.get("decision_correct") else 0)
+        errors.append(abs(d.get("error_return_pct", 0)))
 
-        structural = compute_score(closes=closes, volumes=volumes)
-        if structural is None:
-            return None
+    if len(hits) < 3:
+        raise ValueError("Not enough evaluation history")
 
-        structural_score = structural["score"]
+    hit_rate = sum(hits) / len(hits)
+    mae = sum(errors) / len(errors)
 
-    except Exception:
-        return None
+    return hit_rate, mae
 
-    fundamental = fundamental_signal_context(ticker)
-    fundamental_score = 0.5
+# =========================================================
+# ALFA CORE
+# =========================================================
 
-    if fundamental.get("usable"):
-        fundamental_score = normalize_fundamental(
-            fundamental.get("mispricing_pct")
-        )
+def compute_alpha_for_ticker(ticker: str):
+
+    # -------- Prediction --------
+    fp = get_latest_prediction_file(ticker)
+    pred_json = load_json(fp)
+
+    if not pred_json or "prediction" not in pred_json:
+        raise ValueError("Invalid prediction file")
+
+    p = pred_json["prediction"]
+    ret_pct = p["ret_ens_pct"]
+
+    # -------- Signal --------
+    signal = compute_signal(ticker)
+
+    if "confidence" not in signal:
+        raise ValueError("Signal missing confidence")
+
+    confidence = signal["confidence"]
+
+    if not signal.get("rolling_metrics"):
+        raise ValueError("Missing rolling metrics")
+
+    hit_rate = signal["rolling_metrics"]["hit_rate"]
+    mae = signal["rolling_metrics"]["mae_return_pct"]
+
+    # -------- Fundamental --------
+    fundamental = signal.get("fundamental")
+    if not fundamental or not fundamental.get("usable"):
+        raise ValueError("Missing fundamental context")
+
+    mispricing = fundamental.get("mispricing_pct")
+    fundamental_score = normalize_fundamental(mispricing)
+
+    # -------- Market --------
+    market = load_json(MARKET_FILE)
+    if not market:
+        raise ValueError("Missing market_context.json")
+
+    market_score = normalize_market(
+        market.get("volatility", 0.03),
+        market.get("drawdown", 0.0)
+    )
+
+    # -------- Structural --------
+    structural_score = compute_structural_score(ticker)
+
+    # =====================================================
+    # VECTOR ALFA
+    # =====================================================
 
     alpha = (
-        0.30 * normalize_return(ret_pct) +
-        0.20 * clip01(confidence) +
-        0.15 * normalize_hit_rate(hit_rate) +
-        0.20 * structural_score +
+        0.22 * normalize_return(ret_pct) +
+        0.18 * confidence +
+        0.18 * normalize_hit_rate(hit_rate) +
+        0.12 * normalize_error(mae) +
+        0.15 * structural_score +
         0.10 * fundamental_score +
-        0.05 * clip01(n_windows / 10.0)
+        0.05 * market_score
     )
 
     alpha = clip01(alpha)
-    performance_multiplier = compute_performance_multiplier(ticker)
-    alpha = clip01(alpha * performance_multiplier)
-
-    debug["json_mode"] = False
-    debug["ret_pct"] = ret_pct
-    debug["hit_rate"] = hit_rate
-    debug["n_windows"] = n_windows
-    debug["confidence"] = confidence
-    debug["structural_score"] = structural_score
-    debug["fundamental_score"] = fundamental_score
-    debug["performance_multiplier"] = performance_multiplier
-    debug["alpha_final"] = alpha
 
     return {
         "ticker": ticker,
-        "alpha_score": round(alpha, 3),
-        "ret_pct": ret_pct,
-        "hit_rate": hit_rate,
-        "walkforward_windows": n_windows,
-        "performance_multiplier": round(performance_multiplier, 3),
-        "source": "legacy_compute",
-        "debug": debug
+        "alpha_score": round(alpha, 4),
+        "components": {
+            "return": normalize_return(ret_pct),
+            "confidence": confidence,
+            "hit_rate": normalize_hit_rate(hit_rate),
+            "error_component": normalize_error(mae),
+            "structural": structural_score,
+            "fundamental": fundamental_score,
+            "market": market_score,
+        },
+        "raw": {
+            "ret_pct": ret_pct,
+            "hit_rate": hit_rate,
+            "mae": mae,
+        }
     }
 
 # =========================================================
 # BATCH + PERSIST
 # =========================================================
 
-def compute_batch(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+def compute_and_persist_alpha(tickers: List[str]):
+
     results = {}
-    for ticker in tickers:
-        r = compute_alpha_for_ticker(ticker)
-        if r:
-            results[ticker] = r
-    return results
 
-
-def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
-
-    results = compute_batch(tickers)
-
-    ranked = dict(
-        sorted(results.items(),
-               key=lambda x: x[1]["alpha_score"],
-               reverse=True)
-    )
+    for t in tickers:
+        try:
+            results[t] = compute_alpha_for_ticker(t)
+        except Exception as e:
+            results[t] = {"error": str(e)}
 
     payload = {
         "timestamp": datetime.utcnow().isoformat(),
         "universe_size": len(tickers),
-        "calculated": len(ranked),
-        "results": ranked
+        "calculated": len([r for r in results.values() if "alpha_score" in r]),
+        "results": results
     }
 
-    ALPHA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ALPHA_FILE.write_text(json.dumps(payload, indent=2))
+    save_json(ALPHA_FILE, payload)
 
     return payload
