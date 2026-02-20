@@ -121,7 +121,8 @@ class TradingOrchestrator:
 
                 alpha_filtered = {
                     t: a for t, a in alpha_results.items()
-                    if a and a["alpha_score"] >= self._alpha_threshold
+                    if isinstance(a, dict) and a.get("alpha_score") is not None
+                    and a["alpha_score"] >= self._alpha_threshold
                 }
 
                 logger.info(
