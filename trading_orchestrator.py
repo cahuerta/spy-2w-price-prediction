@@ -388,9 +388,21 @@ class TradingOrchestrator:
             executable = True
 
             alpha_info = alpha_results.get(ticker)
-            if not alpha_info or alpha_info["alpha_score"] < self._alpha_threshold:
-                executable = False
-                reason = "alpha_below_threshold"
+
+            alpha_score = None
+            alpha_error = None
+
+            if isinstance(alpha_info, dict):
+               alpha_score = alpha_info.get("alpha_score")
+               alpha_error = alpha_info.get("error")
+
+            if alpha_error:
+               executable = False
+               reason = f"alpha_error: {alpha_error}"
+
+            elif alpha_score is None or alpha_score < self._alpha_threshold:
+               executable = False
+               reason = "alpha_below_threshold"
 
             if executable and capital_state:
 
