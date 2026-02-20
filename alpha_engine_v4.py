@@ -174,11 +174,17 @@ def compute_alpha_for_ticker(ticker: str):
 
     confidence = signal["confidence"]
 
-    if not signal.get("rolling_metrics"):
-        raise ValueError("Missing rolling metrics")
+    metrics = signal.get("rolling_metrics")
 
-    hit_rate = signal["rolling_metrics"]["hit_rate"]
-    mae = signal["rolling_metrics"]["mae_return_pct"]
+    if not metrics:
+        # Castigo máximo estructural por falta de historia
+        hit_rate = 0.0
+        mae = 100.0   # Error extremo → normaliza casi a 0
+        rolling_penalty = True
+    else:
+        hit_rate = metrics["hit_rate"]
+        mae = metrics["mae_return_pct"]
+        rolling_penalty = False
 
     # -------- Fundamental --------
     fundamental = signal.get("fundamental")
