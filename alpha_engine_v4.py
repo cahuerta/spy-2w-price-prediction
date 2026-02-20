@@ -188,12 +188,16 @@ def compute_alpha_for_ticker(ticker: str):
 
     # -------- Fundamental --------
     fundamental = signal.get("fundamental")
+
     if not fundamental or not fundamental.get("usable"):
-        raise ValueError("Missing fundamental context")
-
-    mispricing = fundamental.get("mispricing_pct")
-    fundamental_score = normalize_fundamental(mispricing)
-
+        # Castigo máximo si no hay fundamental
+        fundamental_score = 0.0
+        fundamental_penalty = True
+    else:
+        mispricing = fundamental.get("mispricing_pct", 0.0)
+        fundamental_score = normalize_fundamental(mispricing)
+        fundamental_penalty = False
+        
     # -------- Market --------
     market = load_json(MARKET_FILE)
     if not market:
@@ -205,8 +209,13 @@ def compute_alpha_for_ticker(ticker: str):
     )
 
     # -------- Structural --------
-    structural_score = compute_structural_score(ticker)
-
+    try:
+        structural_score = compute_structural_score(ticker)
+        structural_penalty = False
+    except Exception:
+        # Castigo máximo si falla cálculo estructural
+        structural_score = 0.0
+        structural_penalty = True
     # =====================================================
     # VECTOR ALFA
     # =====================================================
