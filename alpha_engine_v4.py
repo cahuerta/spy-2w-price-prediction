@@ -172,7 +172,14 @@ def compute_alpha_for_ticker(ticker: str):
     if "confidence" not in signal:
         raise ValueError("Signal missing confidence")
 
-    confidence = signal["confidence"]
+    confidence = signal.get("confidence")
+
+    if confidence is None:
+        # Castigo explícito por falta de historia suficiente
+        confidence = 0.0
+        confidence_penalty = True
+    else:
+        confidence_penalty = False
 
     metrics = signal.get("rolling_metrics")
 
