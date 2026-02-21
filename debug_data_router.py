@@ -201,4 +201,3 @@ def tail(path: str, n: int = 200):
         return {"path": str(fp), "n": n, "lines": lines}
     except Exception as e:
         return {"error": str(e), "checked_path": str(fp)}
-```0
