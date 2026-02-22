@@ -298,7 +298,7 @@ def _run_full_math_engine(ticker: str, horizon: int, pca_target: int,
 # ======================================================
 # API pública (CONTRATO INTACTO)
 # ======================================================
-def run_model(ticker: str = "SPY", horizon: int = 10, pca_target: int = 50,
+def run_model(ticker: str = "SPY", horizon: int = 1, pca_target: int = 50,
               theta: float = 0.75, k_neighbors: int = 20, alpha: float = 0.5,
               period: str = "max"):
     full = _run_full_math_engine(ticker, horizon, pca_target, theta, k_neighbors, alpha, period)
