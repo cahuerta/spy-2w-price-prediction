@@ -22,7 +22,7 @@ from model import run_model   # 🔑 TU MOTOR REAL
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 PREDICTIONS_PATH = DATA_PATH / "predictions"
 TICKERS_FILE = DATA_PATH / "tickers.json"
-
+MODEL_HORIZON = int(os.getenv("MODEL_HORIZON_DAYS", "10"))
 # =========================================================
 # LOGGING
 # =========================================================
@@ -64,35 +64,19 @@ def save_json_atomic(path: Path, data: dict):
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
 
-# =====================================================
-# CORE
-# =====================================================
-MODEL_HORIZON = int(os.getenv("MODEL_HORIZON_DAYS", "1"))
 
+# =========================================================
+# CORE
+# =========================================================
 def run_model_for_ticker(ticker: str) -> dict:
     logger.info(f"📈 Ejecutando modelo para {ticker}")
-    logger.info(f"🕒 Horizon usado = {MODEL_HORIZON}")
 
     result = run_model(
-        ticker=ticker,
-        horizon=MODEL_HORIZON
+    ticker=ticker,
+    horizon=MODEL_HORIZON
     )
 
     today = datetime.utcnow().date().isoformat()
-
-    ticker_dir = PREDICTIONS_PATH / ticker
-    ticker_dir.mkdir(parents=True, exist_ok=True)
-
-    out_file = ticker_dir / f"{today}.json"
-    save_json_atomic(out_file, result)
-
-    if not out_file.exists():
-        raise RuntimeError(
-            f"[MODEL_RUNNER] Archivo NO existe tras grabar: {out_file}"
-        )
-
-    logger.info(f"💾 Guardado: {out_file.resolve()}")
-    return result
 
     # =====================================================
     # 📁 Asegurar directorio del ticker (FIX 2)
