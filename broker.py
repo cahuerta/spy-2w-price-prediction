@@ -350,3 +350,20 @@ async def broker_status():
         "trading_blocked": acc.trading_blocked,
         "paper": PAPER_TRADING,
     }
+@router.get("/positions")
+async def broker_positions():
+    engine = get_trading_engine()
+    positions = engine.client.get_all_positions()
+
+    result = {}
+
+    for p in positions:
+        result[p.symbol] = {
+            "market_value": float(p.market_value),
+            "qty": float(p.qty),
+            "avg_entry_price": float(p.avg_entry_price),
+            "unrealized_pl": float(p.unrealized_pl),
+            "side": p.side,
+        }
+
+    return result
