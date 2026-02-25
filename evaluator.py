@@ -12,6 +12,10 @@ from pathlib import Path
 import concurrent.futures
 import numpy as np
 import yfinance as yf
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.common.exceptions import APIError
 
 # ======================================================
 # CONFIG
@@ -19,6 +23,8 @@ import yfinance as yf
 DATA_PATH = os.getenv("DATA_PATH", "/data")
 MAX_WORKERS = min(int(os.getenv("EVAL_MAX_WORKERS", "4")), 16)
 YF_TIMEOUT = 10
+ALPACA_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 
 logger = logging.getLogger(__name__)
 
@@ -77,42 +83,46 @@ def parse_date(s: str):
 # ======================================================
 # PRECIO REAL HOY (último close disponible)
 # ======================================================
+
 def get_price_today(ticker: str, today):
     try:
-        start = today - timedelta(days=7)
-        end = today + timedelta(days=1)
+        client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
-        df = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-            timeout=YF_TIMEOUT,
+        request = StockBarsRequest(
+            symbol_or_symbols=ticker,
+            timeframe=TimeFrame.Day,
+            start=today - timedelta(days=7),
+            end=today,
         )
 
-        if df is None or len(df) == 0:
+        bars = client.get_stock_bars(request).df
+
+        if bars is None or bars.empty:
             return None
 
-        df.index = df.index.tz_localize(None)
-        df = df[df.index.date <= today]
+        bars = bars.reset_index()
+        bars = bars[bars["timestamp"].dt.date <= today]
 
-        if len(df) == 0:
+        if len(bars) == 0:
             return None
 
-        return float(df["Close"].iloc[-1])
+        return float(bars["close"].iloc[-1])
 
-    except Exception:
+    except APIError as e:
+        logger.error(f"Alpaca API error {ticker}: {e}")
         return None
-
+    except Exception as e:
+        logger.error(f"Unexpected Alpaca error {ticker}: {e}")
+        return None
 
 # ======================================================
 # EVALUACIÓN INDIVIDUAL (LOOKBACK CORRECTO)
 # ======================================================
+
 def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
 
     pred = load_json(prediction_path)
+
     if "meta" not in pred or "prediction" not in pred:
         return None
 
@@ -129,24 +139,44 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
 
     today = datetime.utcnow().date()
 
-    # 🔥 CLAVE: solo evaluar si base_date == hoy - horizon
-    if base_date != today - timedelta(days=horizon):
+    # Target date real
+    target_date = base_date + timedelta(days=horizon)
+
+    # Si aún no corresponde evaluar → no hacer nada
+    if target_date > today:
         return None
 
     real_price = get_price_today(ticker, today)
-    if real_price is None:
-        return None
 
     price_now = float(p["price_now"])
     price_pred = float(p["price_pred"])
     predicted_return = float(p["ret_ens_pct"])
+    rec = p["recommendation"]
+
+    # 🔥 Si no hay precio real, igual grabamos archivo
+    if real_price is None:
+        return EvaluationResult(
+            meta=meta,
+            prediction_date=str(base_date),
+            evaluation_date=str(today),
+            price_now=price_now,
+            price_pred=price_pred,
+            price_real=None,
+            predicted_return_pct=predicted_return,
+            real_return_pct=None,
+            error_price_pct=None,
+            error_return_pct=None,
+            hit_sign=None,
+            hit_threshold=None,
+            recommendation=rec,
+            decision_correct=None,
+            evaluated_at=datetime.utcnow().isoformat(),
+        )
 
     real_return = (real_price / price_now - 1) * 100.0
 
     hit_sign = np.sign(real_return) == np.sign(predicted_return)
     hit_threshold = abs(real_return) >= theta
-
-    rec = p["recommendation"]
 
     if rec == "COMPRA":
         decision_correct = real_return >= 0
@@ -172,7 +202,6 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
         decision_correct=bool(decision_correct),
         evaluated_at=datetime.utcnow().isoformat(),
     )
-
 
 # ======================================================
 # EVALUACIÓN MASIVA
