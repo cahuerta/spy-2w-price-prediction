@@ -208,23 +208,28 @@ async def latest_snapshot(ticker: str):
 # =========================================================
 @router.get("/evaluation-latest/{ticker}")
 async def evaluation_latest(ticker: str):
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        raise HTTPException(400, "ticker requerido")
+
     eval_dir = Path(DATA_PATH) / "evaluations" / ticker
 
     if not eval_dir.exists():
         raise HTTPException(404, f"No evaluations for {ticker}")
 
-    files = sorted(eval_dir.glob("*.json"))
+    files = sorted(eval_dir.glob("*.json"), key=lambda p: p.name)
     if not files:
         raise HTTPException(404, f"No evaluation files for {ticker}")
 
-    last = load_json(files[-1])
+    last_fp = files[-1]
+    last = load_json(last_fp)
     if not last:
         raise HTTPException(404, "Invalid evaluation file")
 
     return {
         "ticker": ticker,
         "evaluation": last,
-        "file": files[-1].name,
+        "file": last_fp.name,
     }
     
 # =========================================================
