@@ -211,8 +211,8 @@ def compute_alpha_for_ticker(ticker: str):
         raise ValueError("Missing market_context.json")
 
     market_score = normalize_market(
-        market.get("volatility", 0.03),
-        market.get("source", {}).get("raw_quant", {}).get("drawdown_rolling", 0.0)
+    market.get("source", {}).get("raw_quant", {}).get("volatility", 0.03),
+    market.get("source", {}).get("raw_quant", {}).get("drawdown_rolling", 0.0)
     )
 
     # -------- Structural --------
