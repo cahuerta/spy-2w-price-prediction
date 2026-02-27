@@ -14,6 +14,9 @@ import traceback
 import os
 import httpx
 import asyncio
+from pathlib import Path
+import json
+import os
 
 # =========================
 # IMPORTS — CAPAS REALES
@@ -51,6 +54,16 @@ async def _run_pipeline_logic(request: Request):
         # -------------------------------------------------
         logger.info("🔍 [1/8] Screener...")
         screener_out = await run_screener_async()
+        # ✅ CREAR ARCHIVO REQUERIDO POR DECIDER
+
+        DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+        screener_file = DATA_PATH / "screener_candidates.json"
+
+        screener_file.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp = screener_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(screener_out, indent=2))
+        tmp.replace(screener_file)
         logger.info(
             f"✅ Screener OK | candidates={screener_out.get('n_candidates')}"
         )
