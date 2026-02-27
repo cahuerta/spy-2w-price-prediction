@@ -71,23 +71,23 @@ def clip01(x: float) -> float:
 
 
 def normalize_return(ret_pct: float) -> float:
-    return clip01(abs(ret_pct) / 3.0)
+    return clip01(abs(ret_pct) / 2.5)
 
 
 def normalize_hit_rate(hit: float) -> float:
-    return clip01((hit - 0.5) / 0.3)
+    return clip01((hit - 0.45) / 0.35)
 
 
 def normalize_error(mae_pct: float) -> float:
-    return clip01(1.0 / (1.0 + mae_pct / 10.0))
+    return clip01(1.0 / (1.0 + mae_pct / 8.0))
 
 
 def normalize_fundamental(mispricing: float) -> float:
-    return clip01(abs(mispricing) / 40.0)
+    return clip01(abs(mispricing) / 30.0)
 
 
 def normalize_market(volatility: float, drawdown: float) -> float:
-    vol_component = clip01(1 - abs(volatility - 0.03) / 0.03)
+    vol_component = clip01(1 - abs(volatility - 0.03) / 0.06)
     dd_component = clip01(1 + drawdown)
     return clip01(0.6 * vol_component + 0.4 * dd_component)
 
