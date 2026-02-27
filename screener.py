@@ -167,10 +167,16 @@ async def run_screener_async() -> Dict[str, Any]:
     # 6️⃣ CONTRATO JSON (NO CAMBIA)
     # =====================================================
     result = {
-        "generated_at": datetime.utcnow().isoformat(),
-        "n_evaluated": len(evaluated),
-        "candidates_strict": candidates,
-        "top20_global": ranking_top20,
+    "generated_at": datetime.utcnow().isoformat(),
+    "n_evaluated": len(evaluated),
+
+    # ✅ compatibilidad (para pipeline_router y front viejo)
+    "n_candidates": len(candidates),
+    "candidates": candidates,
+
+    # ✅ contrato actual tuyo (no se toca)
+    "candidates_strict": candidates,
+    "top20_global": ranking_top20,
     }
 
     logger.info(f"Evaluated (engine): {len(evaluated)}")
