@@ -1,48 +1,47 @@
 # =========================================================
-# alpha_engine_enterprise_strict.py
+# alpha_engine_enterprise_strict_v4.3.py
 # =========================================================
-# ✔ ALFA = Resumen estructural del sistema completo
-# ✔ NO adaptativo
-# ✔ Mercado es componente interno
-# ✔ Lee SOLO datos persistidos
-# ✔ Calcula SOLO lo faltante
-# ✔ Sin fallback silencioso
-# ✔ Debug estructural completo
+# 🔥 V4.3 = V4.2 + V6.3 THETA BONUS + PRODUCTION READY
+# ✔ Time decay + Liquidity gate + Disagreement haircut
+# ✔ V6.3 theta_dynamic boost (+10% si supera umbral propio)
+# ✔ Institutional-grade alpha filtering
 # =========================================================
 
 import os
 import json
+import logging
 from typing import Dict, Any, List, Optional
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 import numpy as np
 
 from signals import compute_signal
 from data_provider import get_price_history
 
-# =========================================================
-# PATHS
-# =========================================================
+# Configuración de Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [ALPHA] %(message)s")
+logger = logging.getLogger("alpha_engine")
 
+# PATHS
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 PRED_DIR = DATA_PATH / "predictions"
-EVAL_DIR = DATA_PATH / "evaluations"
 MARKET_FILE = DATA_PATH / "market_context.json"
 ALPHA_FILE = DATA_PATH / "alpha_last.json"
 
-# =========================================================
-# JSON HELPERS
-# =========================================================
+# CONSTANTES INSTITUCIONALES
+MAX_PRED_AGE_HOURS = 24
+MIN_STRUCTURAL_LIQUIDITY = 0.20
+DISAGREEMENT_HAIRCUT = 0.75
+V6_3_THETA_BONUS = 1.10  # 🔥 NUEVO: Bonus si supera theta_dynamic
 
+# =========================================================
+# HELPERS ATÓMICOS
+# =========================================================
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return None
-
+    if not path.exists(): return None
+    try: return json.loads(path.read_text())
+    except: return None
 
 def save_json(path: Path, data: Dict[str, Any]):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,235 +49,195 @@ def save_json(path: Path, data: Dict[str, Any]):
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
 
-
-def get_latest_prediction_file(ticker: str) -> Path:
-    d = PRED_DIR / ticker
-    if not d.exists():
-        raise FileNotFoundError(f"No predictions folder for {ticker}")
-
-    files = sorted(d.glob("*.json"))
-    if not files:
-        raise FileNotFoundError(f"No prediction files for {ticker}")
-
-    return files[-1]
-
-# =========================================================
-# NORMALIZACIONES
-# =========================================================
-
 def clip01(x: float) -> float:
     return float(np.clip(x, 0.0, 1.0))
 
-
-def normalize_return(ret_pct: float) -> float:
-    return clip01(abs(ret_pct) / 2.5)
-
-
-def normalize_hit_rate(hit: float) -> float:
-    return clip01((hit - 0.45) / 0.35)
-
-
-def normalize_error(mae_pct: float) -> float:
-    return clip01(1.0 / (1.0 + mae_pct / 8.0))
-
-
-def normalize_fundamental(mispricing: float) -> float:
-    return clip01(abs(mispricing) / 30.0)
-
-
-def normalize_market(volatility: float, drawdown: float) -> float:
-    vol_component = clip01(1 - abs(volatility - 0.03) / 0.06)
-    dd_component = clip01(1 + drawdown)
-    return clip01(0.6 * vol_component + 0.4 * dd_component)
-
 # =========================================================
-# STRUCTURAL SCORE (SI NO EXISTE)
+# ESTRUCTURAL (PRIMERO POR PESO)
 # =========================================================
-
-def compute_structural_score(ticker: str) -> float:
-
+def compute_structural_score(ticker: str) -> Dict[str, float]:
     raw = get_price_history(ticker, period="1y", interval="1d")
     if raw is None or len(raw) < 60:
-        raise ValueError("Not enough history for structural")
+        raise ValueError("Insuficiente historial estructural")
 
     closes = raw["Close"].values
     volumes = raw["Volume"].values
-
     returns = np.diff(closes) / closes[:-1]
+    
     volatility = np.std(returns)
     trend = (closes[-1] / closes[0]) - 1
     liquidity = np.mean(closes * volumes)
 
-    trend_score = clip01(trend / 0.20)
-    vol_score = clip01(1 - abs(volatility - 0.03) / 0.03)
-    liquidity_score = clip01(liquidity / 50_000_000)
+    # Scores refinados
+    s_trend = clip01(trend / 0.15)
+    s_vol = clip01(1 - abs(volatility - 0.02) / 0.04)
+    s_liq = clip01(liquidity / 75_000_000)
 
-    return clip01(0.4 * trend_score + 0.3 * vol_score + 0.3 * liquidity_score)
-
-# =========================================================
-# PERFORMANCE HISTÓRICA
-# =========================================================
-
-def compute_performance_metrics(ticker: str, days: int = 60):
-
-    folder = EVAL_DIR / ticker
-    if not folder.exists():
-        raise FileNotFoundError("No evaluation folder")
-
-    cutoff = datetime.utcnow() - timedelta(days=days)
-
-    hits = []
-    errors = []
-
-    for f in folder.glob("*.json"):
-        d = load_json(f)
-        if not d:
-            continue
-
-        dt = datetime.fromisoformat(d["evaluated_at"])
-        if dt < cutoff:
-            continue
-
-        hits.append(1 if d.get("decision_correct") else 0)
-        errors.append(abs(d.get("error_return_pct", 0)))
-
-    if len(hits) < 3:
-        raise ValueError("Not enough evaluation history")
-
-    hit_rate = sum(hits) / len(hits)
-    mae = sum(errors) / len(errors)
-
-    return hit_rate, mae
+    final_struct = clip01(0.4 * s_trend + 0.3 * s_vol + 0.3 * s_liq)
+    
+    return {
+        "score": final_struct,
+        "is_uptrend": trend > 0,
+        "liquidity": s_liq,
+        "volatility": volatility,
+        "trend_pct": trend
+    }
 
 # =========================================================
-# ALFA CORE
+# 🔥 V4.3 CORE ENGINE (CON V6.3 THETA BONUS)
 # =========================================================
+def compute_alpha_for_ticker(ticker: str, market_ctx: Dict, universe_returns: List[float]):
+    
+    # 1. V6.3 PREDICTION + TIME DECAY
+    pred_path = sorted((PRED_DIR / ticker).glob("*.json"))[-1] if (PRED_DIR / ticker).exists() else None
+    if not pred_path: 
+        raise FileNotFoundError(f"No prediction file for {ticker}")
+    
+    pred_data = load_json(pred_path)
+    file_time = datetime.fromtimestamp(pred_path.stat().st_mtime, tz=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - file_time).total_seconds() / 3600
+    
+    time_decay = clip01(1.0 - (age_hours / MAX_PRED_AGE_HOURS))
+    pred_ret = pred_data["prediction"]["ret_ens_pct"]
+    theta_dynamic = pred_data["prediction"]["theta_dynamic_pct"]
 
-def compute_alpha_for_ticker(ticker: str):
+    # 🔥 V6.3 THETA BONUS (NUEVO!)
+    v6_3_bonus = V6_3_THETA_BONUS if abs(pred_ret) >= theta_dynamic else 1.0
 
-    # -------- Prediction --------
-    fp = get_latest_prediction_file(ticker)
-    pred_json = load_json(fp)
-
-    if not pred_json or "prediction" not in pred_json:
-        raise ValueError("Invalid prediction file")
-
-    p = pred_json["prediction"]
-    ret_pct = p["ret_ens_pct"]
-
-    # -------- Signal --------
+    # 2. SIGNAL & HISTÓRICO
     signal = compute_signal(ticker)
+    confidence = signal.get("confidence", 0.0)
+    metrics = signal.get("rolling_metrics", {"hit_rate": 0.45, "mae_return_pct": 10.0})
+    
+    s_hit = clip01((metrics["hit_rate"] - 0.45) / 0.30)
+    s_mae = clip01(1.0 / (1.0 + metrics["mae_return_pct"] / 5.0))
 
-    if "confidence" not in signal:
-        raise ValueError("Signal missing confidence")
+    # 3. LIQUIDITY GATE (CRÍTICO)
+    struct = compute_structural_score(ticker)
+    if struct["liquidity"] < MIN_STRUCTURAL_LIQUIDITY:
+        logger.warning(f"🚫 {ticker} BLOCKED: liquidity {struct['liquidity']:.3f} < {MIN_STRUCTURAL_LIQUIDITY}")
+        return {
+            "ticker": ticker, 
+            "alpha_score": 0.0, 
+            "reason": "liquidity_gate_triggered",
+            "liquidity": struct["liquidity"]
+        }
 
-    confidence = signal.get("confidence")
+    # 4. FUNDAMENTAL & MARKET
+    fundamental = signal.get("fundamental", {})
+    mispricing = fundamental.get("mispricing_pct", 0.0) if fundamental.get("usable") else 0.0
+    s_fund = clip01(abs(mispricing) / 25.0)
+    
+    m_raw = market_ctx.get("source", {}).get("raw_quant", {})
+    vol_m = clip01(1 - abs(m_raw.get("volatility", 0.03) - 0.02) / 0.05)
+    s_market = clip01(0.6 * vol_m + 0.4 * (1 + m_raw.get("drawdown_rolling", 0.0)))
 
-    if confidence is None:
-        # Castigo explícito por falta de historia suficiente
-        confidence = 0.0
-        confidence_penalty = True
-    else:
-        confidence_penalty = False
+    # 5. Z-SCORE RELATIVO (vs universo)
+    avg_u = np.mean(universe_returns) if universe_returns else 0.0
+    std_u = np.std(universe_returns) if universe_returns else 1.0
+    s_ret_rel = clip01(0.5 + (pred_ret - avg_u) / (2 * std_u))
 
-    metrics = signal.get("rolling_metrics")
-
-    if not metrics:
-        # Castigo máximo estructural por falta de historia
-        hit_rate = 0.0
-        mae = 100.0   # Error extremo → normaliza casi a 0
-        rolling_penalty = True
-    else:
-        hit_rate = metrics["hit_rate"]
-        mae = metrics["mae_return_pct"]
-        rolling_penalty = False
-
-    # -------- Fundamental --------
-    fundamental = signal.get("fundamental")
-
-    if not fundamental or not fundamental.get("usable"):
-        # Castigo máximo si no hay fundamental
-        fundamental_score = 0.0
-        fundamental_penalty = True
-    else:
-        mispricing = fundamental.get("mispricing_pct", 0.0)
-        fundamental_score = normalize_fundamental(mispricing)
-        fundamental_penalty = False
-        
-    # -------- Market --------
-    market = load_json(MARKET_FILE)
-    if not market:
-        raise ValueError("Missing market_context.json")
-
-    market_score = normalize_market(
-    market.get("source", {}).get("raw_quant", {}).get("volatility", 0.03),
-    market.get("source", {}).get("raw_quant", {}).get("drawdown_rolling", 0.0)
+    # =====================================================
+    # 🏆 ENSAMBLE V4.3 + V6.3 BONUS
+    # =====================================================
+    base_alpha = (
+        0.25 * struct["score"] +        # Estructural (PRIMERO)
+        0.20 * confidence +             # Confianza signals
+        0.15 * s_ret_rel +              # V6.3 relativo
+        0.15 * s_hit +                  # Hit-rate histórico
+        0.10 * s_mae +                  # Precisión histórica
+        0.10 * s_fund +                 # Fundamental
+        0.05 * s_market                 # Contexto mercado
     )
 
-    # -------- Structural --------
-    try:
-        structural_score = compute_structural_score(ticker)
-        structural_penalty = False
-    except Exception:
-        # Castigo máximo si falla cálculo estructural
-        structural_score = 0.0
-        structural_penalty = True
-    # =====================================================
-    # VECTOR ALFA
-    # =====================================================
+    # ⚔️ DISAGREEMENT HAIRCUT
+    is_pred_positive = pred_ret > 0
+    disagreement = is_pred_positive != struct["is_uptrend"]
+    if disagreement:
+        base_alpha *= DISAGREEMENT_HAIRCUT
+        logger.info(f"⚠️ {ticker} haircut: pred vs trend mismatch")
 
-    alpha = (
-        0.22 * normalize_return(ret_pct) +
-        0.18 * confidence +
-        0.18 * normalize_hit_rate(hit_rate) +
-        0.12 * normalize_error(mae) +
-        0.15 * structural_score +
-        0.10 * fundamental_score +
-        0.05 * market_score
-    )
-
-    alpha = clip01(alpha)
+    # 🎯 FINAL: V6.3 Bonus × Time Decay
+    final_alpha = clip01(base_alpha * v6_3_bonus * time_decay)
 
     return {
         "ticker": ticker,
-        "alpha_score": round(alpha, 4),
+        "alpha_score": round(final_alpha, 4),
         "components": {
-            "return": normalize_return(ret_pct),
-            "confidence": confidence,
-            "hit_rate": normalize_hit_rate(hit_rate),
-            "error_component": normalize_error(mae),
-            "structural": structural_score,
-            "fundamental": fundamental_score,
-            "market": market_score,
+            "structural": round(struct["score"], 3),
+            "relative_return": round(s_ret_rel, 3),
+            "confidence": round(confidence, 3),
+            "v6_3_bonus": round(v6_3_bonus, 3),
+            "time_decay": round(time_decay, 3),
+            "hit_rate": round(s_hit, 3),
+            "fundamental": round(s_fund, 3)
         },
-        "raw": {
-            "ret_pct": ret_pct,
-            "hit_rate": hit_rate,
-            "mae": mae,
+        "flags": {
+            "disagreement_penalty": disagreement,
+            "liquidity_gate": False,
+            "v6_3_theta_cleared": abs(pred_ret) >= theta_dynamic,
+            "age_hours": round(age_hours, 1),
+            "theta_dynamic_pct": round(theta_dynamic, 3)
+        },
+        "debug": {
+            "pred_ret_pct": round(pred_ret, 3),
+            "struct_trend": round(struct["trend_pct"], 3)
         }
     }
 
 # =========================================================
-# BATCH + PERSIST
+# 🚀 BATCH PRODUCTION
 # =========================================================
-
 def compute_and_persist_alpha(tickers: List[str]):
-
-    results = {}
-
+    """Entrada: tickers.json → Salida: /data/alpha_last.json"""
+    
+    logger.info(f"🔬 AlphaEngine V4.3 iniciado | {len(tickers)} tickers")
+    
+    # Carga mercado
+    market_ctx = load_json(MARKET_FILE) or {}
+    
+    # Pre-scan universo para Z-score
+    universe_preds = []
     for t in tickers:
         try:
-            results[t] = compute_alpha_for_ticker(t)
-        except Exception as e:
-            results[t] = {"error": str(e)}
+            path = sorted((PRED_DIR / t).glob("*.json"))[-1]
+            d = load_json(path)
+            universe_preds.append(d["prediction"]["ret_ens_pct"])
+        except:
+            continue
 
+    results = {}
+    valid_count = 0
+    
+    for t in tickers:
+        try:
+            result = compute_alpha_for_ticker(t, market_ctx, universe_preds)
+            results[t] = result
+            if result["alpha_score"] > 0:
+                valid_count += 1
+        except Exception as e:
+            logger.error(f"❌ {t}: {e}")
+            results[t] = {"error": str(e), "alpha_score": 0.0}
+
+    # Persist atomic
     payload = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": "4.3",
         "universe_size": len(tickers),
-        "calculated": len([r for r in results.values() if "alpha_score" in r]),
+        "valid_alphas": valid_count,
+        "alpha_threshold": 0.70,
         "results": results
     }
 
     save_json(ALPHA_FILE, payload)
-
+    logger.info(f"✅ Alpha V4.3 COMPLETADO | {valid_count}/{len(tickers)} válidos")
+    
     return payload
+
+# =========================================================
+# 🧪 TEST UNITARIO
+# =========================================================
+if __name__ == "__main__":
+    from model import run_model  # Para test
+    test_tickers = ["SPY", "TSLA", "AAPL"]
+    compute_and_persist_alpha(test_tickers) y ahora?
