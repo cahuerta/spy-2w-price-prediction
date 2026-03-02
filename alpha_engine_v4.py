@@ -240,4 +240,4 @@ def compute_and_persist_alpha(tickers: List[str]):
 if __name__ == "__main__":
     from model import run_model  # Para test
     test_tickers = ["SPY", "TSLA", "AAPL"]
-    compute_and_persist_alpha(test_tickers) y ahora?
+    compute_and_persist_alpha(test_tickers)
