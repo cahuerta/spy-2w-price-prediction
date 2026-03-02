@@ -9,12 +9,13 @@
 # ✔ COMPATIBLE con signals.py (safe + silent)
 # ======================================================
 
-import yfinance as yf
+
 import numpy as np
 import pandas as pd
 from typing import Dict, Optional
 from dataclasses import dataclass
 from scipy.optimize import newton
+from data_provider import get_fundamental_meta
 
 
 # ======================================================
@@ -122,9 +123,11 @@ def run_model_fundamental_dividend_improved(
     assumptions = assumptions or ModelAssumptions()
 
     try:
-        tk = yf.Ticker(ticker)
-        info = tk.info or {}
-        dividends = tk.dividends
+        meta = get_fundamental_meta(ticker)
+
+        info = meta.get("info", {})
+        dividends_dict = meta.get("dividends_last_year", {})
+        dividends = pd.Series(dividends_dict)
 
         price_market = info.get("currentPrice")
         dividend_rate = info.get("dividendRate", 0.0)
