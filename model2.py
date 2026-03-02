@@ -16,7 +16,7 @@ from typing import Dict, Optional
 from dataclasses import dataclass
 from scipy.optimize import newton
 from data_provider import get_fundamental_meta
-
+from market_data_cache_v2 import get_last_price_from_cache
 
 # ======================================================
 # Supuestos configurables
@@ -129,7 +129,7 @@ def run_model_fundamental_dividend_improved(
         dividends_dict = meta.get("dividends_last_year", {})
         dividends = pd.Series(dividends_dict)
 
-        price_market = info.get("currentPrice")
+        price_market = get_last_price_from_cache(ticker)
         dividend_rate = info.get("dividendRate", 0.0)
         forward_dividend = info.get(
             "forwardAnnualDividendRate",
