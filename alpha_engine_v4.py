@@ -234,10 +234,4 @@ def compute_and_persist_alpha(tickers: List[str]):
     
     return payload
 
-# =========================================================
-# 🧪 TEST UNITARIO
-# =========================================================
-if __name__ == "__main__":
-    from model import run_model  # Para test
-    test_tickers = ["SPY", "TSLA", "AAPL"]
-    compute_and_persist_alpha(test_tickers)
+
