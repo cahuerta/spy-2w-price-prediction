@@ -10,9 +10,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from pathlib import Path
 
-from portfolio_store import (
-    load_positions, register_open, register_close, register_rotate, portfolio_summary
-)
+from portfolio_store import load_positions
 from broker import get_trading_engine
 from capital_governor import CapitalGovernor, CapitalState
 
@@ -49,6 +47,8 @@ class TradingOrchestrator:
         
         if not self._check_daily_run():
             return {"status": "skipped_daily", "timestamp": datetime.utcnow().isoformat()}
+    self.broker.sync_positions_from_broker()
+positions = load_positions()
 
         mode = market_ctx.get("market_mode", "neutral")
         signals = signals or {}
@@ -128,9 +128,7 @@ class TradingOrchestrator:
         try:
             broker_res = await asyncio.wait_for(self.broker.execute_decision(decision), timeout=30)
             if broker_res.status == "executed":
-                if action == "OPEN": register_open(decision, broker_res.model_dump(), market_ctx)
-                elif action == "CLOSE": register_close(decision, broker_res.model_dump())
-                elif action == "ROTATE": register_rotate(decision, broker_res.model_dump(), broker_res.model_dump(), market_ctx)
+            
             return {"decision": decision, "result": broker_res.model_dump()}
         except Exception as e:
             logger.error(f"❌ Error {ticker}: {e}")
