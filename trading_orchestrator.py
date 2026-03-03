@@ -1,6 +1,6 @@
 # =========================================================
-# trading_orchestrator.py — V2.6 HEDGE FUND EDITION
-# ALPACA = SINGLE SOURCE OF TRUTH
+# trading_orchestrator.py — V2.9 ALPHA-DICTATOR PRODUCTION
+# ALPHA MANDATORY | PM ADVISORY | GOVERNOR RISK CONTROL
 # =========================================================
 
 import logging
@@ -8,339 +8,253 @@ import asyncio
 import os
 import json
 from typing import Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from portfolio_store import load_positions
 from broker import get_trading_engine
 from capital_governor import CapitalGovernor
+from alpha_engine_enterprise_strict_v4_3 import compute_and_persist_alpha
 
-# PMs
 from pm_growth import PMGrowth
 from pm_neutral import PMNeutral
 from pm_defensive import PMDefensive
 
-# Alpha Engine
-from alpha_engine_v4 import compute_and_persist_alpha
-
 logger = logging.getLogger("trading_orchestrator")
+logging.basicConfig(level=logging.INFO)
 
 
 class TradingOrchestrator:
     def __init__(self):
+
         self.broker = get_trading_engine()
-        self._last_run_file = Path("/tmp/trading_last_run.flag")
+        self.flag_file = Path("/tmp/trading_last_run.flag")
 
         self.fixed_capital = float(os.getenv("FIXED_CAPITAL", "1000000"))
-        self._daily_limit = int(os.getenv("MAX_ORDERS_DAY", "10"))
-        self._alpha_threshold = float(os.getenv("ALPHA_THRESHOLD", "0.70"))
+        self.daily_limit = int(os.getenv("MAX_ORDERS_DAY", "15"))
 
-        self.governor = CapitalGovernor(fixed_capital=self.fixed_capital)
+        # Alpha thresholds
+        self.alpha_growth = float(os.getenv("ALPHA_GROWTH", "0.65"))
+        self.alpha_neutral = float(os.getenv("ALPHA_NEUTRAL", "0.75"))
+        self.alpha_defensive = float(os.getenv("ALPHA_DEFENSIVE", "0.85"))
 
-        logger.info(
-            f"🧭 Orchestrator v2.6 Online | Capital: ${self.fixed_capital:,.0f}"
-        )
+        self.alpha_elite = float(os.getenv("ALPHA_ELITE", "0.88"))
+        self.alpha_hold_shield = float(os.getenv("ALPHA_SHIELD", "0.75"))
+        self.alpha_kill = float(os.getenv("ALPHA_KILL", "-0.40"))
+
+        self.governor = CapitalGovernor(self.fixed_capital)
+
+        logger.info(f"🚀 v2.9 ALPHA-DICTATOR PRODUCTION | Capital ${self.fixed_capital:,.0f}")
 
     # =========================================================
     # MAIN RUN
     # =========================================================
-    async def run(
-        self,
-        market_ctx: Dict[str, Any],
-        signals: Dict[str, Dict[str, Any]] | None = None,
-        anchor_universe: List[Dict[str, Any]] | None = None,
-    ) -> Dict[str, Any]:
+    async def run(self, market_ctx: Dict[str, Any], signals: Dict = None, anchor_universe: List = None) -> Dict:
 
-        if not self._check_daily_run():
-            return {
-                "status": "skipped_daily",
-                "timestamp": datetime.utcnow().isoformat(),
-            }
+        if not self._daily_flag_check():
+            return {"status": "skipped_daily_limit"}
 
-        # 🔄 1) SINCRONIZAR ESTADO REAL DESDE ALPACA
-        self.broker.sync_positions_from_broker()
+        # 1️⃣ SYNC
+        if hasattr(self.broker, "sync_positions_from_broker"):
+            sync_result = self.broker.sync_positions_from_broker()
+            if asyncio.iscoroutine(sync_result):
+                await sync_result
 
         positions = load_positions()
+        portfolio_tickers = {p["ticker"].upper() for p in positions}
         mode = market_ctx.get("market_mode", "neutral")
-        signals = signals or {}
+
+        logger.info(f"📊 Portfolio: {len(positions)} | Mode: {mode}")
+
+        # 2️⃣ FULL ALPHA
+        alpha_data = await self._compute_full_alpha()
+        alpha_map = {
+            t.upper(): d
+            for t, d in alpha_data.get("results", {}).items()
+            if isinstance(d, dict)
+        }
+
+        # 3️⃣ PM DECISIONS
+        pm_decisions = await self._get_pm_decisions(
+            mode,
+            positions,
+            signals or {},
+            anchor_universe
+        )
+
+        # 4️⃣ PRIORITY ENGINE
+        closes = []
+        opens = []
+
+        # 🔒 SHIELD + PM CLOSE
+        for decision in pm_decisions:
+            if decision.get("action") == "CLOSE":
+                ticker = decision.get("ticker", "").upper()
+                alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
+
+                if alpha_score >= self.alpha_hold_shield:
+                    logger.info(f"🛡 SHIELD BLOCK {ticker} | alpha={alpha_score:.3f}")
+                    continue
+
+                closes.append({
+                    "action": "CLOSE",
+                    "ticker": ticker,
+                    "reason": decision.get("reason", "PM_CLOSE")
+                })
+
+        # 💀 KILL SWITCH
+        for ticker in portfolio_tickers:
+            alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
+            if alpha_score <= self.alpha_kill:
+                closes.append({
+                    "action": "CLOSE",
+                    "ticker": ticker,
+                    "reason": f"ALPHA_KILL_{alpha_score:.3f}"
+                })
+                logger.warning(f"💀 KILL {ticker} | alpha={alpha_score:.3f}")
+
+        # 🔁 Deduplicate CLOSES
+        closes = list({c["ticker"]: c for c in closes}.values())
+
+        # 📈 PM OPENS
+        for decision in pm_decisions:
+            if decision.get("action") in ["OPEN", "ROTATE"]:
+                opens.append(decision)
+
+        # 🚀 ALPHA INJECTION
+        threshold = self._alpha_threshold(mode)
+
+        for ticker, data in alpha_map.items():
+            score = data.get("alpha_score", 0)
+
+            if ticker not in portfolio_tickers and score >= threshold:
+                opens.append({
+                    "action": "OPEN",
+                    "ticker": ticker,
+                    "shares": 0,
+                    "reason": f"ALPHA_INJECT_{score:.3f}",
+                    "alpha": score
+                })
+
+        # 🔁 Deduplicate OPENS (Alpha overrides PM)
+        opens_dict = {}
+        for o in opens:
+            opens_dict[o["ticker"].upper()] = o
+        unique_opens = list(opens_dict.values())
+
+        # 5️⃣ GOVERNOR
+        sized_opens = self.governor.adjust_sizing(positions, unique_opens)
+
+        # 6️⃣ FINAL FILTER
+        final_queue = closes[:]
+        elite_count = 0
+
+        for cmd in sized_opens:
+            ticker = cmd["ticker"].upper()
+            score = alpha_map.get(ticker, {}).get("alpha_score", 0)
+
+            if score >= self.alpha_elite:
+                logger.info(f"🔥 ELITE {ticker} {score:.3f}")
+                elite_count += 1
+                final_queue.append(cmd)
+
+            elif score >= threshold:
+                final_queue.append(cmd)
+
+            else:
+                logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f} < {threshold}")
+
+        # 7️⃣ EXECUTION
+        results = []
+        executed = 0
+
+        for order in final_queue[:self.daily_limit]:
+            try:
+                res = await asyncio.wait_for(
+                    self.broker.execute_decision(order),
+                    timeout=30
+                )
+
+                results.append({
+                    "ticker": order["ticker"],
+                    "status": "success",
+                })
+                executed += 1
+
+                await asyncio.sleep(0.8)
+
+            except Exception as e:
+                results.append({
+                    "ticker": order.get("ticker"),
+                    "status": "error",
+                    "error": str(e)
+                })
+
+        self.flag_file.write_text(datetime.now(timezone.utc).isoformat())
 
         logger.info(
-            f"🚦 MODO: {mode.upper()} | Posiciones actuales: {len(positions)}"
+            f"✅ EXECUTED {executed}/{len(final_queue)} | Elite executed: {elite_count}"
         )
-
-        # 🔍 2) Alpha filtering
-        alpha_filtered_tickers = await self._get_alpha_filtered_tickers()
-
-        # 🧠 3) PM decisions
-        raw_decisions = self._collect_pm_decisions(
-            mode, positions, signals, anchor_universe
-        )
-
-        # 📦 4) Segregación
-        priority_closes = [
-            d for d in raw_decisions if d.get("action") == "CLOSE"
-        ]
-
-        investment_candidates = [
-            d for d in raw_decisions
-            if d.get("action") in ["OPEN", "ROTATE"]
-        ]
-
-        # 🏛 5) Governor sizing
-        validated = self.governor.adjust_sizing(
-            positions, investment_candidates
-        )
-
-        # 🎯 6) Consolidar final queue
-        final_queue = priority_closes.copy()
-
-        for cmd in validated:
-            ticker = cmd.get("ticker")
-
-            if (
-                cmd.get("action") == "OPEN"
-                and ticker not in alpha_filtered_tickers
-            ):
-                logger.info(
-                    f"⛔ {ticker} bloqueado por Alpha (< {self._alpha_threshold})"
-                )
-                continue
-
-            final_queue.append(cmd)
-
-        # 🤖 7) Ejecución serial
-        results = []
-        executed_count = 0
-
-        for order in final_queue[: self._daily_limit]:
-            res = await self._execute(order)
-            results.append(res)
-
-            if res["result"].get("status") == "executed":
-                executed_count += 1
-
-            await asyncio.sleep(0.5)
-
-        self._last_run_file.write_text(
-            datetime.utcnow().isoformat()
-        )
-
-        # 🔄 Estado final actualizado
-        self.broker.sync_positions_from_broker()
 
         return {
-            "status": "ok",
-            "executed_count": executed_count,
-            "capital_state": self.governor.evaluate(
-                load_positions()
-            ).to_dict(),
-            "results": results,
+            "status": "success",
+            "mode": mode,
+            "executed": executed,
+            "elite_executed": elite_count,
+            "queue_size": len(final_queue),
+            "results": results
         }
 
     # =========================================================
-    # PM DECISION COLLECTION
+    # HELPERS
     # =========================================================
-    def _collect_pm_decisions(
-        self, mode, positions, signals, anchor_universe
-    ) -> List[Dict]:
+    async def _compute_full_alpha(self) -> Dict:
+        tickers_path = Path(os.getenv("DATA_PATH", "/data")) / "tickers.json"
+        universe = json.loads(tickers_path.read_text()) if tickers_path.exists() else []
+        return await asyncio.to_thread(compute_and_persist_alpha, universe)
 
-        if mode == "growth":
-            pm = PMGrowth(fixed_capital=self.fixed_capital)
+    def _alpha_threshold(self, mode: str) -> float:
+        return {
+            "growth": self.alpha_growth,
+            "defensive": self.alpha_defensive
+        }.get(mode, self.alpha_neutral)
 
-            return [
-                {
-                    **pm.evaluate_position(
-                        p, signals.get(p["ticker"])
-                    ),
-                    "pm": "GROWTH",
-                }
-                for p in positions
-            ]
+    async def _get_pm_decisions(self, mode: str, positions: List[Dict], signals: Dict, anchor: List) -> List[Dict]:
 
-        elif mode == "defensive":
-            pm = PMDefensive()
-
-            decisions = pm.evaluate_portfolio(
-                positions,
-                anchor_universe,
-                total_capital=self.fixed_capital,
-            )
-
-            return [
-                {**d.to_dict(), "pm": "DEFENSIVE"}
-                for d in decisions
-            ]
-
-        else:
-            pm = PMNeutral()
-            res = pm.evaluate_portfolio(positions)
-
-            return [
-                {**d, "pm": "NEUTRAL"}
-                for d in res.get("decisions", [])
-            ]
-
-    # =========================================================
-    # ALPHA ENGINE
-    # =========================================================
-    async def _get_alpha_filtered_tickers(self) -> List[str]:
-        try:
-            path = Path(os.getenv("DATA_PATH", "/data")) / "tickers.json"
-
-            if not path.exists():
-                return []
-
-            universe = json.loads(path.read_text())
-
-            payload = await asyncio.to_thread(
-                compute_and_persist_alpha, universe
-            )
-
-            scores = payload.get("results", {})
-
-            return [
-                t
-                for t, v in scores.items()
-                if isinstance(v, dict)
-                and v.get("alpha_score", 0)
-                >= self._alpha_threshold
-            ]
-
-        except Exception as e:
-            logger.error(f"Alpha Engine error: {e}")
-            return []
-
-    # =========================================================
-    # EXECUTION (NO JSON WRITE)
-    # =========================================================
-    async def _execute(self, decision: Dict) -> Dict:
-
-        ticker = (
-            decision.get("ticker")
-            or decision.get("open_ticker")
-        )
+        decisions = []
 
         try:
-            broker_res = await asyncio.wait_for(
-                self.broker.execute_decision(decision),
-                timeout=45,
-            )
+            if mode == "growth":
+                pm = PMGrowth(self.fixed_capital)
+                for pos in positions:
+                    d = pm.evaluate_position(pos, signals.get(pos["ticker"]))
+                    if isinstance(d, dict):
+                        decisions.append(d)
 
-            # 🔄 Si ejecuta → sincronizamos espejo
-            if broker_res.status == "executed":
-                self.broker.sync_positions_from_broker()
-                logger.info(
-                    f"🔄 Sync post {decision.get('action')} {ticker}"
-                )
+            elif mode == "defensive":
+                pm = PMDefensive()
+                raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
 
-            return {
-                "decision": decision,
-                "result": broker_res.model_dump(),
-            }
+                if isinstance(raw, list):
+                    decisions.extend([
+                        r if isinstance(r, dict) else r.to_dict()
+                        for r in raw
+                    ])
+                elif isinstance(raw, dict):
+                    decisions.extend(raw.get("decisions", []))
+
+            else:
+                pm = PMNeutral()
+                raw = pm.evaluate_portfolio(positions)
+                decisions.extend(raw.get("decisions", []))
 
         except Exception as e:
-            logger.error(f"❌ Error ejecución {ticker}: {e}")
+            logger.error(f"PM error: {e}")
 
-            return {
-                "decision": decision,
-                "result": {
-                    "status": "error",
-                    "reason": str(e),
-                },
-            }
+        return decisions
 
-    # =========================================================
-    # DAILY RUN CHECK
-    # =========================================================
-    def _check_daily_run(self) -> bool:
-        if not self._last_run_file.exists():
+    def _daily_flag_check(self) -> bool:
+        if not self.flag_file.exists():
             return True
-
-        last_date = datetime.fromisoformat(
-            self._last_run_file.read_text().strip()
-        ).date()
-
-        return last_date != datetime.utcnow().date()
-
-    # =========================================================
-    # PREVIEW (NO BROKER CALL)
-    # =========================================================
-    async def preview_executability(
-        self,
-        market_ctx: Dict[str, Any],
-        signals: Dict[str, Dict[str, Any]] | None = None,
-        anchor_universe: List[Dict[str, Any]] | None = None,
-    ) -> Dict[str, Any]:
-
-        signals = signals or {}
-
-        self.broker.sync_positions_from_broker()
-        positions = load_positions()
-
-        mode = market_ctx.get("market_mode", "neutral")
-
-        alpha_filtered = await self._get_alpha_filtered_tickers()
-
-        raw_decisions = self._collect_pm_decisions(
-            mode, positions, signals, anchor_universe
-        )
-
-        results = {}
-
-        for cmd in raw_decisions:
-
-            ticker = cmd.get("ticker")
-            action = cmd.get("action")
-
-            if action == "CLOSE":
-                results[ticker] = {
-                    "action": "CLOSE",
-                    "executable": True,
-                    "reason": None,
-                }
-
-        investment_candidates = [
-            d for d in raw_decisions
-            if d.get("action") in ["OPEN", "ROTATE"]
-        ]
-
-        validated = self.governor.adjust_sizing(
-            positions, investment_candidates
-        )
-
-        for cmd in validated:
-
-            ticker = cmd.get("ticker")
-            action = cmd.get("action")
-
-            if (
-                action == "OPEN"
-                and ticker not in alpha_filtered
-            ):
-                results[ticker] = {
-                    "action": action,
-                    "executable": False,
-                    "reason": "alpha_below_threshold",
-                }
-                continue
-
-            if cmd.get("shares", 0) <= 0:
-                results[ticker] = {
-                    "action": action,
-                    "executable": False,
-                    "reason": "sizing_block",
-                }
-                continue
-
-            results[ticker] = {
-                "action": action,
-                "executable": True,
-                "reason": None,
-            }
-
-        return {
-            "results": results,
-            "capital_state": self.governor.evaluate(
-                positions
-            ).to_dict(),
-        }
+        last_run = datetime.fromisoformat(self.flag_file.read_text().strip())
+        return last_run.date() != datetime.now(timezone.utc).date()
