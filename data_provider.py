@@ -14,7 +14,7 @@ import pandas as pd
 from providers.cache_provider import get_price_history as cache_fetch
 from providers.yahoo_provider import get_price_history as yahoo_fetch
 from providers.twelve_provider import get_price_history as twelve_fetch
-
+from market_data_cache import load_meta_cache
 logger = logging.getLogger("data_provider")
 
 # =========================================================
@@ -23,7 +23,9 @@ logger = logging.getLogger("data_provider")
 # 🔥 DEFAULT = CACHE
 DEFAULT_PROVIDER = os.getenv("DATA_PROVIDER", "cache").lower()
 
-
+def get_fundamental_meta(ticker: str):
+    return load_meta_cache(ticker)
+    
 # =========================================================
 # MAIN ENTRYPOINT
 # =========================================================
