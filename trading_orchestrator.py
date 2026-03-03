@@ -175,8 +175,8 @@ class TradingOrchestrator:
         return last_date != datetime.utcnow().date()
 
     # =========================================================
-        # PREVIEW EXECUTABILITY (NO EJECUTA)
-        # =========================================================
+    # PREVIEW EXECUTABILITY (NO EJECUTA)
+    # =========================================================
         async def preview_executability(
             self,
             market_ctx: Dict[str, Any],
