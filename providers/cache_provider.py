@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import json
 
-from market_data_cache_v2 import (
+from market_data_cache import (
     load_prices_df,
     refresh_market_cache,
     CACHE_DIR
