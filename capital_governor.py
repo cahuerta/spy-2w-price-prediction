@@ -136,6 +136,79 @@ class CapitalGovernor:
             data_quality=data_quality
         )
 
+    # --- INSERTAR ESTO DENTRO DE LA CLASE CapitalGovernor (v2.4) ---
+
+    def adjust_sizing(self, current_positions: List[Dict], candidates: List[Dict]) -> List[Dict]:
+        """
+        Toma las intenciones de los PMs y ajusta los 'shares' según 
+        el Cash Buffer del 10% y el Riesgo Sistémico (ES).
+        """
+        try:
+            # Re-evaluamos el estado actual antes de procesar candidatos
+            state = self.evaluate(current_positions)
+        except Exception as e:
+            logger.error(f"❌ Error evaluando riesgo para sizing: {e}")
+            return [] # Si falla el riesgo, no abrimos nada (Safe-stop)
+
+        # 1. BLOQUEO TOTAL DE RIESGO (ES > 45%)
+        if state.expected_shortfall_95_annual > 0.45:
+            logger.warning(f"🛑 RIESGO EXTREMO: ES {state.expected_shortfall_95_annual:.2%}. Bloqueando aperturas.")
+            return []
+
+        # 2. CÁLCULO DE PODER DE COMPRA REAL (Respetando el 10% de Buffer)
+        # Usamos state.cash_reserve que ya calculaste en evaluate()
+        safety_buffer = self.fixed_capital * 0.10 
+        effective_buying_power = max(0, state.cash_reserve - safety_buffer)
+
+        logger.info(f"💰 Cash Reserve: ${state.cash_reserve:,.0f} | Buffer: ${safety_buffer:,.0f} | Power: ${effective_buying_power:,.0f}")
+
+        adjusted_decisions = []
+        
+        for cand in candidates:
+            ticker = cand.get('ticker', '').upper()
+            # Buscamos el precio en cualquiera de los dos campos comunes
+            price = cand.get('entry_price') or cand.get('price_now')
+            requested_shares = cand.get('shares', 0)
+            
+            if not price or requested_shares <= 0:
+                logger.warning(f"⚠️ {ticker} saltado: Precio o shares inválidos ({price}, {requested_shares})")
+                continue
+
+            # 3. FACTOR DE REDUCCIÓN SEGÚN RIESGO ACTUAL
+            risk_factor = 1.0
+            if state.expected_shortfall_95_annual > 0.35: 
+                risk_factor = 0.5 # Reducimos a la mitad si el riesgo es alto
+            elif state.expected_shortfall_95_annual > 0.25: 
+                risk_factor = 0.8 # Reducimos un 20% si el riesgo es moderado
+
+            # 4. SIZING ATÓMICO
+            max_shares_by_cash = int(effective_buying_power // price)
+            final_shares = int(min(requested_shares, max_shares_by_cash) * risk_factor)
+
+            if final_shares > 0:
+                # Modificamos la decisión original con los shares aprobados por el Gobernador
+                cand['shares'] = final_shares
+                
+                # Auditoría de por qué se cambió el tamaño
+                cand.setdefault('meta', {})['governor_adj'] = {
+                    "original_shares": requested_shares,
+                    "risk_factor": risk_factor,
+                    "es_at_execution": state.expected_shortfall_95_annual
+                }
+                
+                adjusted_decisions.append(cand)
+                
+                # RESTAMOS EL COSTO DEL PODER DE COMPRA PARA EL SIGUIENTE CANDIDATO
+                # Esto evita que el orquestador mande 5 órdenes que juntas superen el cash
+                effective_buying_power -= (final_shares * price)
+                
+                logger.info(f"✅ {ticker}: Ajustado a {final_shares}s (Original: {requested_shares})")
+            else:
+                logger.warning(f"❌ {ticker}: Rechazado por falta de Capital/Buffer.")
+
+        return adjusted_decisions
+
+
 if __name__ == "__main__":
     positions = [
         {"ticker": "AAPL", "qty": 100, "price_now": 220.0},
