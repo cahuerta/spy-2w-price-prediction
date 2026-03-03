@@ -158,11 +158,16 @@ def compute_alpha_for_ticker(ticker: str, market_ctx: Dict, universe_returns: Li
         logger.info(f"⚠️ {ticker} haircut: pred vs trend mismatch")
 
     # 🎯 FINAL: V6.3 Bonus × Time Decay
-    final_alpha = clip01(base_alpha * v6_3_bonus * time_decay)
+    unsigned_alpha = clip01(base_alpha * v6_3_bonus * time_decay)
 
-    return {
-        "ticker": ticker,
-        "alpha_score": round(final_alpha, 4),
+    # 🔥 CONSERVAR SIGNO DE LA PREDICCIÓN
+    direction = 1 if pred_ret > 0 else -1 if pred_ret < 0 else 0
+
+   unsigned_alpha = unsigned_alpha * direction
+
+   return {
+    "ticker": ticker,
+    "alpha_score": round(signed_alpha, 4),
         "components": {
             "structural": round(struct["score"], 3),
             "relative_return": round(s_ret_rel, 3),
