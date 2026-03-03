@@ -161,6 +161,38 @@ class TradingEngine:
 
     async def get_account(self):
         return self.client.get_account()
+        def sync_positions_from_broker(self):
+    """
+    Descarga posiciones reales desde Alpaca
+    y sobrescribe /data/positions.json
+    """
+
+    from portfolio_store import save_positions
+
+    alpaca_positions = self.client.get_all_positions()
+
+    new_positions = []
+
+    for p in alpaca_positions:
+        new_positions.append({
+            "id": f"{p.symbol}-{datetime.utcnow().isoformat()}",
+            "ticker": p.symbol,
+            "qty": float(p.qty),
+            "entry_price": float(p.avg_entry_price),
+            "price_now": float(p.current_price),
+            "peak_price": float(p.current_price),
+            "days_at_peak": 1,
+            "entry_time": datetime.utcnow().isoformat(),
+            "is_anchor": False,
+            "market_mode_entry": None,
+            "meta": {
+                "source": "alpaca_sync"
+            }
+        })
+
+    save_positions(new_positions)
+
+    logger.info(f"🔄 Synced {len(new_positions)} positions from Alpaca")
 
     def calculate_qty(self, ticker: str, target_pct: float) -> float:
 
