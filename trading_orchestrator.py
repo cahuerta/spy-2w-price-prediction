@@ -174,82 +174,79 @@ class TradingOrchestrator:
         last_date = datetime.fromisoformat(self._last_run_file.read_text().strip()).date()
         return last_date != datetime.utcnow().date()
 
-    # =========================================================
+# =========================================================
     # PREVIEW EXECUTABILITY (NO EJECUTA)
     # =========================================================
-        async def preview_executability(
-            self,
-            market_ctx: Dict[str, Any],
-            signals: Dict[str, Dict[str, Any]] | None = None,
-            anchor_universe: List[Dict[str, Any]] | None = None,
-        ) -> Dict[str, Any]:
+    async def preview_executability(
+        self,
+        market_ctx: Dict[str, Any],
+        signals: Dict[str, Dict[str, Any]] | None = None,
+        anchor_universe: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any]:
 
-            signals = signals or {}
-            positions = load_positions()
+        signals = signals or {}
+        positions = load_positions()
 
-            mode = market_ctx.get("market_mode", "neutral")
+        mode = market_ctx.get("market_mode", "neutral")
 
-            # 1️⃣ Alpha válidos
-            alpha_filtered = await self._get_alpha_filtered_tickers()
+        # 1️⃣ Alpha válidos
+        alpha_filtered = await self._get_alpha_filtered_tickers()
 
-            # 2️⃣ Decisiones crudas desde PM
-            raw_decisions = self._collect_pm_decisions(
-                mode, positions, signals, anchor_universe
-            )
+        # 2️⃣ Decisiones crudas desde PM
+        raw_decisions = self._collect_pm_decisions(
+            mode, positions, signals, anchor_universe
+        )
 
-            results = {}
+        results = {}
 
-            # 3️⃣ Procesar CIERRES (siempre ejecutables)
-            for cmd in raw_decisions:
-                if cmd["action"] == "CLOSE":
-                    ticker = cmd["ticker"]
-                    results[ticker] = {
-                        "action": "CLOSE",
-                        "executable": True,
-                        "reason": None
-                    }
-
-            # 4️⃣ Procesar OPEN / ROTATE (pasar por governor)
-            investment_candidates = [
-                d for d in raw_decisions
-                if d["action"] in ["OPEN", "ROTATE"]
-            ]
-
-            validated = self.governor.adjust_sizing(
-                positions,
-                investment_candidates
-            )
-
-            for cmd in validated:
+        # 3️⃣ Procesar CIERRES (siempre ejecutables)
+        for cmd in raw_decisions:
+            if cmd["action"] == "CLOSE":
                 ticker = cmd["ticker"]
-                action = cmd["action"]
-
-                # 🚫 Alpha bloquea solo OPEN
-                if action == "OPEN" and ticker not in alpha_filtered:
-                    results[ticker] = {
-                        "action": action,
-                        "executable": False,
-                        "reason": "alpha_below_threshold"
-                    }
-                    continue
-
-                # 🚫 Governor sizing bloquea si shares <= 0
-                if cmd.get("shares", 0) <= 0:
-                    results[ticker] = {
-                        "action": action,
-                        "executable": False,
-                        "reason": "sizing_block"
-                    }
-                    continue
-
-                # ✅ Ejecutable
                 results[ticker] = {
-                    "action": action,
+                    "action": "CLOSE",
                     "executable": True,
                     "reason": None
                 }
 
-            return {
-                "results": results,
-                "capital_state": self.governor.evaluate(positions).to_dict()
+        # 4️⃣ Procesar OPEN / ROTATE
+        investment_candidates = [
+            d for d in raw_decisions
+            if d["action"] in ["OPEN", "ROTATE"]
+        ]
+
+        validated = self.governor.adjust_sizing(
+            positions,
+            investment_candidates
+        )
+
+        for cmd in validated:
+            ticker = cmd["ticker"]
+            action = cmd["action"]
+
+            if action == "OPEN" and ticker not in alpha_filtered:
+                results[ticker] = {
+                    "action": action,
+                    "executable": False,
+                    "reason": "alpha_below_threshold"
+                }
+                continue
+
+            if cmd.get("shares", 0) <= 0:
+                results[ticker] = {
+                    "action": action,
+                    "executable": False,
+                    "reason": "sizing_block"
+                }
+                continue
+
+            results[ticker] = {
+                "action": action,
+                "executable": True,
+                "reason": None
             }
+
+        return {
+            "results": results,
+            "capital_state": self.governor.evaluate(positions).to_dict()
+        }
