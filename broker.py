@@ -161,20 +161,21 @@ class TradingEngine:
 
     async def get_account(self):
         return self.client.get_account()
-        def sync_positions_from_broker(self):
+        
+    def sync_positions_from_broker(self):
     """
     Descarga posiciones reales desde Alpaca
     y sobrescribe /data/positions.json
     """
 
-    from portfolio_store import save_positions
+        from portfolio_store import save_positions
 
-    alpaca_positions = self.client.get_all_positions()
+        alpaca_positions = self.client.get_all_positions()
 
-    new_positions = []
+        new_positions = []
 
-    for p in alpaca_positions:
-        new_positions.append({
+        for p in alpaca_positions:
+            new_positions.append({
             "id": f"{p.symbol}-{datetime.utcnow().isoformat()}",
             "ticker": p.symbol,
             "qty": float(p.qty),
