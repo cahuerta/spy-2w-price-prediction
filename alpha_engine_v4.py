@@ -161,13 +161,41 @@ def compute_alpha_for_ticker(ticker: str, market_ctx: Dict, universe_returns: Li
     unsigned_alpha = clip01(base_alpha * v6_3_bonus * time_decay)
 
     # 🔥 CONSERVAR SIGNO DE LA PREDICCIÓN
-    direction = 1 if pred_ret > 0 else -1 if pred_ret < 0 else 0
+    EPS = 1e-6
 
-   unsigned_alpha = unsigned_alpha * direction
+    if pred_ret > EPS:
+        direction = 1
+    elif pred_ret < -EPS:
+        direction = -1
+    else:
+        direction = 0
 
-   return {
-    "ticker": ticker,
-    "alpha_score": round(signed_alpha, 4),
+    signed_alpha = unsigned_alpha * direction
+
+    return {
+        "ticker": ticker,
+        "alpha_score": round(signed_alpha, 4),
+        "components": {
+            "structural": round(struct["score"], 3),
+            "relative_return": round(s_ret_rel, 3),
+            "confidence": round(confidence, 3),
+            "v6_3_bonus": round(v6_3_bonus, 3),
+            "time_decay": round(time_decay, 3),
+            "hit_rate": round(s_hit, 3),
+            "fundamental": round(s_fund, 3)
+        },
+        "flags": {
+            "disagreement_penalty": disagreement,
+            "liquidity_gate": False,
+            "v6_3_theta_cleared": abs(pred_ret) >= theta_dynamic,
+            "age_hours": round(age_hours, 1),
+            "theta_dynamic_pct": round(theta_dynamic, 3)
+        },
+        "debug": {
+            "pred_ret_pct": round(pred_ret, 3),
+            "struct_trend": round(struct["trend_pct"], 3)
+        }
+    }
         "components": {
             "structural": round(struct["score"], 3),
             "relative_return": round(s_ret_rel, 3),
