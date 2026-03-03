@@ -1,5 +1,5 @@
 # =========================================================
-# broker.py — EXECUTION ENGINE v2.1 (PM-DRIVEN + DYNAMIC SIZING)
+# broker.py — EXECUTION ENGINE v2.1 (FIXED INDENTATION)
 # =========================================================
 
 import os
@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
@@ -18,7 +18,10 @@ import asyncio
 # =========================================================
 # Decision logger
 # =========================================================
-from decision_log import log_decision
+try:
+    from decision_log import log_decision
+except ImportError:
+    def log_decision(data): logging.info(f"Log: {data}")
 
 # =========================================================
 # Alpaca
@@ -36,7 +39,6 @@ except ImportError:
 # Config
 # =========================================================
 DATA_PATH = os.getenv("DATA_PATH", "/data")
-
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING = os.getenv("ALPACA_PAPER", "true").lower() == "true"
@@ -66,7 +68,6 @@ router = APIRouter(prefix="/trading", tags=["trading"])
 def is_executable_usa(ticker: str) -> bool:
     return ticker is not None and not ticker.upper().endswith(".SN")
 
-
 def append_trade_log(record: Dict[str, Any]) -> None:
     try:
         day = datetime.utcnow().strftime("%Y-%m-%d")
@@ -94,7 +95,6 @@ class DecisionInput(BaseModel):
             raise ValueError("action debe ser OPEN, CLOSE o ROTATE")
         return v
 
-
 class TradeResultModel(BaseModel):
     status: str
     ticker: Optional[str] = None
@@ -110,7 +110,6 @@ class TradeResultModel(BaseModel):
 # =========================================================
 def rate_limit(calls_per_min: int = 30):
     last_calls = []
-
     def decorator(fn):
         @wraps(fn)
         async def wrapper(*args, **kwargs):
@@ -127,93 +126,64 @@ def rate_limit(calls_per_min: int = 30):
 # Trading Engine
 # =========================================================
 class TradingEngine:
-
     def __init__(self):
-
         if not ALPACA_AVAILABLE:
             raise ValueError("alpaca-py no instalado")
-
         if not ALPACA_KEY or not ALPACA_SECRET:
             raise ValueError("Credenciales Alpaca faltantes")
 
-        self.client = TradingClient(
-            ALPACA_KEY,
-            ALPACA_SECRET,
-            paper=PAPER_TRADING
-        )
-
-        self.data_client = StockHistoricalDataClient(
-            ALPACA_KEY,
-            ALPACA_SECRET
-        )
-
+        self.client = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=PAPER_TRADING)
+        self.data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+        
         acc = self.client.get_account()
-
         if acc.trading_blocked:
             raise ValueError("🚫 Trading blocked en cuenta")
-
+        
         self.equity = float(acc.equity)
-
-        logger.info(
-            f"🚀 Broker {'PAPER' if PAPER_TRADING else 'LIVE'} "
-            f"(equity=${self.equity:.0f})"
-        )
+        logger.info(f"🚀 Broker {'PAPER' if PAPER_TRADING else 'LIVE'} (equity=${self.equity:.0f})")
 
     async def get_account(self):
         return self.client.get_account()
         
     def sync_positions_from_broker(self):
-    """
-    Descarga posiciones reales desde Alpaca
-    y sobrescribe /data/positions.json
-    """
+        """Descarga posiciones reales desde Alpaca y sobrescribe /data/positions.json"""
+        try:
+            from portfolio_store import save_positions
+            alpaca_positions = self.client.get_all_positions()
+            new_positions = []
 
-        from portfolio_store import save_positions
-
-        alpaca_positions = self.client.get_all_positions()
-
-        new_positions = []
-
-        for p in alpaca_positions:
-            new_positions.append({
-            "id": f"{p.symbol}-{datetime.utcnow().isoformat()}",
-            "ticker": p.symbol,
-            "qty": float(p.qty),
-            "entry_price": float(p.avg_entry_price),
-            "price_now": float(p.current_price),
-            "peak_price": float(p.current_price),
-            "days_at_peak": 1,
-            "entry_time": datetime.utcnow().isoformat(),
-            "is_anchor": False,
-            "market_mode_entry": None,
-            "meta": {
-                "source": "alpaca_sync"
-            }
-        })
-
-    save_positions(new_positions)
-
-    logger.info(f"🔄 Synced {len(new_positions)} positions from Alpaca")
+            for p in alpaca_positions:
+                new_positions.append({
+                    "id": f"{p.symbol}-{datetime.utcnow().isoformat()}",
+                    "ticker": p.symbol,
+                    "qty": float(p.qty),
+                    "entry_price": float(p.avg_entry_price),
+                    "price_now": float(p.current_price),
+                    "peak_price": float(p.current_price),
+                    "days_at_peak": 1,
+                    "entry_time": datetime.utcnow().isoformat(),
+                    "is_anchor": False,
+                    "market_mode_entry": None,
+                    "meta": {"source": "alpaca_sync"}
+                })
+            save_positions(new_positions)
+            logger.info(f"🔄 Synced {len(new_positions)} positions from Alpaca")
+        except Exception as e:
+            logger.error(f"❌ Sync failed: {e}")
 
     def calculate_qty(self, ticker: str, target_pct: float) -> float:
-
         if not is_executable_usa(ticker):
             raise RuntimeError(f"EXECUTION BLOCKED (CHILE): {ticker}")
-
         if target_pct <= 0 or target_pct > 0.5:
             raise ValueError(f"target_pct inválido: {target_pct}")
 
         quote = self.data_client.get_stock_latest_quote([ticker]).latest_quote[ticker]
         price = (quote.ask + quote.bid) / 2
-
         acc = self.client.get_account()
         target_value = float(acc.equity) * target_pct
-        qty = max(1, int((target_value / price) * 100) / 100)
-
-        return qty
+        return max(1, int((target_value / price) * 100) / 100)
 
     async def open_market(self, ticker: str, qty: float):
-
         if not is_executable_usa(ticker):
             raise RuntimeError(f"EXECUTION BLOCKED (CHILE): {ticker}")
 
@@ -225,93 +195,54 @@ class TradingEngine:
                 time_in_force=TimeInForce.DAY,
             )
         )
-
         for _ in range(10):
             await asyncio.sleep(1)
             order = self.client.get_order(order.id)
-
             if order.status == OrderStatus.FILLED:
                 return order
-
             if order.status in [OrderStatus.REJECTED, OrderStatus.CANCELLED]:
                 raise RuntimeError(f"Order {order.id} {order.status}")
-
         raise RuntimeError(f"Order timeout: {order.id}")
 
     def close_market(self, ticker: str):
-
         if not is_executable_usa(ticker):
             raise RuntimeError(f"EXECUTION BLOCKED (CHILE): {ticker}")
-
         return self.client.close_position(ticker)
 
     async def execute_decision(self, decision: Dict[str, Any]) -> TradeResultModel:
-
         action = decision.get("action")
         target_pct = decision.get("target_pct") or (decision.get("meta") or {}).get("target_pct")
 
         try:
-
             if action == "OPEN":
                 ticker = decision.get("ticker")
-                if not ticker:
-                    return TradeResultModel(status="rejected", reason="missing_ticker")
-
-                if not is_executable_usa(ticker):
-                    return TradeResultModel(status="skipped", ticker=ticker, reason="CHILE_NO_EXEC")
+                if not ticker: return TradeResultModel(status="rejected", reason="missing_ticker")
+                if not is_executable_usa(ticker): return TradeResultModel(status="skipped", ticker=ticker, reason="CHILE_NO_EXEC")
 
                 qty = self.calculate_qty(ticker, target_pct or 0.1)
                 order = await self.open_market(ticker, qty)
-
                 self._log_execution("OPEN", ticker, qty, decision, order)
-
-                return TradeResultModel(
-                    status="executed",
-                    ticker=ticker,
-                    side="buy",
-                    qty=qty,
-                    order_id=str(order.id),
-                    equity_used_pct=target_pct,
-                )
+                return TradeResultModel(status="executed", ticker=ticker, side="buy", qty=qty, order_id=str(order.id), equity_used_pct=target_pct)
 
             if action == "CLOSE":
                 ticker = decision.get("ticker")
-                if not ticker:
-                    return TradeResultModel(status="rejected", reason="missing_ticker")
-
-                if not is_executable_usa(ticker):
-                    return TradeResultModel(status="skipped", ticker=ticker, reason="CHILE_NO_EXEC")
+                if not ticker: return TradeResultModel(status="rejected", reason="missing_ticker")
+                if not is_executable_usa(ticker): return TradeResultModel(status="skipped", ticker=ticker, reason="CHILE_NO_EXEC")
 
                 self.close_market(ticker)
                 self._log_execution("CLOSE", ticker, None, decision, None)
-
                 return TradeResultModel(status="executed", ticker=ticker, side="sell")
 
             if action == "ROTATE":
-                ct = decision.get("close_ticker")
-                ot = decision.get("open_ticker")
-
-                if not ct or not ot:
-                    return TradeResultModel(status="rejected", reason="missing_tickers")
-
-                if not is_executable_usa(ct) or not is_executable_usa(ot):
-                    return TradeResultModel(status="skipped", ticker=ot, reason="CHILE_NO_EXEC")
+                ct, ot = decision.get("close_ticker"), decision.get("open_ticker")
+                if not ct or not ot: return TradeResultModel(status="rejected", reason="missing_tickers")
+                if not is_executable_usa(ct) or not is_executable_usa(ot): return TradeResultModel(status="skipped", ticker=ot, reason="CHILE_NO_EXEC")
 
                 self.close_market(ct)
-
                 qty = self.calculate_qty(ot, target_pct or 0.1)
                 order = await self.open_market(ot, qty)
-
                 self._log_execution("ROTATE", f"{ct}->{ot}", qty, decision, order)
-
-                return TradeResultModel(
-                    status="executed",
-                    ticker=ot,
-                    side="buy",
-                    qty=qty,
-                    order_id=str(order.id),
-                    equity_used_pct=target_pct,
-                )
+                return TradeResultModel(status="executed", ticker=ot, side="buy", qty=qty, order_id=str(order.id), equity_used_pct=target_pct)
 
             return TradeResultModel(status="ignored", reason=f"unknown_action:{action}")
 
@@ -321,22 +252,17 @@ class TradingEngine:
             return TradeResultModel(status="failed", reason=str(e))
 
     def _log_execution(self, action, ticker, qty, decision, order):
-
         record = {
             "ts": datetime.utcnow().isoformat(),
             "action": action,
             "ticker": ticker,
             "qty": qty,
-            "order_id": getattr(order, "id", None),
+            "order_id": getattr(order, "id", None) if order else None,
             "decision": decision,
         }
-
         append_trade_log(record)
-
         log_decision({"module": "broker", "decision": "executed", **record})
-
         logger.info(f"✅ {action} {ticker} qty={qty}")
-
 
 # =========================================================
 # Singleton
@@ -349,32 +275,24 @@ def get_trading_engine() -> TradingEngine:
         _engine = TradingEngine()
     return _engine
 
-
 # =========================================================
 # Endpoints
 # =========================================================
 @router.post("/execute", response_model=TradeResultModel)
 @rate_limit(30)
-async def execute_trade(
-    decision: DecisionInput,
-    x_api_key: str = Header(None)
-):
+async def execute_trade(decision: DecisionInput, x_api_key: str = Header(None)):
     if not BROKER_EXECUTION_KEY:
         raise HTTPException(status_code=500, detail="Broker key not configured")
-
     if x_api_key != BROKER_EXECUTION_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     engine = get_trading_engine()
     return await engine.execute_decision(decision.model_dump())
-
 
 @router.get("/status")
 async def broker_status():
     engine = get_trading_engine()
     acc = engine.client.get_account()
     positions = engine.client.get_all_positions()
-
     return {
         "status": "active",
         "equity": float(acc.equity),
@@ -383,13 +301,12 @@ async def broker_status():
         "trading_blocked": acc.trading_blocked,
         "paper": PAPER_TRADING,
     }
+
 @router.get("/positions")
 async def broker_positions():
     engine = get_trading_engine()
     positions = engine.client.get_all_positions()
-
     result = {}
-
     for p in positions:
         result[p.symbol] = {
             "market_value": float(p.market_value),
@@ -398,5 +315,5 @@ async def broker_positions():
             "unrealized_pl": float(p.unrealized_pl),
             "side": p.side,
         }
-
     return result
+                
