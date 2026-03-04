@@ -1,12 +1,6 @@
 # =========================================================
-# data_provider.py — FACHADA ÚNICA DE DATOS
+# data_provider.py — FACHADA ÚNICA DE DATOS (Mantiene Contrato)
 # =========================================================
-# ✔ Model.py SOLO importa desde aquí
-# ✔ Permite cambiar proveedor sin tocar modelo
-# ✔ Soporta múltiples fuentes
-# ✔ CACHE FIRST (producción segura)
-# =========================================================
-
 import os
 import logging
 import pandas as pd
@@ -14,20 +8,19 @@ import pandas as pd
 from providers.cache_provider import get_price_history as cache_fetch
 from providers.yahoo_provider import get_price_history as yahoo_fetch
 from providers.twelve_provider import get_price_history as twelve_fetch
+# 🔥 Nueva importación
+from providers import chile_provider 
+
 from market_data_cache import load_meta_cache
 logger = logging.getLogger("data_provider")
 
-# =========================================================
-# CONFIG
-# =========================================================
-# 🔥 DEFAULT = CACHE
 DEFAULT_PROVIDER = os.getenv("DATA_PROVIDER", "cache").lower()
 
 def get_fundamental_meta(ticker: str):
     return load_meta_cache(ticker)
-    
+
 # =========================================================
-# MAIN ENTRYPOINT
+# MAIN ENTRYPOINT (CONTRATO INTACTO)
 # =========================================================
 def get_price_history(
     ticker: str,
@@ -35,11 +28,16 @@ def get_price_history(
     interval: str = "1d"
 ) -> pd.DataFrame:
     """
-    Punto único de acceso a datos históricos.
+    Punto único de acceso. Mantiene la firma original.
     """
+    
+    # Lógica de ruteo para Chile (.SN o .SCL)
+    # Se ejecuta antes que el DEFAULT_PROVIDER para asegurar calidad en Chile
+    if ticker.upper().endswith((".SN", ".SCL")):
+        logger.info(f"[DATA_PROVIDER] ROUTE CHILE → {ticker}")
+        return chile_provider.get_price_history(ticker, period, interval)
 
     provider = DEFAULT_PROVIDER
-
     logger.info(f"[DATA_PROVIDER] {provider.upper()} → {ticker}")
 
     if provider == "cache":
