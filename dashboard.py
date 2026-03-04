@@ -281,59 +281,47 @@ async def executability_preview():
 @router.get("/universe")
 async def universe():
     from portfolio_store import load_positions
-    from trading_orchestrator import TradingOrchestrator
-
-    # 1. Definir rutas
-    pred_base = Path(DATA_PATH) / "predictions"
-    alpha_path = Path(DATA_PATH) / "alpha.json"
-    market_ctx_path = Path(DATA_PATH) / "market_context.json"
-
-    # 2. Cargar datos maestros (Alpha y Posiciones)
-    alpha_data = load_json(alpha_path) or {}
-    # Si alpha_data tiene estructura {"results": {...}}, extrae los results
-    alpha_map = alpha_data.get("results", alpha_data) 
     
-    positions = {p["ticker"]: p for p in load_positions()}
+    # 1. Usar el archivo exacto que usa el orquestador
+    ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
+    market_ctx_path = Path(DATA_PATH) / "market_context.json"
+    
+    # 2. Cargar Alpha
+    alpha_data = load_json(ALPHA_FILE) or {}
+    alpha_map = alpha_data.get("results", {})
+    
+    # 3. Cargar Posiciones y Contexto
+    positions = {p["ticker"].upper(): p for p in load_positions()}
+    market_ctx = load_json(market_ctx_path) or {}
+    mode = market_ctx.get("market_mode", "neutral")
+    
+    # 4. Definir Thresholds (espejo del Orquestador)
+    thresholds = {"growth": 0.65, "neutral": 0.75, "defensive": 0.85}
+    current_threshold = thresholds.get(mode, 0.75)
 
-    # 3. Ejecutabilidad (Preview)
-    exec_results = {}
-    if market_ctx_path.exists():
-        try:
-            market_ctx = json.loads(market_ctx_path.read_text())
-            orchestrator = TradingOrchestrator()
-            preview = await orchestrator.preview_executability(market_ctx)
-            exec_results = preview.get("results", {})
-        except Exception as e:
-            logger.error(f"Error en preview: {e}")
-
-    # 4. Construir Filas (Usando las carpetas de predicciones como lista de tickers real)
     rows = []
-    tickers = list_tickers(str(pred_base)) # O usa tu tickers.json
-
-    for ticker in tickers:
-        retorno = None
-        pred_dir = pred_base / ticker
+    # Usamos los tickers que tienen alpha como base del universo
+    for ticker, data in alpha_map.items():
+        score = data.get("alpha_score")
         
-        # Leer último retorno de predicción
-        if pred_dir.exists():
-            files = sorted(pred_dir.glob("*.json"))
-            if files:
-                last_pred = load_json(files[-1])
-                if last_pred:
-                    retorno = last_pred.get("prediction", {}).get("ret_ens_pct")
+        # Lógica de ejecutabilidad simplificada para el Dashboard
+        is_executable = False
+        if score is not None:
+            if score >= current_threshold:
+                is_executable = True
+            if score <= -0.40: # Kill switch es ejecutable (para cerrar)
+                is_executable = True
 
-        # Mapeo de datos (Ajustado al contrato esperado por el Frontend)
         rows.append({
             "ticker": ticker,
-            "retorno": retorno,
-            "alpha": alpha_map.get(ticker, {}).get("alpha_score"),
-            "confidence": alpha_map.get(ticker, {}).get("confidence"),
-            # IMPORTANTE: Cambia 'qty' por market_value si el front lo necesita así
-            "positionValue": positions.get(ticker, {}).get("market_value", 0),
-            "executable": exec_results.get(ticker, {}).get("executable", False)
+            "alpha": score,
+            "confidence": data.get("confidence"),
+            "positionValue": positions.get(ticker.upper(), {}).get("market_value", 0),
+            "executable": is_executable,
+            "mode_context": mode # Para que el front sepa por qué el threshold es ese
         })
 
-    # Ordenar por Alpha (descendente)
+    # Ordenar por Alpha
     rows.sort(key=lambda x: x["alpha"] if x["alpha"] is not None else -999, reverse=True)
-
     return {"rows": rows}
+    
