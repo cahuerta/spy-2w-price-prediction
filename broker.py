@@ -144,3 +144,29 @@ async def trading_status():
         "positions": len(positions),
         "trading_blocked": account.trading_blocked,
     }
+
+# =========================================================
+# LIVE POSITIONS (para dashboard)
+# =========================================================
+
+@router.get("/positions")
+async def trading_positions():
+    engine = get_engine()
+
+    try:
+        alpaca_positions = engine.client.get_all_positions()
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo posiciones: {e}")
+        return {}
+
+    result = {}
+
+    for p in alpaca_positions:
+        result[p.symbol] = {
+            "qty": float(p.qty),
+            "market_value": float(p.market_value),
+            "avg_entry_price": float(p.avg_entry_price),
+            "unrealized_pl": float(p.unrealized_pl),
+        }
+
+    return result
