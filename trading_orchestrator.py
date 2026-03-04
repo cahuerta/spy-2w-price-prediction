@@ -1,6 +1,6 @@
 # =========================================================
-# trading_orchestrator.py — V2.9 ALPHA-DICTATOR PRODUCTION
-# ALPHA MANDATORY | PM ADVISORY | GOVERNOR RISK CONTROL
+# trading_orchestrator.py — V3.0 ALPHA-CONSUMER
+# ALPHA ENGINE EXTERNO | ORCHESTRATOR SOLO LEE
 # =========================================================
 
 import logging
@@ -14,7 +14,6 @@ from pathlib import Path
 from portfolio_store import load_positions
 from broker import get_trading_engine
 from capital_governor import CapitalGovernor
-from alpha_engine_enterprise_strict_v4_3 import compute_and_persist_alpha
 
 from pm_growth import PMGrowth
 from pm_neutral import PMNeutral
@@ -24,7 +23,12 @@ logger = logging.getLogger("trading_orchestrator")
 logging.basicConfig(level=logging.INFO)
 
 
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+ALPHA_FILE = DATA_PATH / "alpha_last.json"
+
+
 class TradingOrchestrator:
+
     def __init__(self):
 
         self.broker = get_trading_engine()
@@ -44,17 +48,22 @@ class TradingOrchestrator:
 
         self.governor = CapitalGovernor(self.fixed_capital)
 
-        logger.info(f"🚀 v2.9 ALPHA-DICTATOR PRODUCTION | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.0 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
     # =========================================================
     # MAIN RUN
     # =========================================================
-    async def run(self, market_ctx: Dict[str, Any], signals: Dict = None, anchor_universe: List = None) -> Dict:
+    async def run(
+        self,
+        market_ctx: Dict[str, Any],
+        signals: Dict = None,
+        anchor_universe: List = None
+    ) -> Dict:
 
         if not self._daily_flag_check():
             return {"status": "skipped_daily_limit"}
 
-        # 1️⃣ SYNC
+        # 1️⃣ SYNC POSITIONS
         if hasattr(self.broker, "sync_positions_from_broker"):
             sync_result = self.broker.sync_positions_from_broker()
             if asyncio.iscoroutine(sync_result):
@@ -66,8 +75,9 @@ class TradingOrchestrator:
 
         logger.info(f"📊 Portfolio: {len(positions)} | Mode: {mode}")
 
-        # 2️⃣ FULL ALPHA
-        alpha_data = await self._compute_full_alpha()
+        # 2️⃣ LOAD LAST ALPHA (NO RECOMPUTE)
+        alpha_data = self._load_last_alpha()
+
         alpha_map = {
             t.upper(): d
             for t, d in alpha_data.get("results", {}).items()
@@ -82,7 +92,6 @@ class TradingOrchestrator:
             anchor_universe
         )
 
-        # 4️⃣ PRIORITY ENGINE
         closes = []
         opens = []
 
@@ -113,7 +122,6 @@ class TradingOrchestrator:
                 })
                 logger.warning(f"💀 KILL {ticker} | alpha={alpha_score:.3f}")
 
-        # 🔁 Deduplicate CLOSES
         closes = list({c["ticker"]: c for c in closes}.values())
 
         # 📈 PM OPENS
@@ -131,15 +139,13 @@ class TradingOrchestrator:
                 opens.append({
                     "action": "OPEN",
                     "ticker": ticker,
-                    "shares": 0,
+                    "target_pct": 0.05,  # ← ahora sí ejecutable
                     "reason": f"ALPHA_INJECT_{score:.3f}",
                     "alpha": score
                 })
 
-        # 🔁 Deduplicate OPENS (Alpha overrides PM)
-        opens_dict = {}
-        for o in opens:
-            opens_dict[o["ticker"].upper()] = o
+        # Deduplicate OPENS
+        opens_dict = {o["ticker"].upper(): o for o in opens}
         unique_opens = list(opens_dict.values())
 
         # 5️⃣ GOVERNOR
@@ -154,15 +160,15 @@ class TradingOrchestrator:
             score = alpha_map.get(ticker, {}).get("alpha_score", 0)
 
             if score >= self.alpha_elite:
-                logger.info(f"🔥 ELITE {ticker} {score:.3f}")
                 elite_count += 1
+                logger.info(f"🔥 ELITE {ticker} {score:.3f}")
                 final_queue.append(cmd)
 
             elif score >= threshold:
                 final_queue.append(cmd)
 
             else:
-                logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f} < {threshold}")
+                logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f}")
 
         # 7️⃣ EXECUTION
         results = []
@@ -202,16 +208,29 @@ class TradingOrchestrator:
             "executed": executed,
             "elite_executed": elite_count,
             "queue_size": len(final_queue),
+            "alpha_timestamp": alpha_data.get("timestamp"),
             "results": results
         }
 
     # =========================================================
     # HELPERS
     # =========================================================
-    async def _compute_full_alpha(self) -> Dict:
-        tickers_path = Path(os.getenv("DATA_PATH", "/data")) / "tickers.json"
-        universe = json.loads(tickers_path.read_text()) if tickers_path.exists() else []
-        return await asyncio.to_thread(compute_and_persist_alpha, universe)
+
+    def _load_last_alpha(self) -> Dict:
+        if not ALPHA_FILE.exists():
+            raise RuntimeError("❌ alpha_last.json no encontrado. Ejecuta alpha_engine primero.")
+
+        try:
+            data = json.loads(ALPHA_FILE.read_text())
+        except Exception as e:
+            raise RuntimeError(f"❌ alpha_last.json corrupto: {e}")
+
+        logger.info(
+            f"🧠 Alpha loaded | ts={data.get('timestamp')} "
+            f"| universe={data.get('universe_size')}"
+        )
+
+        return data
 
     def _alpha_threshold(self, mode: str) -> float:
         return {
@@ -219,7 +238,13 @@ class TradingOrchestrator:
             "defensive": self.alpha_defensive
         }.get(mode, self.alpha_neutral)
 
-    async def _get_pm_decisions(self, mode: str, positions: List[Dict], signals: Dict, anchor: List) -> List[Dict]:
+    async def _get_pm_decisions(
+        self,
+        mode: str,
+        positions: List[Dict],
+        signals: Dict,
+        anchor: List
+    ) -> List[Dict]:
 
         decisions = []
 
