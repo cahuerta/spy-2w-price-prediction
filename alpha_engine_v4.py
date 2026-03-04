@@ -196,27 +196,6 @@ def compute_alpha_for_ticker(ticker: str, market_ctx: Dict, universe_returns: Li
             "struct_trend": round(struct["trend_pct"], 3)
         }
     }
-        "components": {
-            "structural": round(struct["score"], 3),
-            "relative_return": round(s_ret_rel, 3),
-            "confidence": round(confidence, 3),
-            "v6_3_bonus": round(v6_3_bonus, 3),
-            "time_decay": round(time_decay, 3),
-            "hit_rate": round(s_hit, 3),
-            "fundamental": round(s_fund, 3)
-        },
-        "flags": {
-            "disagreement_penalty": disagreement,
-            "liquidity_gate": False,
-            "v6_3_theta_cleared": abs(pred_ret) >= theta_dynamic,
-            "age_hours": round(age_hours, 1),
-            "theta_dynamic_pct": round(theta_dynamic, 3)
-        },
-        "debug": {
-            "pred_ret_pct": round(pred_ret, 3),
-            "struct_trend": round(struct["trend_pct"], 3)
-        }
-    }
 
 # =========================================================
 # 🚀 BATCH PRODUCTION
