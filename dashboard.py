@@ -280,59 +280,60 @@ async def executability_preview():
     )
 @router.get("/universe")
 async def universe():
-
     from portfolio_store import load_positions
     from trading_orchestrator import TradingOrchestrator
 
-    tickers_file = Path(DATA_PATH) / "tickers.json"
-
-    if not tickers_file.exists():
-        return {"rows": []}
-
-    tickers = json.loads(tickers_file.read_text())
-
-    # ---- alpha ----
+    # 1. Definir rutas
+    pred_base = Path(DATA_PATH) / "predictions"
     alpha_path = Path(DATA_PATH) / "alpha.json"
-    alpha_map = load_json(alpha_path) or {}
+    market_ctx_path = Path(DATA_PATH) / "market_context.json"
 
-    # ---- positions ----
+    # 2. Cargar datos maestros (Alpha y Posiciones)
+    alpha_data = load_json(alpha_path) or {}
+    # Si alpha_data tiene estructura {"results": {...}}, extrae los results
+    alpha_map = alpha_data.get("results", alpha_data) 
+    
     positions = {p["ticker"]: p for p in load_positions()}
 
-    # ---- executability ----
-    market_ctx_path = Path(DATA_PATH) / "market_context.json"
+    # 3. Ejecutabilidad (Preview)
     exec_results = {}
-
     if market_ctx_path.exists():
-        market_ctx = json.loads(market_ctx_path.read_text())
-        orchestrator = TradingOrchestrator()
-        preview = await orchestrator.preview_executability(market_ctx)
-        exec_results = preview.get("results", {})
+        try:
+            market_ctx = json.loads(market_ctx_path.read_text())
+            orchestrator = TradingOrchestrator()
+            preview = await orchestrator.preview_executability(market_ctx)
+            exec_results = preview.get("results", {})
+        except Exception as e:
+            logger.error(f"Error en preview: {e}")
 
+    # 4. Construir Filas (Usando las carpetas de predicciones como lista de tickers real)
     rows = []
+    tickers = list_tickers(str(pred_base)) # O usa tu tickers.json
 
     for ticker in tickers:
-
         retorno = None
-
-        pred_dir = Path(DATA_PATH) / "predictions" / ticker
+        pred_dir = pred_base / ticker
+        
+        # Leer último retorno de predicción
         if pred_dir.exists():
             files = sorted(pred_dir.glob("*.json"))
             if files:
-                last = load_json(files[-1])
-                retorno = (
-                    last.get("prediction", {})
-                    .get("ret_ens_pct")
-                )
+                last_pred = load_json(files[-1])
+                if last_pred:
+                    retorno = last_pred.get("prediction", {}).get("ret_ens_pct")
 
+        # Mapeo de datos (Ajustado al contrato esperado por el Frontend)
         rows.append({
             "ticker": ticker,
             "retorno": retorno,
             "alpha": alpha_map.get(ticker, {}).get("alpha_score"),
             "confidence": alpha_map.get(ticker, {}).get("confidence"),
-            "position_value": positions.get(ticker, {}).get("qty", 0),
+            # IMPORTANTE: Cambia 'qty' por market_value si el front lo necesita así
+            "positionValue": positions.get(ticker, {}).get("market_value", 0),
             "executable": exec_results.get(ticker, {}).get("executable", False)
         })
 
-    rows.sort(key=lambda x: x["alpha"] or -999, reverse=True)
+    # Ordenar por Alpha (descendente)
+    rows.sort(key=lambda x: x["alpha"] if x["alpha"] is not None else -999, reverse=True)
 
     return {"rows": rows}
