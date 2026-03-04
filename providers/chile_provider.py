@@ -1,58 +1,37 @@
-# =========================================================
-# providers/chile_provider.py
-# DATA PROVIDER — BOLSA DE SANTIAGO (OFFICIAL-LIKE)
-# =========================================================
-
 import logging
 import requests
 import pandas as pd
-from datetime import datetime
+from providers import yahoo_provider # Reutilizamos tu provider existente
 
 logger = logging.getLogger("data_provider.chile")
 
-def get_price_history(ticker: str, period: str = "2y") -> pd.DataFrame:
-    """
-    Extrae datos de la Bolsa de Santiago.
-    Ticker format: 'CHILE', 'COPEC', 'SQM-B'
-    """
-    logger.info(f"[CHILE] Extrayendo datos oficiales para {ticker}")
+def get_price_history(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
+    # 1. Limpiar ticker para la Bolsa (ej: 'CHILE.SN' -> 'CHILE')
+    symbol = ticker.split('.')[0].upper()
     
-    # Limpiar ticker (quitar .SN si viene de Yahoo)
-    symbol = ticker.replace(".SN", "").replace(".SCL", "")
-    
-    url = "https://www.bolsadesantiago.com/api/Series/getSeries"
-    
-    payload = {
-        "Instrumento": symbol,
-        "Periodo": "Anual", # Opcional: ajustar según lógica
-        "Tipo": "Cierre"
-    }
-
+    # INTENTO 1: BOLSA DE SANTIAGO
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        response.raise_for_status()
+        url = "https://www.bolsadesantiago.com/api/Series/getSeries"
+        payload = {"Instrumento": symbol, "Periodo": "Cinco", "Tipo": "Cierre"}
+        
+        response = requests.post(url, json=payload, timeout=8)
         data = response.json()
-
-        if not data.get("ListaSeries"):
-            raise ValueError(f"No hay datos para {symbol}")
-
-        # Mapeo al formato que espera tu screener
-        df = pd.DataFrame(data["ListaSeries"])
         
-        # Ajuste de columnas (La Bolsa entrega: Fecha, Valor, etc.)
-        df['Date'] = pd.to_datetime(df['FechaString'], dayfirst=True)
-        df = df.rename(columns={'Ultimo': 'Close', 'Volumen': 'Volume'})
-        
-        # Asegurar columnas mínimas para tu engine
-        df['Open'] = df['Close'] # La API de serie histórica a veces solo da cierre
-        df['High'] = df['Close']
-        df['Low'] = df['Close']
-        
-        df.set_index('Date', inplace=True)
-        df = df.sort_index()
-
-        return df[['Open', 'High', 'Low', 'Close', 'Volume']]
-
+        if data.get("ListaSeries"):
+            df = pd.DataFrame(data["ListaSeries"])
+            df['Date'] = pd.to_datetime(df['FechaString'], dayfirst=True)
+            df = df.rename(columns={'Ultimo': 'Close', 'Valor': 'Close', 'Volumen': 'Volume'})
+            
+            # Asegurar columnas OHLC para compatibilidad
+            for col in ['Open', 'High', 'Low']: df[col] = df['Close']
+            
+            df.set_index('Date', inplace=True)
+            logger.info(f"✅ [CHILE] Datos obtenidos de Bolsa de Santiago para {symbol}")
+            return df[['Open', 'High', 'Low', 'Close', 'Volume']].sort_index()
+            
     except Exception as e:
-        logger.error(f"[CHILE] Error en {symbol}: {e}")
-        return pd.DataFrame() # Devolver vacío para que el screener lo ignore
+        logger.warning(f"⚠️ [CHILE] Falló Bolsa de Santiago para {symbol}: {e}")
+
+    # INTENTO 2: FALLBACK A YAHOO (Usando tu contrato actual)
+    logger.info(f"🔄 [CHILE] Intentando Fallback a Yahoo para {ticker}")
+    return yahoo_provider.get_price_history(ticker, period, interval)
