@@ -125,3 +125,22 @@ async def execute(decision: PureDecisionInput, x_api_key: str = Header(None)):
     if x_api_key != os.getenv("BROKER_EXECUTION_KEY"):
         raise HTTPException(401)
     return await get_engine().execute_decision(decision.dict())
+
+# =========================================================
+# ACCOUNT STATUS (para dashboard Portfolio)
+# =========================================================
+
+@router.get("/status")
+async def trading_status():
+    engine = get_engine()
+    account = engine.client.get_account()
+    positions = engine.client.get_all_positions()
+
+    return {
+        "status": account.status,
+        "equity": float(account.equity),
+        "buying_power": float(account.buying_power),
+        "paper": engine.paper,
+        "positions": len(positions),
+        "trading_blocked": account.trading_blocked,
+    }
