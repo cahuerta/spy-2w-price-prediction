@@ -11,7 +11,7 @@ from typing import Dict, Any, List
 
 from fastapi import APIRouter
 
-from broker import get_trading_engine
+from broker import get_engine
 
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 META_FILE = DATA_PATH / "account_meta.json"
@@ -129,7 +129,7 @@ async def performance():
 
     # ================= ACCOUNT PERFORMANCE =================
     try:
-        engine = get_trading_engine()
+        engine = get_engine()
         account = await engine.get_account()
         equity = float(account.equity)
     except Exception:
