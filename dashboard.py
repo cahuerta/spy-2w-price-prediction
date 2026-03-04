@@ -278,3 +278,61 @@ async def executability_preview():
     return await orchestrator.preview_executability(
         market_ctx=market_ctx
     )
+@router.get("/universe")
+async def universe():
+
+    from portfolio_store import load_positions
+    from trading_orchestrator import TradingOrchestrator
+
+    tickers_file = Path(DATA_PATH) / "tickers.json"
+
+    if not tickers_file.exists():
+        return {"rows": []}
+
+    tickers = json.loads(tickers_file.read_text())
+
+    # ---- alpha ----
+    alpha_path = Path(DATA_PATH) / "alpha.json"
+    alpha_map = load_json(alpha_path) or {}
+
+    # ---- positions ----
+    positions = {p["ticker"]: p for p in load_positions()}
+
+    # ---- executability ----
+    market_ctx_path = Path(DATA_PATH) / "market_context.json"
+    exec_results = {}
+
+    if market_ctx_path.exists():
+        market_ctx = json.loads(market_ctx_path.read_text())
+        orchestrator = TradingOrchestrator()
+        preview = await orchestrator.preview_executability(market_ctx)
+        exec_results = preview.get("results", {})
+
+    rows = []
+
+    for ticker in tickers:
+
+        retorno = None
+
+        pred_dir = Path(DATA_PATH) / "predictions" / ticker
+        if pred_dir.exists():
+            files = sorted(pred_dir.glob("*.json"))
+            if files:
+                last = load_json(files[-1])
+                retorno = (
+                    last.get("prediction", {})
+                    .get("ret_ens_pct")
+                )
+
+        rows.append({
+            "ticker": ticker,
+            "retorno": retorno,
+            "alpha": alpha_map.get(ticker, {}).get("alpha_score"),
+            "confidence": alpha_map.get(ticker, {}).get("confidence"),
+            "position_value": positions.get(ticker, {}).get("qty", 0),
+            "executable": exec_results.get(ticker, {}).get("executable", False)
+        })
+
+    rows.sort(key=lambda x: x["alpha"] or -999, reverse=True)
+
+    return {"rows": rows}
