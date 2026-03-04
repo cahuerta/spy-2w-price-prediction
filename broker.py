@@ -50,7 +50,12 @@ class TradingEngine:
 
     def is_executable(self, ticker: str) -> bool:
         return ticker is not None and not ticker.upper().endswith(".SN")
-
+        
+    async def get_account(self):
+        """
+        Devuelve la cuenta Alpaca para el dashboard
+        """
+        return self.client.get_account()
     async def execute_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
         action = decision.get("action")
         ticker = decision.get("ticker", "").upper()
