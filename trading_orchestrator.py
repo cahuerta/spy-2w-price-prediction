@@ -10,9 +10,10 @@ import json
 from typing import Dict, Any, List
 from datetime import datetime, timezone
 from pathlib import Path
+from broker import get_engine
 
 from portfolio_store import load_positions
-from broker import get_trading_engine
+
 from capital_governor import CapitalGovernor
 
 from pm_growth import PMGrowth
@@ -31,7 +32,7 @@ class TradingOrchestrator:
 
     def __init__(self):
 
-        self.broker = get_trading_engine()
+        self.broker = get_engine()
         self.flag_file = Path("/tmp/trading_last_run.flag")
 
         self.fixed_capital = float(os.getenv("FIXED_CAPITAL", "1000000"))
