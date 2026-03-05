@@ -16,6 +16,7 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 import sys
+import gc
 
 
 PREDICTOR_DIR = "predictors_engine"
@@ -37,39 +38,41 @@ class MasterOrchestrator:
         self.results = []
 
     # ======================================================
-    # RUN ALL PREDICTORS
+    # RUN ALL PREDICTORS (SECUENCIAL → MENOS RAM)
     # ======================================================
 
     def run_all_predictors(self):
 
         print(f"\n🚀 EJECUTANDO SUITE H1-H10 → {self.ticker}")
 
-        processes = []
-
         for h, script in self.predictors.items():
 
             script_path = os.path.join(PREDICTOR_DIR, script)
 
-            if os.path.exists(script_path):
+            if not os.path.exists(script_path):
 
-                p = subprocess.Popen(
-                    ["python3", script_path, self.ticker],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-
-                processes.append((h, p))
-
-        for h, p in processes:
+                print(f"   ❌ H{h} no encontrado")
+                continue
 
             try:
-                p.wait(timeout=180)
+
+                subprocess.run(
+                    [sys.executable, script_path, self.ticker],
+                    check=True
+                )
+
                 print(f"   ✅ H{h} terminado")
 
             except subprocess.TimeoutExpired:
 
-                p.kill()
                 print(f"   ⚠️ H{h} timeout")
+
+            except Exception as e:
+
+                print(f"   ❌ H{h} falló: {e}")
+
+            # liberar memoria entre modelos
+            gc.collect()
 
     # ======================================================
     # COLLECT RESULTS
