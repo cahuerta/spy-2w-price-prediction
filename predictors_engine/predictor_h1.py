@@ -1,4 +1,4 @@
-Import numpy as np
+import numpy as np
 import pandas as pd
 import os
 import json
@@ -42,38 +42,39 @@ def make_features_h1(df: pd.DataFrame):
     out["ret_lag_5"] = out["ret1"].shift(5)
     
     # VOLATILIDAD (corrigiendo past shift)
-    past_returns = out["ret1"].shift(1)  # CORREGIDO: shift(1) explícito
+    past_returns = out["ret1"].shift(1)
     out["rv_short"] = past_returns.rolling(3).std().fillna(method='bfill')
     out["vol_ema"] = past_returns.ewm(span=5).std().fillna(method='bfill')
     
-    # MOMENTUM (protegido contra división cero)
+    # MOMENTUM
     out["mom_3d"] = past_returns.rolling(3).sum()
     out["mom_vol"] = out["mom_3d"] / out["rv_short"].replace(0, 0.01)
     
-    # RSI ULTRA RÁPIDO (3) - CORREGIDO
+    # RSI ULTRA RÁPIDO
     delta = out["Close"].diff()
     gain = delta.clip(lower=0).rolling(3).mean()
     loss = (-delta.clip(upper=0)).rolling(3).mean()
-    rs = gain / loss.replace(0, 1.0)  # 1.0 neutral vs np.nan
+    rs = gain / loss.replace(0, 1.0)
     out["rsi_fast"] = 100 - (100 / (1 + rs))
     
-    # FUERZA RELATIVA (protegida)
+    # FUERZA RELATIVA
     out["price_strength"] = out["ret1"] / out["rv_short"].replace(0, 0.01)
     
-    # TENDENCIA LOCAL (simplificada y robusta)
+    # TENDENCIA LOCAL
     out["trend_5"] = out["Close"].pct_change(5).fillna(0)
     
     return out
 
+
 def run_predictor_h1(ticker: str):
-    """H1 PRODUCTION READY - Predicción Día 1"""
-    
-    # DATOS
+
     raw = get_price_history(ticker=ticker, period="2y", interval="1d")
+
     if raw is None or len(raw) < 150:
         return None
         
     df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
     if len(df) < 140:
         return None
         
@@ -81,19 +82,17 @@ def run_predictor_h1(ticker: str):
     
     feature_cols = [
         "range", "ret_lag_1", "ret_lag_2", "ret_lag_5",
-        "rv_short", "vol_ema", "mom_vol", "rsi_fast", 
+        "rv_short", "vol_ema", "mom_vol", "rsi_fast",
         "price_strength", "trend_5"
     ]
     
-    # TARGET
     feat["y_fwd"] = np.log(feat["Close"].shift(-HORIZON) / feat["Close"])
     
-    # LIMPIEZA ROBUSTA
     clean = feat.dropna(subset=feature_cols + ["y_fwd"])
+
     if len(clean) < 130:
         return None
     
-    # PIPELINE PRODUCTION
     model = Pipeline([
         ("scaler", StandardScaler()),
         ("pca", PCA(n_components=PCA_COMPONENTS)),
@@ -102,21 +101,22 @@ def run_predictor_h1(ticker: str):
     
     model.fit(clean[feature_cols], clean["y_fwd"])
     
-    # PREDICCIÓN ROBUSTA
     last_features = feat[feature_cols].iloc[-1:].fillna(method='ffill').fillna(method='bfill')
+
     y_pred_log = model.predict(last_features)[0]
     
     price_today = float(feat["Close"].iloc[-1])
     price_tomorrow = price_today * np.exp(y_pred_log)
     
-    # MÉTRICAS ESTABLES
     ridge_model = model.named_steps["ridge"]
+
     confidence = 1 / (1 + np.std(ridge_model.coef_))
+
     r2_train = ridge_model.score(clean[feature_cols], clean["y_fwd"])
     
     return {
         "ticker": ticker,
-        "predictor": "H1_v2.0",  # Versión estable
+        "predictor": "H1_v2.0",
         "horizon_days": HORIZON,
         "date_today": datetime.now().strftime("%Y-%m-%d"),
         "price_today": round(price_today, 4),
@@ -133,25 +133,31 @@ def run_predictor_h1(ticker: str):
         "timestamp": datetime.now().isoformat()
     }
 
+
 if __name__ == "__main__":
+
     ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
-    
+
     print(f"🚀 H1 PRODUCTION v2.0 → {ticker}")
+
     result = run_predictor_h1(ticker)
     
     if result:
+
         filename = f"{ticker}_H1_dia1_v2.json"
+
         path = os.path.join(DATA_OUTPUT_DIR, filename)
-        
+
         with open(path, "w") as f:
             json.dump(result, f, indent=2, default=str)
         
-        print("
-✅ H1 v2.0 - PRODUCCIÓN")
+        print("\n✅ H1 v2.0 - PRODUCCIÓN")
         print(f"📊 {ticker}:  ${result['price_today']:>8.2f}")
         print(f"📊 Predicción: ${result['price_tomorrow']:>8.2f}")
         print(f"📈 Retorno:    {result['return_pct']:>6.2f}%")
         print(f"🔥 Confianza:  {result['confidence']:>5.1f}")
         print(f"📁 {path}")
+
     else:
+
         print("❌ Datos insuficientes para entrenamiento")
