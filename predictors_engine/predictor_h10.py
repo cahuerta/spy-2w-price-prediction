@@ -4,6 +4,8 @@ import os
 import json
 import sys
 from datetime import datetime
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT_DIR)
 from data_provider import get_price_history
 from typing import Dict, List, Optional
 from dataclasses import dataclass
