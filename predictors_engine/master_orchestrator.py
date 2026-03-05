@@ -1,3 +1,14 @@
+# ======================================================
+# master_orchestrator_v4_model_compatible.py
+# ======================================================
+# Ejecuta H1-H10
+# Construye JSON compatible con model.py
+# Incluye:
+#   - Curva H1-H10
+#   - Análisis de consenso
+#   - Acelerador de retorno esperado (segunda derivada)
+# ======================================================
+
 import os
 import json
 import subprocess
@@ -6,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
+
 PREDICTOR_DIR = "predictors_engine"
 DATA_DIR = "predictions_data"
 FINAL_OUTPUT_DIR = "final_reports"
@@ -13,45 +25,32 @@ FINAL_OUTPUT_DIR = "final_reports"
 for d in [DATA_DIR, FINAL_OUTPUT_DIR]:
     Path(d).mkdir(exist_ok=True)
 
+
 class MasterOrchestrator:
 
     def __init__(self, ticker):
 
         self.ticker = ticker.upper()
 
-        self.predictors = {
-            1: "predictor_h1.py",
-            2: "predictor_h2.py",
-            3: "predictor_h3.py",
-            4: "predictor_h4.py",
-            5: "predictor_h5.py",
-            6: "predictor_h6.py",
-            7: "predictor_h7.py",
-            8: "predictor_h8.py",
-            9: "predictor_h9.py",
-            10: "predictor_h10.py"
-        }
+        self.predictors = {h: f"predictor_h{h}.py" for h in range(1, 11)}
 
         self.results = []
 
     # ======================================================
-    # EJECUCIÓN DE PREDICTORES
+    # RUN ALL PREDICTORS
     # ======================================================
 
     def run_all_predictors(self):
 
-        print(f"🚀 MASTER ORQUESTADOR H1-H10 → {self.ticker}")
-        print("=" * 60)
+        print(f"\n🚀 EJECUTANDO SUITE H1-H10 → {self.ticker}")
 
         processes = []
 
-        for h, script_name in self.predictors.items():
+        for h, script in self.predictors.items():
 
-            script_path = os.path.join(PREDICTOR_DIR, script_name)
+            script_path = os.path.join(PREDICTOR_DIR, script)
 
             if os.path.exists(script_path):
-
-                print(f"🔥 H{h:2d} → {script_name}")
 
                 p = subprocess.Popen(
                     ["python3", script_path, self.ticker],
@@ -61,276 +60,238 @@ class MasterOrchestrator:
 
                 processes.append((h, p))
 
-            else:
-                print(f"❌ H{h:2d} NO ENCONTRADO: {script_path}")
-
-        completed = 0
-
         for h, p in processes:
 
             try:
-
                 p.wait(timeout=180)
-
-                print(f"   ✅ H{h:2d} COMPLETADO")
-
-                completed += 1
+                print(f"   ✅ H{h} terminado")
 
             except subprocess.TimeoutExpired:
 
                 p.kill()
-
-                print(f"   ⚠️  H{h:2d} TIMEOUT")
-
-        print(f"\n✅ {completed}/10 predictores ejecutados")
-
-        return completed
-
+                print(f"   ⚠️ H{h} timeout")
 
     # ======================================================
-    # RECOLECCIÓN DE RESULTADOS
+    # COLLECT RESULTS
     # ======================================================
 
     def collect_results(self):
 
-        print("\n📊 RECOLECTANDO RESULTADOS H1-H10...")
-
-        curve_data = []
-
-        filename_patterns = {
-            1: "H1_dia1_v2.json",
-            2: "H2_48h_v2.json",
-            3: "H3_72h_v2.json",
-            4: "H4_96h_v2.json",
-            5: "H5_semanal_v2.json",
-            6: "H6_6d_v2.json",
-            7: "H7_7d_v2.json",
-            8: "H8_8d_v2.json",
-            9: "H9_9d_v2.json",
-            10: "H10_10d_v2.json"
-        }
+        curve = []
 
         for h in range(1, 11):
 
-            pattern = filename_patterns[h]
+            file_path = os.path.join(DATA_DIR, f"{self.ticker}_h{h}.json")
 
-            filepath = os.path.join(DATA_DIR, f"{self.ticker}_{pattern}")
-
-            if os.path.exists(filepath):
+            if os.path.exists(file_path):
 
                 try:
 
-                    with open(filepath, "r") as f:
+                    with open(file_path) as f:
 
                         data = json.load(f)
 
                         data["horizon"] = h
-                        data["horizon_label"] = f"H{h}"
 
-                        curve_data.append(data)
+                        curve.append(data)
 
-                        print(f"   ✅ H{h:2d} → {pattern}")
+                except Exception as e:
 
-                except json.JSONDecodeError:
+                    print(f"   ❌ Error leyendo H{h}: {e}")
 
-                    print(f"   ❌ H{h:2d} JSON corrupto")
+        self.results = sorted(curve, key=lambda x: x["horizon"])
 
-            else:
-
-                print(f"   ❌ H{h:2d} NO ENCONTRADO")
-
-        self.results = sorted(curve_data, key=lambda x: x["horizon"])
-
-        print(f"\n📈 {len(self.results)}/10 predictores válidos")
+        print(f"\n📊 {len(self.results)}/10 predictores válidos recolectados.")
 
         return self.results
 
-
     # ======================================================
-    # REPARACIÓN DE CURVA
+    # CURVE ANALYSIS + ACCELERATION
     # ======================================================
 
-    def repair_curve(self, horizons, returns):
+    def analyze_curve(self):
 
-        if len(horizons) < 2:
-            return returns
+        if len(self.results) < 2:
+
+            return {
+                "recommendation": "MANTÉN",
+                "weighted_return_pct": 0.0,
+                "consensus_score": 0.0,
+                "prediction_volatility": 0.0,
+                "acceleration_score": 0.0,
+                "acceleration_boost": 0.0,
+                "models_used": len(self.results)
+            }
+
+        horizons = np.array([r["horizon"] for r in self.results])
+
+        returns = np.array([r.get("expected_ret_pct", 0) for r in self.results])
+
+        # ======================================================
+        # Interpolación curva completa H1-H10
+        # ======================================================
 
         full_h = np.arange(1, 11)
 
         repaired = np.interp(full_h, horizons, returns)
 
-        return repaired
+        # ======================================================
+        # Weighted ensemble
+        # ======================================================
 
+        weights = np.linspace(1.0, 1.6, len(repaired))
 
-    # ======================================================
-    # ANÁLISIS MAESTRO
-    # ======================================================
+        base_return = np.average(repaired, weights=weights)
 
-    def analyze_curve_and_recommend(self):
+        volatility = float(np.std(repaired))
 
-        if len(self.results) < 3:
+        consensus = 1 / (1 + volatility / (np.mean(np.abs(repaired)) + 1e-6))
 
-            return {
-                "recommendation": "🟡 INSUFICIENTES_PREDICTORES",
-                "models_used": len(self.results),
-                "status": "Necesita mínimo 3 modelos"
-            }
+        # ======================================================
+        # ACCELERATION ENGINE
+        # ======================================================
 
-        returns = []
-        confidences = []
-        horizons = []
+        first_derivative = np.gradient(repaired)
 
-        return_keys = [
-            'return_72h_pct',
-            'return_96h_pct',
-            'return_5d_pct',
-            'return_6d_pct',
-            'return_7d_pct',
-            'return_8d_pct',
-            'return_9d_pct',
-            'return_10d_pct',
-            'expected_ret_pct'
-        ]
+        second_derivative = np.gradient(first_derivative)
 
-        for r in self.results:
+        acceleration = float(np.mean(second_derivative))
 
-            horizons.append(r["horizon"])
+        accel_boost = np.clip(acceleration * 4.0, -0.5, 0.5)
 
-            value = None
+        weighted_return = base_return + accel_boost
 
-            for key in return_keys:
-                if key in r:
-                    value = r[key]
-                    break
+        # ======================================================
+        # Recommendation logic
+        # ======================================================
 
-            if value is not None:
-                returns.append(float(value))
+        if weighted_return > 0.5:
 
-            conf = r.get("confidence") or r.get("r2_train") or 0.5
+            rec = "COMPRA"
 
-            confidences.append(float(conf))
+        elif weighted_return < -0.5:
 
-        if len(returns) == 0:
-
-            return {"recommendation": "❌ SIN_RETORNOS_VÁLIDOS"}
-
-        returns = np.array(self.repair_curve(horizons, returns))
-
-        weights = np.linspace(0.8, 1.8, len(returns))
-
-        conf_weights = np.array(confidences) / (np.max(confidences) + 1e-8)
-
-        final_weights = weights * conf_weights
-
-        weighted_avg = np.average(returns, weights=final_weights)
-
-        volatility = np.std(returns)
-
-        consensus = 1 / (1 + volatility / (np.mean(np.abs(returns)) + 1e-6))
-
-        if volatility > 4.0:
-            rec = "🟡 ESPERAR (Dispersión extrema)"
-
-        elif weighted_avg > 1.5:
-            rec = "🟢🟢 COMPRA FUERTE"
-
-        elif weighted_avg > 0.4:
-            rec = "🟢 COMPRA"
-
-        elif weighted_avg < -1.5:
-            rec = "🔴🔴 VENTA FUERTE"
-
-        elif weighted_avg < -0.4:
-            rec = "🔴 VENTA"
+            rec = "VENDE"
 
         else:
-            rec = "⚪ NEUTRAL"
+
+            rec = "MANTÉN"
 
         return {
 
+            "weighted_return_pct": round(float(weighted_return), 4),
+
+            "prediction_volatility": round(volatility, 4),
+
+            "consensus_score": round(consensus, 4),
+
+            "acceleration_score": round(acceleration, 6),
+
+            "acceleration_boost": round(accel_boost, 4),
+
             "recommendation": rec,
 
-            "weighted_return_pct": round(float(weighted_avg), 2),
+            "models_used": len(self.results)
 
-            "consensus_score": round(float(consensus), 3),
-
-            "prediction_volatility": round(float(volatility), 2),
-
-            "models_used": len(self.results),
-
-            "avg_confidence": round(float(np.mean(confidences)), 3),
-
-            "strongest_signal": round(float(np.max(np.abs(returns))), 2),
-
-            "status": "ANÁLISIS_COMPLETO"
         }
 
-
     # ======================================================
-    # GUARDAR RESULTADO FINAL
+    # BUILD MODEL COMPATIBLE JSON
     # ======================================================
 
-    def save_final_json(self, analysis):
+    def build_model_json(self, curve_analysis):
 
-        final_payload = {
+        if not self.results:
 
-            "ticker": self.ticker,
+            raise RuntimeError("No hay resultados")
 
-            "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # usamos H10 como base principal
 
-            "timestamp": datetime.now().isoformat(),
+        h10 = next((r for r in self.results if r["horizon"] == 10), self.results[-1])
 
-            "suite_version": "H1-H10_v2.2",
+        return {
 
-            "total_predictors": 10,
+            # ==========================================
+            # CONTRATO model.py
+            # ==========================================
 
-            "valid_predictors": len(self.results),
+            "meta": {
+
+                "ticker": self.ticker,
+
+                "horizon_days": 10,
+
+                "pca_target": 25,
+
+                "theta": 0.85,
+
+                "k_neighbors": 30,
+
+                "alpha": float(h10.get("alpha_used", 2.0)),
+
+                "period": "max"
+
+            },
+
+            "historical": {
+
+                "hit_rate_mean": None,
+
+                "mae_mean": None,
+
+                "rmse_mean": None,
+
+                "pca_dims": 25,
+
+                "n_features": 26,
+
+                "n_windows": 0
+
+            },
+
+            "prediction": {
+
+                "date_base": datetime.utcnow().date().isoformat(),
+
+                "ret_global_pct": round(curve_analysis["weighted_return_pct"], 4),
+
+                "ret_knn_pct": round(curve_analysis["weighted_return_pct"], 4),
+
+                "ret_ens_pct": round(curve_analysis["weighted_return_pct"], 4),
+
+                "price_now": float(h10.get("price_now", 0)),
+
+                "price_pred": float(h10.get("price_pred", 0)),
+
+                "recommendation": curve_analysis["recommendation"],
+
+                "theta_dynamic_pct": 0.85,
+
+                "pca_dims_effective": 25,
+
+                "n_features": 26
+
+            },
+
+            # ==========================================
+            # EXTRAS PARA APP / ANALYTICS
+            # ==========================================
 
             "prediction_curve": self.results,
 
-            "master_analysis": analysis
+            "curve_analysis": curve_analysis,
+
+            "engine_metadata": {
+
+                "engine": "H1-H10_SUITE_MASTER",
+
+                "version": "v4_acceleration_engine",
+
+                "timestamp": datetime.utcnow().isoformat()
+
+            }
 
         }
-
-        output_file = os.path.join(
-            FINAL_OUTPUT_DIR,
-            f"{self.ticker}_MASTER_H1H10_v2.json"
-        )
-
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(final_payload, f, indent=2, ensure_ascii=False)
-
-        print(f"\n🏆 MASTER REPORT → {output_file}")
-
-        return output_file
-
-
-    # ======================================================
-    # RESUMEN EJECUTIVO
-    # ======================================================
-
-    def print_executive_summary(self, analysis):
-
-        print("\n" + "═" * 80)
-
-        print(f"🏆 SUITE H1-H10 EXECUTIVE SUMMARY → {self.ticker}")
-
-        print("═" * 80)
-
-        print(f"📊 Modelos válidos:    {analysis['models_used']}/10")
-
-        print(f"📈 Retorno ponderado:  {analysis['weighted_return_pct']:+6.2f}%")
-
-        print(f"🤝 Consenso:           {analysis['consensus_score']:>6.3f}")
-
-        print(f"📊 Volatilidad pred:   {analysis['prediction_volatility']:>5.2f}%")
-
-        print(f"🔥 Señal más fuerte:   {analysis['strongest_signal']:+.2f}%")
-
-        print(f"🎯 RECOMENDACIÓN:      {analysis['recommendation']}")
-
-        print("═" * 80)
-
 
 
 # ======================================================
@@ -343,16 +304,18 @@ if __name__ == "__main__":
 
     maestro = MasterOrchestrator(ticker)
 
-    print("🚀 INICIANDO SUITE H1-H10...\n")
-
     maestro.run_all_predictors()
 
     maestro.collect_results()
 
-    analysis = maestro.analyze_curve_and_recommend()
+    analysis = maestro.analyze_curve()
 
-    maestro.save_final_json(analysis)
+    final_payload = maestro.build_model_json(analysis)
 
-    maestro.print_executive_summary(analysis)
+    output_path = os.path.join(FINAL_OUTPUT_DIR, f"{ticker}_prediction.json")
 
-    print(f"\n🎉 {ticker} H1-H10 MASTER COMPLETADO!")
+    with open(output_path, "w") as f:
+
+        json.dump(final_payload, f, indent=2)
+
+    print(f"\n🏆 JSON FINAL GENERADO → {output_path}")
