@@ -4,26 +4,28 @@ import os
 import json
 import sys
 from datetime import datetime
+
+# Configuración de rutas
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT_DIR)
+
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.decomposition import PCA
-import warnings
 
+import warnings
 warnings.filterwarnings("ignore")
 
 # ======================================================
 # CONFIGURACIÓN H8 - FUERZA DE TENDENCIA
 # ======================================================
-
 DATA_OUTPUT_DIR = "predictions_data"
 os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
 
 HORIZON = 8
 ALPHA_H8 = 1.25
-PCA_COMPONENTS = 10
+MAX_PCA_COMPONENTS = 10
 
 try:
     from data_provider import get_price_history
@@ -31,235 +33,140 @@ except ImportError:
     print("❌ ERROR: data_provider.py no encontrado")
     sys.exit(1)
 
-
 # ======================================================
-# FEATURES
+# FEATURE ENGINEERING H8
 # ======================================================
-
 def make_features_h8(df: pd.DataFrame):
-
     out = df.copy()
 
-    # BASE
+    # BASE Y RETORNOS
     out["ret1"] = np.log(out["Close"]).diff()
+    out["range"] = np.log(out["High"] / out["Low"]).clip(0, 0.40)
 
-    out["range"] = np.log(
-        out["High"] / out["Low"]
-    ).clip(0, 0.40)
-
-    # LAGS
+    # LAGS ESTRUCTURALES
     for k in [1, 3, 5, 10, 20, 30]:
         out[f"ret_lag_{k}"] = out["ret1"].shift(k)
 
-    # VOLATILIDAD
-    past = out["ret1"].shift(1)
+    # VOLATILIDAD 30d (SHIFTED)
+    past_ret = out["ret1"].shift(1)
+    out["rv_30"] = past_ret.rolling(30).std().clip(1e-6) * np.sqrt(252)
 
-    out["rv_30"] = (
-        past.rolling(30)
-        .std()
-        .clip(1e-6)
-    ) * np.sqrt(252/30)
+    # ADX ROBUSTO (SIN LEAKAGE)
+    # Usamos datos desplazados 1 periodo para la señal actual
+    h_past = out["High"].shift(1)
+    l_past = out["Low"].shift(1)
+    c_past = out["Close"].shift(1)
+    c_prev = out["Close"].shift(2)
 
-    # ADX
-    high_diff = out["High"].diff()
-    low_diff = out["Low"].diff()
+    up_move = h_past - h_past.shift(1)
+    down_move = l_past.shift(1) - l_past
 
-    plus_dm = np.where(
-        (high_diff > low_diff) & (high_diff > 0),
-        high_diff,
-        0
-    )
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
 
-    minus_dm = np.where(
-        (low_diff > high_diff) & (low_diff > 0),
-        low_diff,
-        0
-    )
-
-    tr1 = out["High"] - out["Low"]
-    tr2 = np.abs(out["High"] - out["Close"].shift(1))
-    tr3 = np.abs(out["Low"] - out["Close"].shift(1))
-
-    true_range = np.maximum(tr1, np.maximum(tr2, tr3))
+    tr = np.maximum(h_past - l_past, 
+                    np.maximum(np.abs(h_past - c_prev), 
+                               np.abs(l_past - c_prev)))
 
     alpha = 1/14
+    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=alpha).mean() / 
+                     pd.Series(tr).ewm(alpha=alpha).mean().replace(0, 1))
+    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=alpha).mean() / 
+                      pd.Series(tr).ewm(alpha=alpha).mean().replace(0, 1))
+    
+    dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1))
+    out["adx_14"] = dx.ewm(alpha=alpha).mean().clip(0, 100).values
 
-    plus_dm = pd.Series(plus_dm, index=out.index)
-    minus_dm = pd.Series(minus_dm, index=out.index)
-    true_range = pd.Series(true_range, index=out.index)
+    # EMA50 SLOPE (INERCIA)
+    ema50 = c_past.ewm(span=50).mean()
+    out["ema50_slope"] = ((ema50 - ema50.shift(5)) / ema50.shift(5)).clip(-0.1, 0.1)
 
-    plus_di = (
-        plus_dm.ewm(alpha=alpha).mean() /
-        true_range.ewm(alpha=alpha).mean().replace(0,1)
-    ) * 100
-
-    minus_di = (
-        minus_dm.ewm(alpha=alpha).mean() /
-        true_range.ewm(alpha=alpha).mean().replace(0,1)
-    ) * 100
-
-    dx = (
-        np.abs(plus_di - minus_di) /
-        (plus_di + minus_di).replace(0,1)
-    ) * 100
-
-    out["adx_14"] = dx.ewm(alpha=alpha).mean().fillna(25)
-    out["adx_14"] = out["adx_14"].clip(0,100)
-
-    # EMA50 SLOPE
-    ema50 = out["Close"].ewm(span=50).mean()
-
-    out["ema50_slope"] = (
-        (ema50 - ema50.shift(5)) /
-        ema50.shift(5)
-    ).clip(-0.1,0.1)
-
-    # FUERZA DE TENDENCIA
+    # FUERZA DE TENDENCIA DIRECCIONAL
     out["trend_strength"] = out["adx_14"] * np.sign(out["ema50_slope"])
 
     return out
 
-
 # ======================================================
-# PREDICTOR
+# PREDICTOR H8
 # ======================================================
-
 def run_predictor_h8(ticker: str):
-
-    raw = get_price_history(
-        ticker=ticker,
-        period="2y",
-        interval="1d"
-    )
+    raw = get_price_history(ticker=ticker, period="2y", interval="1d")
 
     if raw is None or len(raw) < 280:
         return None
 
-    df = raw[["Open","High","Low","Close","Volume"]].dropna()
-
-    if len(df) < 270:
-        return None
-
+    df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
     feat = make_features_h8(df)
 
     feature_cols = [
-        "range",
-        "rv_30",
-        "adx_14",
-        "ema50_slope",
-        "trend_strength",
-        "ret_lag_1",
-        "ret_lag_5",
-        "ret_lag_10",
-        "ret_lag_20",
-        "ret_lag_30"
+        "range", "rv_30", "adx_14", "ema50_slope", "trend_strength",
+        "ret_lag_1", "ret_lag_5", "ret_lag_10", "ret_lag_20", "ret_lag_30"
     ]
 
-    # TARGET
-    feat["y_fwd"] = np.log(
-        feat["Close"].shift(-HORIZON) /
-        feat["Close"]
-    )
-
+    feat["y_fwd"] = np.log(feat["Close"].shift(-HORIZON) / feat["Close"])
     clean = feat.dropna(subset=feature_cols + ["y_fwd"])
 
     if len(clean) < 230:
         return None
 
-    # PIPELINE
+    X = clean[feature_cols].values
+    y = clean["y_fwd"].values
+
+    # PCA DINÁMICO
+    n_samples, n_features = X.shape
+    dynamic_pca = max(1, min(MAX_PCA_COMPONENTS, n_features, n_samples - 1))
+
     model = Pipeline([
         ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=PCA_COMPONENTS)),
+        ("pca", PCA(n_components=dynamic_pca, random_state=42)),
         ("ridge", Ridge(alpha=ALPHA_H8, random_state=42))
     ])
 
-    model.fit(clean[feature_cols], clean["y_fwd"])
+    model.fit(X, y)
 
     # PREDICCIÓN
-    last_features = (
-        feat[feature_cols]
-        .iloc[-1:]
-        .ffill()
-        .bfill()
-    )
+    last_features = feat[feature_cols].iloc[-1:]
+    if last_features.isna().any().any():
+        return None
 
-    y_pred_log = model.predict(last_features)[0]
-
-    # CLIP
+    y_pred_log = float(model.predict(last_features)[0])
     y_pred_log = np.clip(y_pred_log, -0.15, 0.15)
 
     price_today = float(feat["Close"].iloc[-1])
-
     price_8d = price_today * np.exp(y_pred_log)
 
     # MÉTRICAS
-    ridge_model = model.named_steps["ridge"]
-
-    confidence = 1 / (1 + np.std(ridge_model.coef_))
-
-    r2_train = ridge_model.score(
-        clean[feature_cols],
-        clean["y_fwd"]
-    )
-
-    adx_current = float(feat["adx_14"].iloc[-1])
-
-    trend_regime = (
-        "STRONG" if adx_current > 35
-        else "WEAK" if adx_current < 20
-        else "NEUTRAL"
-    )
+    adx_now = float(feat["adx_14"].iloc[-1])
+    regime = "STRONG" if adx_now > 35 else "WEAK" if adx_now < 20 else "NEUTRAL"
+    confidence = 1 / (1 + np.std(model.named_steps["ridge"].coef_))
 
     return {
         "ticker": ticker,
-        "predictor": "H8_v2.1_TrendStrength",
+        "predictor": "H8_v2.2_TrendStrength",
         "horizon_days": HORIZON,
-        "date_today": datetime.now().strftime("%Y-%m-%d"),
         "price_today": round(price_today, 4),
         "price_8d": round(price_8d, 4),
         "return_8d_pct": round(y_pred_log * 100, 4),
-        "confidence": round(confidence, 3),
-        "r2_train": round(r2_train, 4),
-        "adx_14": round(adx_current, 1),
-        "trend_regime": trend_regime,
-        "samples": len(clean),
-        "model": {
-            "alpha": ALPHA_H8,
-            "pca_components": PCA_COMPONENTS,
-            "features": len(feature_cols)
-        },
+        "adx": round(adx_now, 1),
+        "regime": regime,
+        "confidence": round(float(confidence), 3),
         "timestamp": datetime.now().isoformat()
     }
 
-
-# ======================================================
-# MAIN
-# ======================================================
-
 if __name__ == "__main__":
-
     ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
-
-    print(f"🚀 H8 v2.1 Fuerza de Tendencia (8d) → {ticker}")
+    print(f"🚀 Iniciando H8 Trend Strength (8d) → {ticker}")
 
     result = run_predictor_h8(ticker)
-
     if result:
-
         filename = f"{ticker}_H8_8d_v2.json"
-
         path = os.path.join(DATA_OUTPUT_DIR, filename)
-
         with open(path, "w") as f:
-            json.dump(result, f, indent=2, default=str)
+            json.dump(result, f, indent=2)
 
-        print("\n✅ H8 v2.1 - TREND STRENGTH")
-        print(f"📊 {ticker}:           ${result['price_today']:>8.2f}")
-        print(f"📊 Predicción 8d:      ${result['price_8d']:>8.2f}")
-        print(f"📈 Retorno:            {result['return_8d_pct']:>6.2f}%")
-        print(f"🔥 ADX: {result['adx_14']} ({result['trend_regime']})")
-        print(f"📁 {path}")
-
-    else:
-
-        print("❌ Datos insuficientes H8")
+        print(f"\n✅ H8 COMPLETADO")
+        print("-" * 40)
+        print(f"📊 {ticker}: ${result['price_today']:,.2f} → 8d: ${result['price_8d']:,.2f}")
+        print(f"📈 Retorno: {result['return_8d_pct']}% | ADX: {result['adx']} ({result['regime']})")
+        print(f"🔥 Confianza: {result['confidence']}")
+        print("-" * 40)
