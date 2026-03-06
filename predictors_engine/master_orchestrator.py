@@ -14,7 +14,10 @@ DATA_DIR = "predictions_data"
 
 def extract_price_prediction(data):
     for k in [
-        "price_pred","price_tomorrow","price_10d","price_target"
+        "price_pred",
+        "price_tomorrow",
+        "price_10d",
+        "price_target"
     ]:
         if k in data:
             return float(data[k])
@@ -23,7 +26,10 @@ def extract_price_prediction(data):
 
 def extract_return_pct(data):
     for k in [
-        "return_pct","ret_pct","ret_global_pct","ret_ens_pct"
+        "return_pct",
+        "ret_pct",
+        "ret_global_pct",
+        "ret_ens_pct"
     ]:
         if k in data:
             return float(data[k])
@@ -128,9 +134,13 @@ class MasterOrchestrator:
 
                         data["price_pred"] = price
 
+                        # detectar precio actual
                         if self.price_now is None:
 
-                            self.price_now = data.get("price_now") or data.get("price_today")
+                            self.price_now = (
+                                data.get("price_now")
+                                or data.get("price_today")
+                            )
 
                             if self.price_now is None:
                                 raise RuntimeError("price_now missing")
@@ -173,7 +183,9 @@ class MasterOrchestrator:
         interpolated = np.interp(full_h,horizons,prices)
 
         smoothed = pd.Series(interpolated).rolling(
-            3,center=True,min_periods=1
+            3,
+            center=True,
+            min_periods=1
         ).mean().values
 
         H = np.vstack([
@@ -277,9 +289,9 @@ class MasterOrchestrator:
         signal_strength = weighted_return*consensus
 
         recommendation = (
-            "COMPRA" if signal_strength>0.4 else
-            "VENDE" if signal_strength<-0.4 else
-            "MANTÉN"
+            "COMPRA" if signal_strength>0.4
+            else "VENDE" if signal_strength<-0.4
+            else "MANTÉN"
         )
 
         return {
@@ -296,7 +308,7 @@ class MasterOrchestrator:
 
 
 # ======================================================
-# JSON FINAL (CONTRATO MODEL)
+# JSON FINAL (CONTRATO)
 # ======================================================
 
     def build_model_json(self,analysis,curve):
