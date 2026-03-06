@@ -293,7 +293,7 @@ if __name__ == "__main__":
 
     ticker = sys.argv[1] if len(sys.argv) > 1 else "SPY"
 
-    orch = MasterOrchestratorV5(ticker)
+    orch = MasterOrchestrator(ticker)
 
     result = orch.run()
 
