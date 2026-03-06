@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 import sys
+import subprocess
 
 DATA_DIR = "predictions_data"
 
@@ -37,6 +38,37 @@ class MasterOrchestrator:
 
 
     def __init__(self, ticker):
+        # ======================================================
+# EJECUCIÓN SECUENCIAL H1-H10
+# ======================================================
+
+    def run_all_predictors(self):
+
+        print(f"🚀 EJECUTANDO SUITE H1-H10 → {self.ticker}")
+
+        base_dir = os.path.dirname(__file__)
+
+        for h in range(1, 11):
+
+            script = os.path.join(base_dir, f"predictor_h{h}.py")
+
+            if not os.path.exists(script):
+
+                print(f"❌ predictor_h{h}.py no encontrado")
+                continue
+
+            try:
+
+                subprocess.run(
+                    [sys.executable, script, self.ticker],
+                    check=True
+                )
+
+                print(f"   ✅ H{h} terminado")
+
+            except subprocess.CalledProcessError as e:
+
+                print(f"   ❌ H{h} falló: {e}")
 
         self.ticker = ticker.upper()
         self.results = []
