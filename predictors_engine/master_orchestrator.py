@@ -38,6 +38,9 @@ class MasterOrchestrator:
 
 
     def __init__(self, ticker):
+        self.ticker = ticker.upper()
+        self.results = []
+        
         # ======================================================
 # EJECUCIÓN SECUENCIAL H1-H10
 # ======================================================
@@ -69,9 +72,6 @@ class MasterOrchestrator:
             except subprocess.CalledProcessError as e:
 
                 print(f"   ❌ H{h} falló: {e}")
-
-        self.ticker = ticker.upper()
-        self.results = []
 
 
 # ======================================================
