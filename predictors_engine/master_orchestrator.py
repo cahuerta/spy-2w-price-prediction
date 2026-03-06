@@ -327,6 +327,8 @@ if __name__ == "__main__":
 
     orch = MasterOrchestrator(ticker)
 
+    orch.run_all_predictors()
+
     result = orch.run()
 
     print(f"\n🏆 MASTER ORCHESTRATOR → {ticker}")
