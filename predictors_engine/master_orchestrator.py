@@ -1,82 +1,50 @@
-# ======================================================
-# master_orchestrator_v4_model_compatible.py
-# ======================================================
-# Ejecuta H1-H10
-# Construye JSON compatible con model.py
-# Incluye:
-#   - Curva H1-H10
-#   - Análisis de consenso
-#   - Acelerador de retorno esperado (segunda derivada)
-# ======================================================
-
 import os
 import json
-import subprocess
 import numpy as np
-from datetime import datetime
-from pathlib import Path
+import pandas as pd
 import sys
-import gc
 
-
-PREDICTOR_DIR = "predictors_engine"
 DATA_DIR = "predictions_data"
-FINAL_OUTPUT_DIR = "final_reports"
-
-for d in [DATA_DIR, FINAL_OUTPUT_DIR]:
-    Path(d).mkdir(exist_ok=True)
 
 
-class MasterOrchestrator:
+# ======================================================
+# TRADUCTOR UNIVERSAL DE RETORNOS
+# ======================================================
+
+def get_return_from_data(data):
+
+    keys = [
+        "expected_ret_pct",
+        "ret_pct",
+        "return_8d_pct",
+        "return_9d_pct",
+        "return_6d_pct",
+        "normalized_ret"
+    ]
+
+    for k in keys:
+        if k in data:
+            return float(data[k])
+
+    return 0.0
+
+
+# ======================================================
+# ORCHESTRATOR V5.2 (PRODUCTION READY)
+# ======================================================
+
+class MasterOrchestratorV5:
+
 
     def __init__(self, ticker):
 
         self.ticker = ticker.upper()
-
-        self.predictors = {h: f"predictor_h{h}.py" for h in range(1, 11)}
-
         self.results = []
 
-    # ======================================================
-    # RUN ALL PREDICTORS (SECUENCIAL → MENOS RAM)
-    # ======================================================
 
-    def run_all_predictors(self):
-
-        print(f"\n🚀 EJECUTANDO SUITE H1-H10 → {self.ticker}")
-
-        for h, script in self.predictors.items():
-
-            script_path = os.path.join(PREDICTOR_DIR, script)
-
-            if not os.path.exists(script_path):
-
-                print(f"   ❌ H{h} no encontrado")
-                continue
-
-            try:
-
-                subprocess.run(
-                    [sys.executable, script_path, self.ticker],
-                    check=True
-                )
-
-                print(f"   ✅ H{h} terminado")
-
-            except subprocess.TimeoutExpired:
-
-                print(f"   ⚠️ H{h} timeout")
-
-            except Exception as e:
-
-                print(f"   ❌ H{h} falló: {e}")
-
-            # liberar memoria entre modelos
-            gc.collect()
-
-    # ======================================================
-    # COLLECT RESULTS
-    # ======================================================
+# ======================================================
+# RECOLECTOR DE RESULTADOS
+# ======================================================
 
     def collect_results(self):
 
@@ -84,11 +52,21 @@ class MasterOrchestrator:
 
         for h in range(1, 11):
 
-            file_path = os.path.join(DATA_DIR, f"{self.ticker}_h{h}.json")
+            possible_files = [
 
-            if os.path.exists(file_path):
+                f"{self.ticker}_h{h}.json",
+                f"{self.ticker}_H{h}_{h}d_v2.json",
+                f"{self.ticker}_H{h}.json",
+                f"{self.ticker}_H{h}_{h}d.json",
+                f"{self.ticker}_H{h}_{h}d_v3.json"
 
-                try:
+            ]
+
+            for fname in possible_files:
+
+                file_path = os.path.join(DATA_DIR, fname)
+
+                if os.path.exists(file_path):
 
                     with open(file_path) as f:
 
@@ -96,93 +74,190 @@ class MasterOrchestrator:
 
                         data["horizon"] = h
 
+                        data["normalized_ret"] = get_return_from_data(data)
+
                         curve.append(data)
 
-                except Exception as e:
-
-                    print(f"   ❌ Error leyendo H{h}: {e}")
+                    break
 
         self.results = sorted(curve, key=lambda x: x["horizon"])
 
-        print(f"\n📊 {len(self.results)}/10 predictores válidos recolectados.")
-
         return self.results
 
-    # ======================================================
-    # CURVE ANALYSIS + ACCELERATION
-    # ======================================================
+
+# ======================================================
+# ANALYSIS DEFAULT
+# ======================================================
+
+    def default_analysis(self):
+
+        return {
+
+            "weighted_return_pct": 0.0,
+            "prediction_volatility": 0.0,
+            "consensus_score": 0.0,
+            "acceleration_score": 0.0,
+            "acceleration_boost": 0.0,
+            "recommendation": "MANTÉN",
+            "models_used": 0
+
+        }
+
+
+# ======================================================
+# ANÁLISIS DE CURVA (ORTOGONAL)
+# ======================================================
 
     def analyze_curve(self):
 
-        if len(self.results) < 2:
+        if len(self.results) < 3:
+            return self.default_analysis()
 
-            return {
-                "recommendation": "MANTÉN",
-                "weighted_return_pct": 0.0,
-                "consensus_score": 0.0,
-                "prediction_volatility": 0.0,
-                "acceleration_score": 0.0,
-                "acceleration_boost": 0.0,
-                "models_used": len(self.results)
-            }
 
         horizons = np.array([r["horizon"] for r in self.results])
 
-        returns = np.array([r.get("expected_ret_pct", 0) for r in self.results])
+        returns = np.array([r["normalized_ret"] for r in self.results], dtype=float)
 
-        # ======================================================
-        # Interpolación curva completa H1-H10
-        # ======================================================
+        returns = np.nan_to_num(
+            returns,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0
+        )
+
+
+# ======================================================
+# INTERPOLACIÓN H1-H10
+# ======================================================
 
         full_h = np.arange(1, 11)
 
         repaired = np.interp(full_h, horizons, returns)
 
-        # ======================================================
-        # Weighted ensemble
-        # ======================================================
 
-        weights = np.linspace(1.0, 1.6, len(repaired))
+# ======================================================
+# SUAVIZADO ANTI RUIDO
+# ======================================================
 
-        base_return = np.average(repaired, weights=weights)
+        smoothed = pd.Series(repaired).rolling(
 
-        volatility = float(np.std(repaired))
+            3,
+            center=True,
+            min_periods=1
 
-        consensus = 1 / (1 + volatility / (np.mean(np.abs(repaired)) + 1e-6))
+        ).mean().values
 
-        # ======================================================
-        # ACCELERATION ENGINE
-        # ======================================================
 
-        first_derivative = np.gradient(repaired)
+# ======================================================
+# SISTEMA ORTOGONAL (QR)
+# ======================================================
+
+        H = np.vstack([
+
+            np.ones(10),
+            np.linspace(-1, 1, 10),
+            np.linspace(-1, 1, 10) ** 2
+
+        ]).T
+
+
+        Q, _ = np.linalg.qr(H)
+
+
+        coeffs = Q.T @ smoothed
+
+
+        reconstructed = (
+
+            coeffs[0] * Q[:, 0] +
+            coeffs[1] * Q[:, 1] +
+            coeffs[2] * Q[:, 2]
+
+        )
+
+
+# ======================================================
+# ACELERACIÓN
+# ======================================================
+
+        first_derivative = np.gradient(reconstructed)
 
         second_derivative = np.gradient(first_derivative)
 
         acceleration = float(np.mean(second_derivative))
 
-        accel_boost = np.clip(acceleration * 4.0, -0.5, 0.5)
+        accel_boost = np.clip(acceleration * 2.0, -0.3, 0.3)
 
-        weighted_return = base_return + accel_boost
 
-        # ======================================================
-        # Recommendation logic
-        # ======================================================
+# ======================================================
+# CONFIDENCE GATE
+# ======================================================
 
-        if weighted_return > 0.5:
+        residual = float(
 
-            rec = "COMPRA"
+            np.sqrt(
+                np.mean(
+                    (smoothed - reconstructed) ** 2
+                )
+            )
 
-        elif weighted_return < -0.5:
+        )
 
-            rec = "VENDE"
 
-        else:
+        volatility = float(np.std(reconstructed))
 
-            rec = "MANTÉN"
+
+        if residual > np.std(smoothed) * 2:
+
+            volatility *= 1.5
+
+
+# ======================================================
+# RETORNO PONDERADO
+# ======================================================
+
+        weighted_return = np.average(
+
+            reconstructed,
+            weights=np.linspace(0.5, 1.5, 10)
+
+        ) + accel_boost
+
+
+        weighted_return = float(
+            np.clip(weighted_return, -20, 20)
+        )
+
+
+# ======================================================
+# CONSENSO
+# ======================================================
+
+        consensus = float(1 / (1 + volatility))
+
+
+# ======================================================
+# RECOMENDACIÓN
+# ======================================================
+
+        recommendation = (
+
+            "COMPRA"
+            if weighted_return > 0.4
+            else "VENDE"
+            if weighted_return < -0.4
+            else "MANTÉN"
+
+        )
+
+
+# ======================================================
+# JSON FINAL
+# ======================================================
 
         return {
 
-            "weighted_return_pct": round(float(weighted_return), 4),
+            "weighted_return_pct": round(weighted_return, 4),
 
             "prediction_volatility": round(volatility, 4),
 
@@ -192,133 +267,36 @@ class MasterOrchestrator:
 
             "acceleration_boost": round(accel_boost, 4),
 
-            "recommendation": rec,
+            "recommendation": recommendation,
 
             "models_used": len(self.results)
 
         }
 
-    # ======================================================
-    # BUILD MODEL COMPATIBLE JSON
-    # ======================================================
 
-    def build_model_json(self, curve_analysis):
+# ======================================================
+# RUN
+# ======================================================
 
-        if not self.results:
+    def run(self):
 
-            raise RuntimeError("No hay resultados")
+        self.collect_results()
 
-        # usamos H10 como base principal
-
-        h10 = next((r for r in self.results if r["horizon"] == 10), self.results[-1])
-
-        return {
-
-            # ==========================================
-            # CONTRATO model.py
-            # ==========================================
-
-            "meta": {
-
-                "ticker": self.ticker,
-
-                "horizon_days": 10,
-
-                "pca_target": 25,
-
-                "theta": 0.85,
-
-                "k_neighbors": 30,
-
-                "alpha": float(h10.get("alpha_used", 2.0)),
-
-                "period": "max"
-
-            },
-
-            "historical": {
-
-                "hit_rate_mean": None,
-
-                "mae_mean": None,
-
-                "rmse_mean": None,
-
-                "pca_dims": 25,
-
-                "n_features": 26,
-
-                "n_windows": 0
-
-            },
-
-            "prediction": {
-
-                "date_base": datetime.utcnow().date().isoformat(),
-
-                "ret_global_pct": round(curve_analysis["weighted_return_pct"], 4),
-
-                "ret_knn_pct": round(curve_analysis["weighted_return_pct"], 4),
-
-                "ret_ens_pct": round(curve_analysis["weighted_return_pct"], 4),
-
-                "price_now": float(h10.get("price_now", 0)),
-
-                "price_pred": float(h10.get("price_pred", 0)),
-
-                "recommendation": curve_analysis["recommendation"],
-
-                "theta_dynamic_pct": 0.85,
-
-                "pca_dims_effective": 25,
-
-                "n_features": 26
-
-            },
-
-            # ==========================================
-            # EXTRAS PARA APP / ANALYTICS
-            # ==========================================
-
-            "prediction_curve": self.results,
-
-            "curve_analysis": curve_analysis,
-
-            "engine_metadata": {
-
-                "engine": "H1-H10_SUITE_MASTER",
-
-                "version": "v4_acceleration_engine",
-
-                "timestamp": datetime.utcnow().isoformat()
-
-            }
-
-        }
+        return self.analyze_curve()
 
 
 # ======================================================
-# MAIN
+# CLI
 # ======================================================
 
 if __name__ == "__main__":
 
-    ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
+    ticker = sys.argv[1] if len(sys.argv) > 1 else "SPY"
 
-    maestro = MasterOrchestrator(ticker)
+    orch = MasterOrchestratorV5(ticker)
 
-    maestro.run_all_predictors()
+    result = orch.run()
 
-    maestro.collect_results()
+    print(f"\n🏆 MASTER ORCHESTRATOR → {ticker}")
 
-    analysis = maestro.analyze_curve()
-
-    final_payload = maestro.build_model_json(analysis)
-
-    output_path = os.path.join(FINAL_OUTPUT_DIR, f"{ticker}_prediction.json")
-
-    with open(output_path, "w") as f:
-
-        json.dump(final_payload, f, indent=2)
-
-    print(f"\n🏆 JSON FINAL GENERADO → {output_path}")
+    print(json.dumps(result, indent=2))
