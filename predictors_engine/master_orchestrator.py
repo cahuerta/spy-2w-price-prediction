@@ -33,7 +33,7 @@ def get_return_from_data(data):
 # ORCHESTRATOR V5.2 (PRODUCTION READY)
 # ======================================================
 
-class MasterOrchestratorV5:
+class MasterOrchestrator:
 
 
     def __init__(self, ticker):
