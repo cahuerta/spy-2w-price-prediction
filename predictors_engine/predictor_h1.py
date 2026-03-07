@@ -171,7 +171,7 @@ if __name__ == "__main__":
 
         print("\n✅ H1 v2.1 - PRODUCCIÓN")
         print(f"📊 {ticker}:      $ {result['price_today']:>8.2f}")
-        print(f"📊 Predicción:   $ {result['price_tomorrow']:>8.2f}")
+        print(f"📊 Predicción:   $ {result['price_pred']:>8.2f}")
         print(f"📈 Retorno:        {result['return_pct']:>6.2f}%")
         print(f"🔥 Confianza:      {result['confidence']:>5.2f}")
         print(f"📁 {path}")
