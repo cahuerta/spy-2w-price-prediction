@@ -134,12 +134,12 @@ def run_predictor_h3(ticker: str):
 
     return {
         "ticker": ticker,
-        "predictor": "H3_v2.2_Prod",
+        "predictor": "H3",
         "horizon_days": HORIZON,
         "date_today": datetime.now().strftime("%Y-%m-%d"),
         "price_today": round(price_today, 4),
-        "price_72h": round(price_72h, 4),
-        "return_72h_pct": round(y_pred_log * 100, 4),
+        "price_pred": round(price_72h, 4),
+        "return_pct": round(y_pred_log * 100, 4),
         "confidence": round(float(confidence), 3),
         "r2_train": round(r2_train, 4),
         "samples": len(clean),
