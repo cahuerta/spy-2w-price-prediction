@@ -241,7 +241,7 @@ if __name__ == "__main__":
 
     if result:
 
-        filename = f"{ticker}_H7_7d_v2.json"
+        filename = f"{ticker}_H7.json"
 
         path = os.path.join(DATA_OUTPUT_DIR, filename)
 
@@ -251,8 +251,8 @@ if __name__ == "__main__":
         print("\n✅ H7 ANALIZADO")
         print("----------------------------------------")
         print(f"📊 {ticker}: ${result['price_today']:,.2f}")
-        print(f"🎯 7d target: ${result['price_7d']:,.2f}")
-        print(f"📈 Retorno: {result['return_7d_pct']}%")
+        print(f"🎯 7d target: ${result['price_pred']:,.2f}")
+        print(f"📈 Retorno: {result['return_pct']}%")
         print(f"📊 Hurst: {result['hurst']} ({result['regime']})")
         print(f"🔥 Confianza: {result['confidence']}")
         print("----------------------------------------")
