@@ -164,7 +164,7 @@ if __name__ == "__main__":
     result = run_predictor_h1(ticker)
 
     if result:
-        filename = f"{ticker}_H1_dia1_v2.json"
+        filename = f"{ticker}_H1.json"
         path = os.path.join(DATA_OUTPUT_DIR, filename)
         with open(path, "w") as f:
             json.dump(result, f, indent=2, default=str)
