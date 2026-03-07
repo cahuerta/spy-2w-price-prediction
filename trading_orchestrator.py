@@ -71,6 +71,12 @@ class TradingOrchestrator:
                 await sync_result
 
         positions = load_positions()
+
+        if len(positions) == 0:
+            logger.warning("⚠️ positions.json vacío → fallback broker")
+
+            if hasattr(self.broker, "get_positions"):
+                positions = await self.broker.get_positions()
         portfolio_tickers = {p["ticker"].upper() for p in positions}
         mode = market_ctx.get("market_mode", "neutral")
 
