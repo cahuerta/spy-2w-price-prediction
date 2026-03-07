@@ -81,9 +81,17 @@ def _load_raw() -> List[Dict[str, Any]]:
                 return json.loads(POSITIONS_FILE.read_text(encoding="utf-8"))
             return []
 
-def _save_raw(positions: List[Dict[str, Any]]):
+def _save_raw(positions):
     with _store_lock:
         _backup()
+
+        # Si llega dict {"AES": {...}} lo convertimos a lista
+        if isinstance(positions, dict):
+            positions = [
+                {"ticker": ticker, **data}
+                for ticker, data in positions.items()
+            ]
+
         POSITIONS_FILE.write_text(
             json.dumps(positions, indent=2, default=str),
             encoding="utf-8"
