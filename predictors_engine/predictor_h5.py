@@ -158,7 +158,7 @@ def run_predictor_h5(ticker:str):
         "horizon_days": HORIZON,
 
         "price_today": round(price_today,4),
-        "price_predd": round(price_5d,4),
+        "price_pred": round(price_5d,4),
 
         "return_pct": round(y_pred_log*100,4),
 
