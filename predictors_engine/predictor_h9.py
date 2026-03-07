@@ -177,14 +177,14 @@ def run_predictor_h9(ticker:str):
     return {
 
         "ticker": ticker,
-        "predictor": "H9_v2.3_CapitalCycle",
+        "predictor": "H9",
 
         "horizon_days": HORIZON,
 
         "price_today": round(price_today,4),
-        "price_9d": round(price_9d,4),
+        "price_pred": round(price_9d,4),
 
-        "return_9d_pct": round(y_pred_log*100,4),
+        "return_pct": round(y_pred_log*100,4),
 
         "mfi_14": round(float(feat["mfi_14"].iloc[-1]),1),
         "bb_position": round(float(feat["bb_dist"].iloc[-1]),2),
