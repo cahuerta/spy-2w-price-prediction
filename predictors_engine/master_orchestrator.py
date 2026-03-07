@@ -6,9 +6,7 @@ import sys
 import subprocess
 from datetime import datetime
 
-DATA_PATH = os.getenv("DATA_PATH", "/data")
-DATA_DIR = os.path.join(DATA_PATH, "predictions")
-
+DATA_DIR = "predictions_data"
 
 # ======================================================
 # UTILIDADES
