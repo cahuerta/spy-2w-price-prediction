@@ -140,11 +140,11 @@ def run_predictor_h1(ticker: str):
 
     return {
         "ticker": ticker,
-        "predictor": "H1_v2.1",
+        "predictor": "H1",
         "horizon_days": HORIZON,
         "date_today": datetime.now().strftime("%Y-%m-%d"),
         "price_today": round(price_today, 4),
-        "price_tomorrow": round(price_tomorrow, 4),
+        "price_pred": round(price_tomorrow, 4),
         "return_pct": round(y_pred_log * 100, 4),
         "confidence": round(confidence, 3),
         "r2_train": round(r2_train, 4),
