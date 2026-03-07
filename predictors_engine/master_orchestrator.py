@@ -6,7 +6,7 @@ import sys
 import subprocess
 from datetime import datetime
 
-TEMP_DIR = "predictions_data"   # donde escriben H1-H10
+DATA_DIR = "predictions_data"   # donde escriben H1-H10
 FINAL_DIR = "/data/predictions" # donde va el resultado final
 
 # ======================================================
@@ -78,7 +78,7 @@ class MasterOrchestrator:
 
             for fname in possible_files:
 
-                path = os.path.join(DATA_DIR,fname)
+                path = os.path.join(DATA_DIR, fname)
 
                 if os.path.exists(path):
 
