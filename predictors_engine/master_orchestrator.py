@@ -51,49 +51,9 @@ class MasterOrchestrator:
 
         self.results = []
 
-        self.price_now = None
+        self.price_today = None
 
         self.h10_json = None
-
-
-# ======================================================
-# EJECUTAR H1-H10
-# ======================================================
-
-    def run_all_predictors(self):
-
-        print(f"🚀 EJECUTANDO SUITE H1-H10 → {self.ticker}")
-
-        base_dir = os.path.dirname(__file__)
-
-        for h in range(1,11):
-
-            script = os.path.join(base_dir,f"predictor_h{h}.py")
-
-            if not os.path.exists(script):
-
-                print(f"⚠️ predictor_h{h}.py no encontrado")
-                continue
-
-            try:
-
-                subprocess.run(
-                    [sys.executable,script,self.ticker],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-
-                print(f"   ✅ H{h} terminado")
-
-            except subprocess.TimeoutExpired:
-
-                print(f"   ⏰ H{h} timeout")
-
-            except subprocess.CalledProcessError:
-
-                print(f"   ❌ H{h} falló")
 
 
 # ======================================================
@@ -134,7 +94,7 @@ class MasterOrchestrator:
                         if price is None:
                             continue
 
-                        if self.price_now is None:
+                        if self.price_today is None:
 
                             self.price_now = (
                                 data.get("price_now")
@@ -239,7 +199,7 @@ class MasterOrchestrator:
         # consenso entre modelos
         consensus = np.std([r["price_pred"] for r in self.results if r["horizon"] < 10])
 
-        consensus_weight = 1/(1+consensus/self.price_now)
+        consensus_weight = 1/(1+consensus/self.price_today)
 
         # ajuste suave (H10 sigue mandando)
         adjust_factor = 0.15 * consensus_weight
@@ -276,7 +236,6 @@ class MasterOrchestrator:
 
     def run(self):
 
-        self.run_all_predictors()
 
         self.collect_results()
 
