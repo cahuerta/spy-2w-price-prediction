@@ -275,7 +275,7 @@ if __name__ == "__main__":
 
     if result:
 
-        filename = f"{ticker}_H8_8d_v2.json"
+        filename = f"{ticker}_H8.json"
 
         path = os.path.join(DATA_OUTPUT_DIR, filename)
 
@@ -286,10 +286,10 @@ if __name__ == "__main__":
         print("-" * 40)
         print(
             f"📊 {ticker}: ${result['price_today']:,.2f} → "
-            f"${result['price_8d']:,.2f}"
+            f"${result['price_pred']:,.2f}"
         )
         print(
-            f"📈 Retorno: {result['return_8d_pct']}% "
+            f"📈 Retorno: {result['return_pct']}% "
             f"| ADX: {result['adx']} ({result['regime']})"
         )
         print(f"🔥 Confianza: {result['confidence']}")
