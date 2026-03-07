@@ -157,14 +157,14 @@ if __name__ == "__main__":
     result = run_predictor_h3(ticker)
 
     if result:
-        filename = f"{ticker}_H3_72h_v2.json"
+        filename = f"{ticker}_H3.json"
         path = os.path.join(DATA_OUTPUT_DIR, filename)
         with open(path, "w") as f:
             json.dump(result, f, indent=2)
 
         print(f"\n✅ H3 PROCESADO CORRECTAMENTE")
         print(f"📊 {ticker}: ${result['price_today']:>8.2f} → Pred. 72h: ${result['price_72h']:>8.2f}")
-        print(f"📈 Retorno: {result['return_72h_pct']:>6.2f}% | Confianza: {result['confidence']:>4.2f}")
+        print(f"📈 Retorno: {result['return_pct']:>6.2f}% | Confianza: {result['confidence']:>4.2f}")
         print(f"📁 Destino: {path}")
     else:
         print("❌ Error: Datos insuficientes.")
