@@ -229,10 +229,35 @@ class MasterOrchestrator:
 
         os.makedirs(DATA_DIR, exist_ok=True)
 
+        valid_models = 0
+
         for i in range(1,11):
-            subprocess.run([sys.executable, f"predictors_engine/predictor_h{i}.py", self.ticker], check=True)
+
+            try:
+
+                print(f"🚀 Ejecutando H{i}")
+
+                subprocess.run(
+                    [sys.executable, f"predictors_engine/predictor_h{i}.py", self.ticker],
+                    check=True
+                )
+
+                valid_models += 1
+
+            except subprocess.CalledProcessError as e:
+
+                print(f"❌ H{i} FALLÓ → revisar predictor_h{i}.py")
+                print(f"   Error: {e}")
         self.collect_results()
 
+        if len(self.results) < 5:
+            raise RuntimeError(
+                f"❌ Ensemble inválido → solo {len(self.results)} modelos válidos (mínimo 5)"
+            )
+        missing = [h for h in range(1,11) if h not in [r["horizon"] for r in self.results]]
+
+        if missing:
+            print(f"⚠️ Horizontes faltantes: {missing}")
         curve = self.build_price_curve()
 
         final_json = self.build_model_json(curve)
