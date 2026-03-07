@@ -14,10 +14,7 @@ DATA_DIR = "predictions_data"
 
 def extract_price_prediction(data):
     for k in [
-        "price_pred",
-        "price_tomorrow",
-        "price_10d",
-        "price_target"
+        "price_pred"
     ]:
         if k in data:
             return float(data[k])
@@ -26,10 +23,7 @@ def extract_price_prediction(data):
 
 def extract_return_pct(data):
     for k in [
-        "return_pct",
-        "ret_pct",
-        "ret_global_pct",
-        "ret_ens_pct"
+        "return_pct"
     ]:
         if k in data:
             return float(data[k])
