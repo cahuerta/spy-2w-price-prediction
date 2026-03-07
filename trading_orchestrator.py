@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from broker import get_engine
 
-from portfolio_store import load_positions
 from portfolio_store import load_positions, save_positions
 
 from capital_governor import CapitalGovernor
