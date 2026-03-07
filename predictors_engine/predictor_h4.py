@@ -253,7 +253,7 @@ if __name__ == "__main__":
 
     if result:
 
-        filename = f"{ticker}_H4_96h_v2.json"
+        filename = f"{ticker}_H4.json"
 
         path = os.path.join(DATA_OUTPUT_DIR, filename)
 
@@ -263,8 +263,8 @@ if __name__ == "__main__":
         print("\n✅ H4 INSTITUCIONAL COMPLETADO")
         print("-----------------------------------")
         print(f"📊 Precio Actual:   ${result['price_today']:,.2f}")
-        print(f"🎯 Predicción 96h:  ${result['price_96h']:,.2f}")
-        print(f"📈 Retorno Semanal: {result['return_96h_pct']}%")
+        print(f"🎯 Predicción 96h:  ${result['price_pred']:,.2f}")
+        print(f"📈 Retorno Semanal: {result['return_pct']}%")
         print(f"🔥 Confianza:       {result['confidence']}")
         print("-----------------------------------")
         print(f"📁 JSON: {path}")
