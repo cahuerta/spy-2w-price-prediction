@@ -214,15 +214,6 @@ class MasterOrchestrator:
             4
         )
 
-        final_json["prediction"]["recommendation"] = (
-
-            "COMPRA"
-            if final_json["prediction"]["ret_ens_pct"] > 0.4
-            else "VENDE"
-            if final_json["prediction"]["ret_ens_pct"] < -0.4
-            else "MANTÉN"
-
-        )
 
         final_json["price_curve"] = curve
 
