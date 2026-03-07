@@ -163,7 +163,7 @@ if __name__ == "__main__":
             json.dump(result, f, indent=2)
 
         print(f"\n✅ H3 PROCESADO CORRECTAMENTE")
-        print(f"📊 {ticker}: ${result['price_today']:>8.2f} → Pred. 72h: ${result['price_72h']:>8.2f}")
+        print(f"📊 {ticker}: ${result['price_today']:>8.2f} → Pred. 72h: ${result['price_pred']:>8.2f}")
         print(f"📈 Retorno: {result['return_pct']:>6.2f}% | Confianza: {result['confidence']:>4.2f}")
         print(f"📁 Destino: {path}")
     else:
