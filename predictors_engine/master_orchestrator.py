@@ -96,16 +96,16 @@ class MasterOrchestrator:
 
                         if self.price_today is None:
 
-                            self.price_now = (
+                            self.price_today = (
                                 data.get("price_now")
                                 or data.get("price_today")
                                 or data.get("prediction",{}).get("price_now")
                             )
 
-                            if self.price_now is None:
-                                raise RuntimeError("price_now missing")
+                            if self.price_today is None:
+                                raise RuntimeError("price_today missing")
 
-                            self.price_now = float(self.price_now)
+                            self.price_today = float(self.price_today)
 
                         data["price_pred"] = price
 
@@ -175,7 +175,7 @@ class MasterOrchestrator:
 
         curve_last = curve["price_path"][-1]
 
-        curve_ret = ((curve_last-self.price_now)/self.price_now)*100
+        curve_ret = ((curve_last-self.price_today)/self.price_today)*100
 
         return curve_ret
 
@@ -209,7 +209,7 @@ class MasterOrchestrator:
         final_json["prediction"]["price_pred"] = round(final_price,2)
 
         final_json["prediction"]["ret_ens_pct"] = round(
-            ((final_price-self.price_now)/self.price_now)*100,
+            ((final_price-self.price_today)/self.price_today)*100,
             4
         )
 
