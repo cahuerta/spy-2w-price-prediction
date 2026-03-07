@@ -202,14 +202,14 @@ def run_predictor_h7(ticker: str):
     return {
 
         "ticker": ticker,
-        "predictor": "H7_v2.3_Persistence",
+        "predictor": "H7",
 
         "horizon_days": HORIZON,
 
         "price_today": round(price_today,4),
-        "price_7d": round(price_7d,4),
+        "price_pred": round(price_7d,4),
 
-        "return_7d_pct": round(y_pred_log*100,4),
+        "return_pct": round(y_pred_log*100,4),
 
         "hurst": round(hurst_val,3),
         "regime": regime,
