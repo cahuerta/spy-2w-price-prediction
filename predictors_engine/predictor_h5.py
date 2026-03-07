@@ -189,7 +189,7 @@ if __name__ == "__main__":
 
     if result:
 
-        filename = f"{ticker}_H5_5d_v2.json"
+        filename = f"{ticker}_H5.json"
         path = os.path.join(DATA_OUTPUT_DIR, filename)
 
         with open(path,"w") as f:
@@ -198,8 +198,8 @@ if __name__ == "__main__":
         print("\n✅ H5 SEMANAL COMPLETADO")
         print("-----------------------------------")
         print(f"📊 {ticker}:      ${result['price_today']:,.2f}")
-        print(f"🎯 Target 5d:     ${result['price_target_5d']:,.2f}")
-        print(f"📈 Retorno Est:   {result['return_5d_pct']}%")
+        print(f"🎯 Target 5d:     ${result['price_pred']:,.2f}")
+        print(f"📈 Retorno Est:   {result['return_pct']}%")
         print(f"🔥 Confianza:     {result['confidence']}")
         print("-----------------------------------")
 
