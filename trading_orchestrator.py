@@ -13,6 +13,7 @@ from pathlib import Path
 from broker import get_engine
 
 from portfolio_store import load_positions
+from portfolio_store import load_positions, save_positions
 
 from capital_governor import CapitalGovernor
 
@@ -77,6 +78,10 @@ class TradingOrchestrator:
 
             if hasattr(self.broker, "get_positions"):
                 positions = await self.broker.get_positions()
+
+                if positions:
+                    save_positions(positions)
+                    logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
         portfolio_tickers = {p["ticker"].upper() for p in positions}
         mode = market_ctx.get("market_mode", "neutral")
 
