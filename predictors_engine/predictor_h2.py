@@ -174,7 +174,7 @@ if __name__ == "__main__":
     result = run_predictor_h2(ticker)
 
     if result:
-        filename = f"{ticker}_H2_48h.json"
+        filename = f"{ticker}_H2.json"
         path = os.path.join(DATA_OUTPUT_DIR, filename)
 
         with open(path, "w") as f:
