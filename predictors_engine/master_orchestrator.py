@@ -6,7 +6,8 @@ import sys
 import subprocess
 from datetime import datetime
 
-DATA_DIR = "predictions_data"
+DATA_PATH = os.getenv("DATA_PATH", "/data")
+DATA_DIR = os.path.join(DATA_PATH, "predictions")
 
 
 # ======================================================
@@ -243,7 +244,12 @@ class MasterOrchestrator:
 
         final_json = self.build_model_json(curve)
 
-        output_file = os.path.join(DATA_DIR,f"{self.ticker}_ENSEMBLE.json")
+        ticker_dir = os.path.join(DATA_DIR, self.ticker)
+        os.makedirs(ticker_dir, exist_ok=True)
+
+        file_name = datetime.utcnow().strftime("%Y-%m-%d") + ".json"
+
+        output_file = os.path.join(ticker_dir, file_name)
 
         os.makedirs(DATA_DIR,exist_ok=True)
 
