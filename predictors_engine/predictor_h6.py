@@ -135,12 +135,12 @@ def run_predictor_h6(ticker: str):
 
     return {
         "ticker": ticker,
-        "predictor": "H6_v2.2_Structural",
+        "predictor": "H6",
         "horizon_days": HORIZON,
         "date_today": datetime.now().strftime("%Y-%m-%d"),
         "price_today": round(price_today, 4),
-        "price_6d": round(price_6d, 4),
-        "return_6d_pct": round(y_pred_log * 100, 4),
+        "price_pred": round(price_6d, 4),
+        "return_pct": round(y_pred_log * 100, 4),
         "confidence": round(float(confidence), 3),
         "samples": len(clean),
         "timestamp": datetime.now().isoformat()
