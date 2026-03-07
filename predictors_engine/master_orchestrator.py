@@ -6,7 +6,8 @@ import sys
 import subprocess
 from datetime import datetime
 
-DATA_DIR = "predictions_data"
+TEMP_DIR = "predictions_data"   # donde escriben H1-H10
+FINAL_DIR = "/data/predictions" # donde va el resultado final
 
 # ======================================================
 # UTILIDADES
@@ -233,8 +234,9 @@ class MasterOrchestrator:
 
         final_json = self.build_model_json(curve)
 
-        ticker_dir = os.path.join(DATA_DIR, self.ticker)
+        ticker_dir = os.path.join(FINAL_DIR, self.ticker)
         os.makedirs(ticker_dir, exist_ok=True)
+
 
         file_name = datetime.utcnow().strftime("%Y-%m-%d") + ".json"
 
