@@ -248,12 +248,12 @@ def run_predictor_h10(ticker: str):
     return {
 
         "ticker": ticker,
-        "predictor": "H10_v2.6_LongStructure",
+        "predictor": "H10",
 
-        "price_now": round(price_today, 4),
-        "price_10d": round(price_10d, 4),
+        "price_today": round(price_today, 4),
+        "price_pred": round(price_10d, 4),
 
-        "ret_pct": round(y_final * 100, 4),
+        "return_pct": round(y_final * 100, 4),
 
         "samples": len(clean),
 
