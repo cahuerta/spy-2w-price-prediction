@@ -40,10 +40,7 @@ def run_model(
     # ======================================================
     try:
         maestro = MasterOrchestrator(ticker)
-        maestro.run_all_predictors()
-        maestro.collect_results()
-        analysis = maestro.analyze_curve()
-        result = maestro.build_model_json(analysis)
+        result = maestro.run()
         return result
     except Exception as e:
         return {
