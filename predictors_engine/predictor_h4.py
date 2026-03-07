@@ -215,15 +215,15 @@ def run_predictor_h4(ticker: str):
     return {
 
         "ticker": ticker,
-        "predictor": "H4_v2.2_Weekly",
+        "predictor": "H4",
 
         "horizon_days": HORIZON,
         "date_today": datetime.now().strftime("%Y-%m-%d"),
 
         "price_today": round(price_today,4),
-        "price_96h": round(price_96h,4),
+        "price_pred": round(price_96h,4),
 
-        "return_96h_pct": round(y_pred_log*100,4),
+        "return_pct": round(y_pred_log*100,4),
 
         "confidence": round(float(confidence),3),
         "r2_train": round(float(r2_train),4),
