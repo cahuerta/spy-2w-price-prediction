@@ -216,7 +216,7 @@ if __name__ == "__main__":
 
     if result:
 
-        filename = f"{ticker}_H9_9d_v2.json"
+        filename = f"{ticker}_H9.json"
 
         path = os.path.join(DATA_OUTPUT_DIR, filename)
 
@@ -226,8 +226,8 @@ if __name__ == "__main__":
         print("\n✅ H9 COMPLETADO")
         print("----------------------------------------")
         print(f"📊 {ticker}: ${result['price_today']:,.2f}")
-        print(f"🎯 9d target: ${result['price_9d']:,.2f}")
-        print(f"📈 Retorno Est: {result['return_9d_pct']}%")
+        print(f"🎯 9d target: ${result['price_pred']:,.2f}")
+        print(f"📈 Retorno Est: {result['return_pct']}%")
         print(f"💰 MFI: {result['mfi_14']} | BB Dist: {result['bb_position']}")
         print(f"🔥 Confianza: {result['confidence']}")
         print("----------------------------------------")
