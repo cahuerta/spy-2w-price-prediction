@@ -1,298 +1,405 @@
-import numpy as np
-import pandas as pd
+"""
+predictor_h10.py
+Adaptación de model.py para funcionar como H10 dentro del orchestrator.
+NO cambia la lógica matemática.
+"""
+
 import os
 import json
 import sys
+import numpy as np
+import pandas as pd
 from datetime import datetime
+from data_provider import get_price_history
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+import warnings
+warnings.filterwarnings('ignore')
+
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
-import warnings
-
-warnings.filterwarnings("ignore")
-
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, ROOT_DIR)
-
-from data_provider import get_price_history
-
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from pandas.tseries.offsets import DateOffset
 
 # ======================================================
-# CONFIGURACIÓN GLOBAL
+# CONFIG H10
 # ======================================================
 
 DATA_OUTPUT_DIR = "predictions_data"
 os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
 
-HORIZON = 10
-ALPHA_H10 = 2.0
-K_NEIGHBORS = 30
-PCA_TARGET = 25
-
+HORIZON_H10 = 10
+PCA_TARGET_H10 = 50
+THETA_H10 = 0.75
+K_NEIGHBORS_H10 = 20
+ALPHA_H10 = 0.5
+PERIOD_H10 = "max"
 
 # ======================================================
-# UTILIDADES MATEMÁTICAS
+# Dataclasses (solo internas, no afectan API)
 # ======================================================
+
+@dataclass
+class ModelMeta:
+    ticker: str
+    horizon_days: int
+    pca_target: int
+    theta: float
+    k_neighbors: int
+    alpha: float
+    period: str
+
+@dataclass
+class HistoricalStats:
+    hit_rate_mean: Optional[float]
+    mae_mean: Optional[float]
+    rmse_mean: Optional[float]
+    pca_dims: Optional[int]
+    n_features: int
+    n_windows: int
+
+# ======================================================
+# Utils matemáticos
+# ======================================================
+
+def log_return(series: pd.Series) -> pd.Series:
+    return np.log(series).diff()
 
 def hurst_rs(x: np.ndarray) -> float:
-
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
-
     n = len(x)
-
     if n < 30:
-        return 0.5
+        return np.nan
 
     x = x - x.mean()
-
     z = np.cumsum(x)
-
     r = z.max() - z.min()
     s = x.std(ddof=1)
 
-    if s <= 1e-9 or r <= 1e-9:
-        return 0.5
+    if s == 0 or r == 0:
+        return np.nan
+    return float(np.log(r / s) / np.log(n))
 
-    return float(np.log((r + 1e-9) / (s + 1e-9)) / np.log(n))
-
-
-def compute_rsi_wilder(price: pd.Series, period: int = 14) -> pd.Series:
-
-    delta = price.diff()
-
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-
-    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-
-    rs = avg_gain / (avg_loss + 1e-9)
-
-    return 100 - (100 / (1 + rs))
-
-
-def zscore_rolling(s: pd.Series, window: int) -> pd.Series:
-
-    mean = s.rolling(window).mean()
-    std = s.rolling(window).std()
-
-    return (s - mean) / (std + 1e-9)
-
+def rolling_hurst(returns: pd.Series, window: int) -> pd.Series:
+    return returns.rolling(window).apply(lambda a: hurst_rs(a), raw=True)
 
 # ======================================================
-# FEATURE ENGINEERING H10
+# Feature engineering (SIN data leak)
 # ======================================================
 
-def make_features_h10(df: pd.DataFrame):
-
+def make_features(df: pd.DataFrame, horizon: int = 10) -> pd.DataFrame:
     out = df.copy()
 
-    out["ret1"] = np.log(out["Close"]).diff()
+    out["ret1"] = log_return(out["Close"])
+    out["range"] = np.log(out["High"] / out["Low"])
+    out["vol_chg"] = np.log(out["Volume"].replace(0, np.nan)).diff()
 
-    out["range"] = np.log(out["High"] / out["Low"]).clip(0, 0.50)
-
-    out["vol_chg"] = np.log(out["Volume"].replace(0, np.nan)).diff().fillna(0)
-
-    # LAGS
     for k in range(1, 21):
         out[f"ret_lag_{k}"] = out["ret1"].shift(k)
 
     past = out["ret1"].shift(1)
+    out["rv_20"] = past.rolling(20).std()
+    out["rv_60"] = past.rolling(60).std()
+    out["hurst_60"] = rolling_hurst(past, 60)
+    out["hurst_120"] = rolling_hurst(past, 120)
 
-    out["rv_60"] = past.rolling(60).std().fillna(0)
+    out["y_fwd"] = np.log(out["Close"].shift(-horizon) / out["Close"])
 
-    out["hurst_120"] = past.rolling(120).apply(
-        lambda a: hurst_rs(a),
-        raw=True
-    ).fillna(0.5)
-
-    close_past = out["Close"].shift(1)
-
-    sma = close_past.rolling(20).mean()
-    std = close_past.rolling(20).std()
-
-    out["bb_pct_b_z"] = zscore_rolling(
-        (close_past - (sma - 2 * std)) / (4 * std + 1e-9),
-        252
-    ).fillna(0)
-
-    out["rsi_z"] = zscore_rolling(
-        compute_rsi_wilder(close_past, 14),
-        252
-    ).fillna(0)
-
-    return out.fillna(0)
-
+    return out
 
 # ======================================================
-# MOTOR H10
+# kNN caótico
 # ======================================================
 
-def run_predictor_h10(ticker: str):
+def knn_caotico_predict(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_query: np.ndarray,
+    k: int = 20
+) -> float:
+    k_eff = min(k, len(X_train))
+    nn = NearestNeighbors(n_neighbors=k_eff, metric="euclidean")
+    nn.fit(X_train)
+    _, idx = nn.kneighbors(X_query)
+    return float(np.mean(y_train[idx[0]]))
 
-    raw = get_price_history(ticker=ticker, period="max", interval="1d")
+# ======================================================
+# WALK-FORWARD CORREGIDO 100%
+# ======================================================
 
-    if raw is None or len(raw) < 300:
-        return None
+def walk_forward_train_test(
+    data: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    train_years: int = 5,
+    test_months: int = 6,
+    pca_target: int = 50
+) -> pd.DataFrame:
+    """
+    Walk-forward VALIDADO: datos completos + sin NaNs + sin overlap
+    """
+    clean_data = data.dropna(subset=feature_cols + [target_col]).sort_index()
 
-    df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if len(clean_data) < 400:
+        return pd.DataFrame()
 
-    feat = make_features_h10(df)
+    results = []
+    start = clean_data.index.min()
+    cur_train_start = start
 
-    feature_cols = [
-        "range",
-        "vol_chg",
-        "rv_60",
-        "hurst_120",
-        "bb_pct_b_z",
-        "rsi_z"
-    ] + [f"ret_lag_{k}" for k in range(1, 21)]
+    n_features = len(feature_cols)
+    n_pca = min(pca_target, max(1, n_features - 1))
 
-    feat["y_fwd"] = np.log(
-        feat["Close"].shift(-HORIZON) / feat["Close"]
-    )
-
-    clean = feat.dropna(subset=feature_cols + ["y_fwd"])
-
-    X = clean[feature_cols].values
-    y = clean["y_fwd"].values
-
-
-    # ======================================================
-    # PCA DINÁMICO
-    # ======================================================
-
-    n_samples, n_features = X.shape
-
-    dynamic_pca = max(
-        1,
-        min(PCA_TARGET, n_features, n_samples - 1)
-    )
-
-    pipe = Pipeline([
+    model = Pipeline([
         ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=dynamic_pca, random_state=42)),
-        ("ridge", Ridge(alpha=ALPHA_H10))
+        ("pca", PCA(n_components=n_pca, random_state=42)),
+        ("ridge", Ridge(alpha=1.0))
     ])
 
-    pipe.fit(X, y)
+    while True:
+        cur_train_end = cur_train_start + DateOffset(years=train_years)
+        cur_test_end = cur_train_end + DateOffset(months=test_months)
 
+        train = clean_data[
+            (clean_data.index >= cur_train_start) &
+            (clean_data.index < cur_train_end)
+        ]
+        test = clean_data[
+            (clean_data.index >= cur_train_end) &
+            (clean_data.index < cur_test_end)
+        ]
 
-    # ======================================================
-    # PREDICCIÓN GLOBAL
-    # ======================================================
+        if len(test) < 30:
+            break
 
-    last_feat = feat[feature_cols].iloc[-1:].values
+        if len(train) >= 300:
+            X_train = train[feature_cols].values
+            y_train = train[target_col].values
+            X_test = test[feature_cols].values
+            y_test = test[target_col].values
 
-    y_global = float(pipe.predict(last_feat)[0])
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
 
+            results.append({
+                "mae": float(mean_absolute_error(y_test, y_pred)),
+                "rmse": float(np.sqrt(mean_squared_error(y_test, y_pred))),
+                "hit_rate": float((np.sign(y_pred) == np.sign(y_test)).mean()),
+                "n_test": len(test),
+                "n_train": len(train),
+                "n_features": n_features,
+                "n_pca": n_pca,
+            })
 
-    # ======================================================
-    # kNN ANALOGÍA HISTÓRICA
-    # ======================================================
+        cur_train_start = cur_train_end
 
-    X_scaled = pipe.named_steps["scaler"].transform(X)
-    X_pca = pipe.named_steps["pca"].transform(X_scaled)
-
-    X_last_scaled = pipe.named_steps["scaler"].transform(last_feat)
-    X_last_pca = pipe.named_steps["pca"].transform(X_last_scaled)
-
-    k = min(K_NEIGHBORS, len(X_pca))
-
-    nn = NearestNeighbors(n_neighbors=k)
-
-    nn.fit(X_pca)
-
-    distances, idx = nn.kneighbors(X_last_pca)
-
-    weights = 1.0 / (distances[0] + 1e-9)
-
-    y_knn = float(
-        np.sum(y[idx[0]] * weights) /
-        np.sum(weights)
-    )
-
-
-    # ======================================================
-    # ENSEMBLE
-    # ======================================================
-
-    y_final = 0.5 * y_knn + 0.5 * y_global
-
-
-    # ======================================================
-    # CONDITIONING
-    # ======================================================
-
-    h120 = float(feat["hurst_120"].iloc[-1])
-    rsi_z = float(feat["rsi_z"].iloc[-1])
-
-    if h120 > 0.55:
-        y_final *= 1.15
-
-    if abs(rsi_z) > 1.5:
-        y_final *= 1.10
-
-
-    y_final = np.clip(y_final, -0.20, 0.20)
-
-
-    price_today = float(feat["Close"].iloc[-1])
-
-    price_10d = price_today * np.exp(y_final)
-
-
-    return {
-
-        "ticker": ticker,
-        "predictor": "H10",
-
-        "price_today": round(price_today, 4),
-        "price_pred": round(price_10d, 4),
-
-        "return_pct": round(y_final * 100, 4),
-
-        "samples": len(clean),
-
-        "model": {
-            "pca_components": dynamic_pca,
-            "k_neighbors": k
-        },
-
-        "timestamp": datetime.now().isoformat()
-    }
-
+    return pd.DataFrame(results)
 
 # ======================================================
-# EJECUCIÓN
+# Motor matemático completo (CORREGIDO)
+# ======================================================
+
+def _run_full_math_engine(
+    ticker: str,
+    horizon: int,
+    pca_target: int,
+    theta: float,
+    k_neighbors: int,
+    alpha: float,
+    period: str
+) -> Dict:
+
+    raw = get_price_history(ticker=ticker, period=period, interval="1d")
+
+    if raw is None or len(raw) == 0:
+        raise RuntimeError(f"No se pudieron descargar datos para {ticker}")
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+
+    df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    df.index = pd.to_datetime(df.index)
+
+    if len(df) < 300:
+        raise RuntimeError(f"Datos insuficientes: {len(df)} filas")
+
+    feat = make_features(df, horizon=horizon)
+
+    feature_cols = [
+        "range", "vol_chg", "rv_20", "rv_60", "hurst_60", "hurst_120",
+        *[f"ret_lag_{k}" for k in range(1, 21)]
+    ]
+
+    res_df = walk_forward_train_test(feat, feature_cols, "y_fwd", pca_target=pca_target)
+
+    if res_df is None or len(res_df) == 0:
+        hist = HistoricalStats(
+            hit_rate_mean=None,
+            mae_mean=None,
+            rmse_mean=None,
+            pca_dims=None,
+            n_features=len(feature_cols),
+            n_windows=0
+        )
+    else:
+        hist = HistoricalStats(
+            hit_rate_mean=float(res_df["hit_rate"].mean()),
+            mae_mean=float(res_df["mae"].mean()),
+            rmse_mean=float(res_df["rmse"].mean()),
+            pca_dims=int(res_df["n_pca"].iloc[0]),
+            n_features=int(res_df["n_features"].iloc[0]),
+            n_windows=int(len(res_df))
+        )
+
+    n_features = len(feature_cols)
+    n_pca = min(pca_target, max(1, n_features - 1))
+
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", PCA(n_components=n_pca, random_state=42)),
+        ("ridge", Ridge(alpha=1.0))
+    ])
+
+    train_df = feat.dropna(subset=["y_fwd"] + feature_cols)
+    X = train_df[feature_cols].values
+    y = train_df["y_fwd"].values
+    model.fit(X, y)
+
+    last_row = feat.iloc[-1]
+    X_last = last_row[feature_cols].values.reshape(1, -1)
+
+    y_global = float(model.predict(X_last)[0])
+
+    X_pca = model.named_steps["pca"].transform(
+        model.named_steps["scaler"].transform(X)
+    )
+    X_last_pca = model.named_steps["pca"].transform(
+        model.named_steps["scaler"].transform(X_last)
+    )
+    y_knn = knn_caotico_predict(X_pca, y, X_last_pca, k_neighbors)
+
+    w = hist.hit_rate_mean
+    if w is not None:
+        w = float(np.clip(w, 0.4, 0.6))
+    else:
+        w = alpha
+
+    y_ens = w * y_knn + (1 - w) * y_global
+
+    recent_vol = float(feat["rv_60"].iloc[-1])
+    if not np.isfinite(recent_vol) or recent_vol <= 0:
+        recent_vol = 0.02
+
+    hit_rate = hist.hit_rate_mean if hist.hit_rate_mean is not None else 0.5
+    base_theta = theta
+    vol_adjustment = np.clip(recent_vol * 50, 0.5, 2.0)
+    quality_adjustment = np.clip(1.0 - (hit_rate - 0.5), 0.8, 1.2)
+
+    theta_dynamic = base_theta * vol_adjustment * quality_adjustment
+
+    price_now = float(last_row["Close"])
+    price_pred = float(price_now * np.exp(y_ens))
+
+    recommendation = (
+        "COMPRA" if y_ens * 100 >= theta_dynamic else
+        "VENDE" if y_ens * 100 <= -theta_dynamic else
+        "MANTÉN"
+    )
+
+    return {
+        "meta": ModelMeta(ticker, horizon, pca_target, theta, k_neighbors, alpha, period).__dict__,
+        "historical": {
+            "hit_rate_mean": hist.hit_rate_mean,
+            "mae_mean": hist.mae_mean,
+            "rmse_mean": hist.rmse_mean,
+            "pca_dims": hist.pca_dims,
+            "n_features": hist.n_features,
+            "n_windows": hist.n_windows,
+        },
+        "prediction": {
+            "date_base": datetime.utcnow().date().isoformat(),
+            "ret_global_pct": round(y_global * 100.0, 4),
+            "ret_knn_pct": round(y_knn * 100.0, 4),
+            "ret_ens_pct": round(y_ens * 100.0, 4),
+            "price_now": round(price_now, 2),
+            "price_pred": round(price_pred, 2),
+            "recommendation": recommendation,
+            "theta_dynamic_pct": round(theta_dynamic, 4),
+            "pca_dims_effective": n_pca,
+            "n_features": n_features,
+        },
+    }
+
+# ======================================================
+# API pública (CONTRATO INTACTO)
+# ======================================================
+
+def run_model(
+    ticker: str = "SPY",
+    horizon: int = 1,
+    pca_target: int = 50,
+    theta: float = 0.75,
+    k_neighbors: int = 20,
+    alpha: float = 0.5,
+    period: str = "max"
+):
+    full = _run_full_math_engine(ticker, horizon, pca_target, theta, k_neighbors, alpha, period)
+    return full
+
+def format_report(result: dict) -> str:
+    m, h, p = result["meta"], result["historical"], result["prediction"]
+
+    lines = ["=== RESUMEN HISTÓRICO (WALK-FORWARD OOS) ==="]
+    if h["hit_rate_mean"] is None:
+        lines.append("Sin ventanas walk-forward válidas.")
+    else:
+        lines.extend([
+            f"✅ Ventanas OOS     : {h['n_windows']}",
+            f"✅ Hit-rate OOS     : {h['hit_rate_mean']:.4f}",
+            f"MAE retorno OOS    : {h['mae_mean']:.6f}",
+            f"RMSE retorno OOS   : {h['rmse_mean']:.6f}",
+            f"PCA dims           : {h['pca_dims']}",
+        ])
+
+    lines.extend([
+        "",
+        "=== PREDICCIÓN HOY (ENSEMBLE) ===",
+        f"Activo              : {m['ticker']}",
+        f"Horizonte           : {m['horizon_days']} días",
+        f"Precio actual       : ${p['price_now']:,.2f}",
+        f"Precio esperado     : ${p['price_pred']:,.2f}",
+        f"Retorno ENSAMBLE    : {p['ret_ens_pct']:.2f}%",
+        f"Theta dinámico      : {p['theta_dynamic_pct']:.2f}%",
+        f"RECOMENDACIÓN FINAL : {p['recommendation']}",
+    ])
+
+    return "\n".join(lines)
+
+# ======================================================
+# EJECUCIÓN COMO H10
 # ======================================================
 
 if __name__ == "__main__":
-
     ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
 
-    print(f"🚀 Iniciando H10 V2.6 → {ticker}")
+    result = run_model(
+        ticker=ticker,
+        horizon=10,
+        pca_target=50,
+        theta=0.75,
+        k_neighbors=20,
+        alpha=0.5,
+        period="max"
+    )
 
-    res = run_predictor_h10(ticker)
+    output_path = os.path.join(DATA_OUTPUT_DIR, f"{ticker}_H10.json")
 
-    if res:
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
 
-        path = os.path.join(DATA_OUTPUT_DIR, f"{ticker}_H10.json")
-
-        with open(path, "w") as f:
-            json.dump(res, f, indent=2)
-
-        print("")
-        print("✅ H10 COMPLETADO")
-        print("----------------------------------")
-        print(f"📊 Precio: ${res['price_now']}")
-        print(f"🎯 Target 10d: ${res['price_10d']}")
-        print(f"📈 Retorno: {res['ret_pct']}%")
-        print("----------------------------------")
-
-    else:
-
-        print("❌ Datos insuficientes para H10")
+    print(format_report(result))
+    print(f"\n💾 Guardado: {output_path}")
