@@ -1,5 +1,5 @@
 # =========================================================
-# portfolio_store.py — PORTFOLIO STATE MANAGER v1.4
+# portfolio_store.py — PORTFOLIO STATE MANAGER v1.5 STABLE
 # =========================================================
 
 import json
@@ -17,6 +17,7 @@ from dataclasses import dataclass
 # =========================================================
 # CONFIG
 # =========================================================
+
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 POSITIONS_FILE = DATA_PATH / "positions.json"
 POSITIONS_BACKUP = DATA_PATH / "positions_backup.json"
@@ -36,6 +37,7 @@ _store_lock = threading.Lock()
 # =========================================================
 # STRUCT
 # =========================================================
+
 @dataclass
 class PortfolioMetrics:
     positions_count: int
@@ -49,6 +51,7 @@ class PortfolioMetrics:
 # =========================================================
 # UTILS
 # =========================================================
+
 def _now():
     return datetime.now(CL_TIMEZONE).isoformat()
 
@@ -69,10 +72,7 @@ def _save_raw(data):
         _backup()
 
         if isinstance(data, dict):
-            data = [
-                {"ticker": t, **v}
-                for t, v in data.items()
-            ]
+            data = [{"ticker": t, **v} for t, v in data.items()]
 
         POSITIONS_FILE.write_text(
             json.dumps(data, indent=2, default=str),
@@ -80,16 +80,17 @@ def _save_raw(data):
         )
 
 # =========================================================
-# FETCH DESDE API TRADING
+# FETCH DESDE /trading/positions
 # =========================================================
-async def _fetch_positions_api():
+
+def _fetch_positions_api():
 
     url = f"{API_BASE}/trading/positions"
 
     try:
 
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
+        with httpx.Client(timeout=10) as client:
+            r = client.get(url)
 
         if r.status_code != 200:
             raise RuntimeError("positions API error")
@@ -97,10 +98,7 @@ async def _fetch_positions_api():
         data = r.json()
 
         if isinstance(data, dict):
-            data = [
-                {"ticker": t, **v}
-                for t, v in data.items()
-            ]
+            data = [{"ticker": t, **v} for t, v in data.items()]
 
         logger.info(f"🔄 Sync API positions → {len(data)}")
 
@@ -113,38 +111,27 @@ async def _fetch_positions_api():
         return None
 
 # =========================================================
-# LOAD POSITIONS (SYNC + CACHE)
+# LOAD POSITIONS
 # =========================================================
+
 def load_positions() -> List[Dict[str, Any]]:
 
     _ensure_store()
 
-    try:
+    data = _fetch_positions_api()
 
-        import asyncio
+    if data:
 
-        data = asyncio.run(_fetch_positions_api())
+        _save_raw(data)
 
-        if data:
+        return data
 
-            _save_raw(data)
-
-            return data
-
-    except Exception as e:
-
-        logger.warning(f"API sync skipped: {e}")
-
-    # fallback local
     try:
 
         data = json.loads(POSITIONS_FILE.read_text())
 
         if isinstance(data, dict):
-            data = [
-                {"ticker": t, **v}
-                for t, v in data.items()
-            ]
+            data = [{"ticker": t, **v} for t, v in data.items()]
 
         return data
 
@@ -155,6 +142,7 @@ def load_positions() -> List[Dict[str, Any]]:
 # =========================================================
 # SAVE POSITIONS
 # =========================================================
+
 def save_positions(positions: List[Dict[str, Any]]):
 
     _save_raw(positions)
@@ -162,6 +150,7 @@ def save_positions(positions: List[Dict[str, Any]]):
 # =========================================================
 # PRICE UPDATE
 # =========================================================
+
 def update_prices(price_map: Dict[str, float]):
 
     positions = load_positions()
@@ -191,6 +180,7 @@ def update_prices(price_map: Dict[str, float]):
 # =========================================================
 # METRICS
 # =========================================================
+
 def portfolio_metrics() -> PortfolioMetrics:
 
     positions = load_positions()
@@ -202,13 +192,15 @@ def portfolio_metrics() -> PortfolioMetrics:
 
     for p in positions:
 
-        value = p["qty"] * p.get("price_now", p["entry_price"])
+        price = p.get("price_now", p["entry_price"])
+
+        value = p["qty"] * price
 
         total_value += value
 
         entry_value += p["qty"] * p["entry_price"]
 
-        unrealized += (p.get("price_now", p["entry_price"]) - p["entry_price"]) * p["qty"]
+        unrealized += (price - p["entry_price"]) * p["qty"]
 
         if p.get("is_anchor"):
             anchors += 1
