@@ -153,14 +153,14 @@ def run_predictor_h5(ticker:str):
     return {
 
         "ticker": ticker,
-        "predictor": "H5_v2.2_Weekly",
+        "predictor": "H5",
 
         "horizon_days": HORIZON,
 
         "price_today": round(price_today,4),
-        "price_target_5d": round(price_5d,4),
+        "price_predd": round(price_5d,4),
 
-        "return_5d_pct": round(y_pred_log*100,4),
+        "return_pct": round(y_pred_log*100,4),
 
         "confidence": round(float(confidence),3),
 
