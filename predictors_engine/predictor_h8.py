@@ -250,11 +250,11 @@ def run_predictor_h8(ticker: str):
 
     return {
         "ticker": ticker,
-        "predictor": "H8_v2.3_TrendStrength",
+        "predictor": "H8",
         "horizon_days": HORIZON,
         "price_today": round(price_today, 4),
-        "price_8d": round(price_8d, 4),
-        "return_8d_pct": round(y_pred_log * 100, 4),
+        "price_pred": round(price_8d, 4),
+        "return_pct": round(y_pred_log * 100, 4),
         "adx": round(adx_now, 1),
         "regime": regime,
         "confidence": round(float(confidence), 3),
