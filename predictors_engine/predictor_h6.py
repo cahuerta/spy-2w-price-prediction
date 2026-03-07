@@ -153,15 +153,15 @@ if __name__ == "__main__":
     result = run_predictor_h6(ticker)
 
     if result:
-        filename = f"{ticker}_H6_6d_v2.json"
+        filename = f"{ticker}_H6.json"
         path = os.path.join(DATA_OUTPUT_DIR, filename)
         with open(path, "w") as f:
             json.dump(result, f, indent=2)
 
         print(f"\n✅ H6 COMPLETADO")
         print("-" * 35)
-        print(f"📊 {ticker}: ${result['price_today']:,.2f} → Est. 6d: ${result['price_6d']:,.2f}")
-        print(f"📈 Retorno Esperado: {result['return_6d_pct']}%")
+        print(f"📊 {ticker}: ${result['price_today']:,.2f} → Est. 6d: ${result['price_pred']:,.2f}")
+        print(f"📈 Retorno Esperado: {result['return_pct']}%")
         print(f"🔥 Confianza del Modelo: {result['confidence']}")
         print("-" * 35)
     else:
