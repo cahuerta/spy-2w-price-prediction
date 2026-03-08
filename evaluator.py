@@ -25,6 +25,7 @@ MAX_WORKERS = min(int(os.getenv("EVAL_MAX_WORKERS", "4")), 16)
 YF_TIMEOUT = 10
 ALPACA_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
+PRICE_CACHE = {}
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,12 @@ def parse_date(s: str):
 # ======================================================
 
 def get_price_today(ticker: str, today):
+
+    key = f"{ticker}_{today}"
+
+    if key in PRICE_CACHE:
+        return PRICE_CACHE[key]
+
     try:
         client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
@@ -105,15 +112,14 @@ def get_price_today(ticker: str, today):
         if len(bars) == 0:
             return None
 
-        return float(bars["close"].iloc[-1])
+        price = float(bars["close"].iloc[-1])
 
-    except APIError as e:
-        logger.error(f"Alpaca API error {ticker}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected Alpaca error {ticker}: {e}")
-        return None
+        PRICE_CACHE[key] = price
 
+        return price
+
+    except Exception:
+        return None
 
 # ======================================================
 # EVALUACIÓN INDIVIDUAL (LOOKBACK CORRECTO)
