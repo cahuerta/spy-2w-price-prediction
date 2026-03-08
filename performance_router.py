@@ -44,6 +44,10 @@ def list_evaluation_files() -> List[Path]:
     return sorted(files)
 
 
+# =========================================================
+# MODEL METRICS
+# =========================================================
+
 def compute_model_metrics():
 
     files = list_evaluation_files()
@@ -57,15 +61,22 @@ def compute_model_metrics():
             "pending_predictions": 0,
             "sharpe_ratio": None,
             "max_drawdown_pct": None,
+            "models_performance": {},
         }
 
     total = 0
     evaluated = 0
     correct = 0
+
     errors = []
     returns = []
 
+    # NUEVO: métricas por modelo
+    model_errors: Dict[str, List[float]] = {}
+    model_hits: Dict[str, List[int]] = {}
+
     for f in files:
+
         data = load_json(f)
         if not data:
             continue
@@ -86,6 +97,23 @@ def compute_model_metrics():
         if data.get("real_return_pct") is not None:
             returns.append(float(data["real_return_pct"]))
 
+        # =========================================================
+        # NUEVO: leer diagnóstico de modelos
+        # =========================================================
+
+        models = data.get("models_diagnostics", {})
+
+        for model, mdata in models.items():
+
+            err = mdata.get("error_pct")
+            hit = mdata.get("hit_sign")
+
+            if err is not None:
+                model_errors.setdefault(model, []).append(float(err))
+
+            if hit is not None:
+                model_hits.setdefault(model, []).append(1 if hit else 0)
+
     pending = total - evaluated
 
     win_rate = round((correct / evaluated) * 100, 2) if evaluated > 0 else None
@@ -95,6 +123,7 @@ def compute_model_metrics():
     max_dd = None
 
     if returns:
+
         returns_arr = np.array(returns) / 100.0
 
         mean_ret = np.mean(returns_arr)
@@ -109,6 +138,26 @@ def compute_model_metrics():
 
         max_dd = round(np.min(drawdowns) * 100, 2)
 
+    # =========================================================
+    # NUEVO: performance por modelo
+    # =========================================================
+
+    models_perf = {}
+
+    for model in model_errors:
+
+        errs = model_errors.get(model, [])
+        hits = model_hits.get(model, [])
+
+        if not errs:
+            continue
+
+        models_perf[model] = {
+            "avg_error_pct": round(float(np.mean(errs)), 4),
+            "win_rate_pct": round((sum(hits) / len(hits)) * 100, 2) if hits else None,
+            "samples": len(errs),
+        }
+
     return {
         "win_rate_pct": win_rate,
         "avg_prediction_error_pct": avg_error,
@@ -117,6 +166,7 @@ def compute_model_metrics():
         "pending_predictions": pending,
         "sharpe_ratio": sharpe,
         "max_drawdown_pct": max_dd,
+        "models_performance": models_perf,
     }
 
 
@@ -128,6 +178,7 @@ def compute_model_metrics():
 async def performance():
 
     # ================= ACCOUNT PERFORMANCE =================
+
     try:
         engine = get_engine()
         account = await engine.get_account()
@@ -146,6 +197,7 @@ async def performance():
         META_FILE.write_text(json.dumps(meta, indent=2))
 
     if meta and equity:
+
         initial_equity = float(meta["initial_equity"])
         high_water_mark = float(meta.get("high_water_mark", equity))
 
@@ -155,18 +207,23 @@ async def performance():
             META_FILE.write_text(json.dumps(meta, indent=2))
 
         total_return_pct = round(
-            (equity - initial_equity) / initial_equity * 100, 2
+            (equity - initial_equity) / initial_equity * 100,
+            2,
         )
 
         drawdown_pct = round(
-            (equity - high_water_mark) / high_water_mark * 100, 2
+            (equity - high_water_mark) / high_water_mark * 100,
+            2,
         )
+
     else:
+
         total_return_pct = None
         drawdown_pct = None
         high_water_mark = None
 
     # ================= MODEL METRICS =================
+
     model_metrics = compute_model_metrics()
 
     return {
@@ -184,4 +241,7 @@ async def performance():
         "pending_predictions": model_metrics["pending_predictions"],
         "sharpe_ratio": model_metrics["sharpe_ratio"],
         "max_drawdown_pct": model_metrics["max_drawdown_pct"],
-    }
+
+        # NUEVO
+        "models_performance": model_metrics["models_performance"],
+        }
