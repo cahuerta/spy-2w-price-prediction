@@ -96,7 +96,6 @@ def get_price_today(ticker: str, today):
         )
 
         bars = client.get_stock_bars(request).df
-
         if bars is None or bars.empty:
             return None
 
@@ -114,6 +113,7 @@ def get_price_today(ticker: str, today):
     except Exception as e:
         logger.error(f"Unexpected Alpaca error {ticker}: {e}")
         return None
+
 
 # ======================================================
 # EVALUACIÓN INDIVIDUAL (LOOKBACK CORRECTO)
@@ -203,6 +203,64 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
         evaluated_at=datetime.utcnow().isoformat(),
     )
 
+def evaluate_models(pred: Dict[str, Any], price_real: float):
+
+    p = pred.get("prediction", {})
+    price_now = float(p.get("price_now"))
+
+    curve = pred.get("price_curve", {})
+    path = curve.get("price_path", [])
+
+    models = {}
+
+    for i, price_pred in enumerate(path):
+
+        h = i + 1
+
+        pred_ret = (price_pred / price_now - 1) * 100
+        real_ret = (price_real / price_now - 1) * 100
+
+        models[f"H{h}"] = {
+            "pred_price": round(price_pred,4),
+            "pred_return": round(pred_ret,4),
+            "real_return": round(real_ret,4),
+            "error_pct": round(abs(pred_ret-real_ret),4),
+            "hit_sign": bool(np.sign(pred_ret)==np.sign(real_ret))
+        }
+
+    # H10
+    price_pred = float(p.get("price_pred"))
+
+    pred_ret = (price_pred / price_now - 1) * 100
+    real_ret = (price_real / price_now - 1) * 100
+
+    models["H10"] = {
+        "pred_price": round(price_pred,4),
+        "pred_return": round(pred_ret,4),
+        "real_return": round(real_ret,4),
+        "error_pct": round(abs(pred_ret-real_ret),4),
+        "hit_sign": bool(np.sign(pred_ret)==np.sign(real_ret))
+    }
+
+    return models
+
+def summarize_models(models: Dict[str, Any]):
+
+    errors = {k:v["error_pct"] for k,v in models.items() if v["error_pct"] is not None}
+
+    if not errors:
+        return {}
+
+    best = min(errors, key=errors.get)
+    worst = max(errors, key=errors.get)
+
+    mean_error = float(np.mean(list(errors.values())))
+
+    return {
+        "best_model": best,
+        "worst_model": worst,
+        "mean_error": round(mean_error,4)
+    }
 # ======================================================
 # EVALUACIÓN MASIVA
 # ======================================================
@@ -242,11 +300,29 @@ def evaluate_all(
             f = future_map[fut]
             try:
                 ev = fut.result()
-                if ev:
-                    save_json(
-                        eval_root / f.parent.name / f.name,
-                        asdict(ev),
-                    )
+
+                    if ev:
+
+                        ev_dict = asdict(ev)
+
+                        # cargar predicción original
+                        pred = load_json(f)
+
+                        if ev_dict.get("price_real") is not None:
+
+                            models_diag = evaluate_models(pred, ev_dict["price_real"])
+
+                            models_summary = summarize_models(models_diag)
+
+                            ev_dict["models_diagnostics"] = models_diag
+                            ev_dict["models_summary"] = models_summary
+
+                        save_json(
+                            eval_root / f.parent.name / f.name,
+                            ev_dict,
+                        )
+
+                        
                     results["evaluated"].append(str(f))
                 else:
                     results["skipped"].append(str(f))
