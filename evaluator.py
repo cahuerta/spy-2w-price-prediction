@@ -121,6 +121,7 @@ def get_price_today(ticker: str, today):
     except Exception:
         return None
 
+
 # ======================================================
 # EVALUACIÓN INDIVIDUAL (LOOKBACK CORRECTO)
 # ======================================================
@@ -267,6 +268,7 @@ def summarize_models(models: Dict[str, Any]):
         "worst_model": worst,
         "mean_error": round(mean_error,4)
     }
+
 # ======================================================
 # EVALUACIÓN MASIVA
 # ======================================================
@@ -306,33 +308,27 @@ def evaluate_all(
             f = future_map[fut]
             try:
                 ev = fut.result()
+                if ev:
+                    ev_dict = asdict(ev)
+                    # cargar predicción original
+                    pred = load_json(f)
 
-                    if ev:
+                    if ev_dict.get("price_real") is not None:
+                        models_diag = evaluate_models(pred, ev_dict["price_real"])
+                        models_summary = summarize_models(models_diag)
 
-                        ev_dict = asdict(ev)
+                        ev_dict["models_diagnostics"] = models_diag
+                        ev_dict["models_summary"] = models_summary
 
-                        # cargar predicción original
-                        pred = load_json(f)
-
-                        if ev_dict.get("price_real") is not None:
-
-                            models_diag = evaluate_models(pred, ev_dict["price_real"])
-
-                            models_summary = summarize_models(models_diag)
-
-                            ev_dict["models_diagnostics"] = models_diag
-                            ev_dict["models_summary"] = models_summary
-
-                        save_json(
-                            eval_root / f.parent.name / f.name,
-                            ev_dict,
-                        )
-
-                        
+                    save_json(
+                        eval_root / f.parent.name / f.name,
+                        ev_dict,
+                    )
                     results["evaluated"].append(str(f))
                 else:
                     results["skipped"].append(str(f))
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error evaluating {f}: {e}")
                 results["errors"].append(str(f))
 
     results["summary"] = {
