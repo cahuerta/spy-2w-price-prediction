@@ -13,6 +13,8 @@ import os
 import shutil
 import httpx
 from dataclasses import dataclass
+from broker import get_engine
+
 
 # =========================================================
 # CONFIG
@@ -118,7 +120,8 @@ def load_positions() -> List[Dict[str, Any]]:
 
     _ensure_store()
 
-    data = _fetch_positions_api()
+    engine = get_engine()
+    data = engine.get_positions()
 
     if data:
 
