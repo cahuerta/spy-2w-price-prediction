@@ -122,6 +122,9 @@ def load_positions() -> List[Dict[str, Any]]:
 
     engine = get_engine()
     data = engine.get_positions()
+    
+    if isinstance(data, dict):
+        data = [{"ticker": t, **v} for t, v in data.items()]
 
     if data:
 
