@@ -231,7 +231,7 @@ async def evaluation_latest(ticker: str):
         "evaluation": last,
         "file": last_fp.name,
     }
-    
+
 # =========================================================
 # SCREENER (SIN RATE LIMIT)
 # =========================================================
@@ -278,56 +278,57 @@ async def executability_preview():
     return await orchestrator.preview_executability(
         market_ctx=market_ctx
     )
+
 @router.get("/universe")
 async def universe():
     from portfolio_store import load_positions
-    
+
     # 1. Usar el archivo exacto que usa el orquestador
     ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
     market_ctx_path = Path(DATA_PATH) / "market_context.json"
-    
+
     # 2. Cargar Alpha
     alpha_data = load_json(ALPHA_FILE) or {}
     alpha_map = alpha_data.get("results", {})
-    
+
     # 3. Cargar Posiciones y Contexto
     positions = {p["ticker"].upper(): p for p in load_positions()}
     market_ctx = load_json(market_ctx_path) or {}
     mode = market_ctx.get("market_mode", "neutral")
-    
+
     # 4. Definir Thresholds (espejo del Orquestador)
     thresholds = {"growth": 0.65, "neutral": 0.75, "defensive": 0.85}
     current_threshold = thresholds.get(mode, 0.75)
 
     rows = []
+
     # Usamos los tickers que tienen alpha como base del universo
     for ticker, data in alpha_map.items():
         score = data.get("alpha_score")
-        
-       is_executable = False
-block_reason = None
 
-if score is None:
-    block_reason = "no_alpha"
+        is_executable = False
+        block_reason = None
 
-else:
+        if score is None:
+            block_reason = "no_alpha"
 
-    # Kill switch → ejecutable (cerrar)
-    if score <= -0.40:
-        is_executable = True
-        block_reason = "kill_switch"
+        else:
+            # Kill switch → ejecutable (cerrar)
+            if score <= -0.40:
+                is_executable = True
+                block_reason = "kill_switch"
 
-    # Alpha suficiente
-    elif score >= current_threshold:
-        is_executable = True
+            # Alpha suficiente
+            elif score >= current_threshold:
+                is_executable = True
 
-    # Alpha insuficiente
-    else:
-        block_reason = "alpha_below_threshold"
+            # Alpha insuficiente
+            else:
+                block_reason = "alpha_below_threshold"
 
-# Si el alpha_engine ya generó un motivo explícito
-if data.get("reason"):
-    block_reason = data["reason"] 
+        # Si el alpha_engine ya generó un motivo explícito
+        if data.get("reason"):
+            block_reason = data["reason"]
 
         rows.append({
             "ticker": ticker,
@@ -336,10 +337,12 @@ if data.get("reason"):
             "positionValue": positions.get(ticker.upper(), {}).get("market_value", 0),
             "executable": is_executable,
             "block_reason": block_reason,
-            "mode_context": mode # Para que el front sepa por qué el threshold es ese
+            "mode_context": mode,  # Para que el front sepa por qué el threshold es ese
         })
 
     # Ordenar por Alpha
-    rows.sort(key=lambda x: x["alpha"] if x["alpha"] is not None else -999, reverse=True)
+    rows.sort(
+        key=lambda x: x["alpha"] if x["alpha"] is not None else -999,
+        reverse=True
+    )
     return {"rows": rows}
-    
