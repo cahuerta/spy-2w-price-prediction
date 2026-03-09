@@ -292,7 +292,13 @@ async def universe():
     alpha_map = alpha_data.get("results", {})
 
     # 3. Cargar Posiciones y Contexto
-    positions = {p["ticker"].upper(): p for p in load_positions()}
+    positions_list = load_positions()
+
+    positions = {
+        p.get("ticker", "").upper(): p
+        for p in positions_list
+        if "ticker" in p
+    }
     market_ctx = load_json(market_ctx_path) or {}
     mode = market_ctx.get("market_mode", "neutral")
 
