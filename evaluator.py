@@ -210,38 +210,40 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
         evaluated_at=datetime.utcnow().isoformat(),
     )
 
+
 def evaluate_models(pred: Dict[str, Any], price_real: float):
 
     p = pred.get("prediction", {})
     price_now = float(p.get("price_now"))
+
+    base_date = parse_date(p["date_base"])
+    today = datetime.utcnow().date()
+
+    h = (today - base_date).days
+
+    if h < 1 or h > 10:
+        return {}
 
     curve = pred.get("price_curve", {})
     path = curve.get("price_path", [])
 
     models = {}
 
-    for i, price_pred in enumerate(path):
+    if h <= 9:
 
-        h = i + 1
+        if len(path) < h:
+            return {}
 
-        pred_ret = (price_pred / price_now - 1) * 100
-        real_ret = (price_real / price_now - 1) * 100
+        price_pred = float(path[h-1])
 
-        models[f"H{h}"] = {
-            "pred_price": round(price_pred,4),
-            "pred_return": round(pred_ret,4),
-            "real_return": round(real_ret,4),
-            "error_pct": round(abs(pred_ret-real_ret),4),
-            "hit_sign": bool(np.sign(pred_ret)==np.sign(real_ret))
-        }
+    else:
 
-    # H10
-    price_pred = float(p.get("price_pred"))
+        price_pred = float(p.get("price_pred"))
 
     pred_ret = (price_pred / price_now - 1) * 100
     real_ret = (price_real / price_now - 1) * 100
 
-    models["H10"] = {
+    models[f"H{h}"] = {
         "pred_price": round(price_pred,4),
         "pred_return": round(pred_ret,4),
         "real_return": round(real_ret,4),
