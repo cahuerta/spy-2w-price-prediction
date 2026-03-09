@@ -161,15 +161,8 @@ def compute_alpha_for_ticker(ticker: str, market_ctx: Dict, universe_returns: Li
     unsigned_alpha = clip01(base_alpha * v6_3_bonus * time_decay)
 
     # 🔥 CONSERVAR SIGNO DE LA PREDICCIÓN
-    EPS = 1e-6
-
-    if pred_ret > EPS:
-        direction = 1
-    elif pred_ret < -EPS:
-        direction = -1
-    else:
-        direction = 0
-
+    
+    direction = np.sign(pred_ret)
     signed_alpha = unsigned_alpha * direction
 
     return {
