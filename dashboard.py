@@ -308,9 +308,15 @@ async def universe():
 
     rows = []
 
-    # Usamos los tickers que tienen alpha como base del universo
-    for ticker, data in alpha_map.items():
-        score = data.get("alpha_score")
+    alpha_tickers = set(alpha_map.keys())
+    position_tickers = set(positions.keys())
+
+    universe_tickers = alpha_tickers | position_tickers
+
+    for ticker in universe_tickers:
+
+        data = alpha_map.get(ticker, {})
+        score = data.get("alpha_score") 
 
         is_executable = False
         block_reason = None
