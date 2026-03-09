@@ -304,13 +304,30 @@ async def universe():
     for ticker, data in alpha_map.items():
         score = data.get("alpha_score")
         
-        # Lógica de ejecutabilidad simplificada para el Dashboard
-        is_executable = False
-        if score is not None:
-            if score >= current_threshold:
-                is_executable = True
-            if score <= -0.40: # Kill switch es ejecutable (para cerrar)
-                is_executable = True
+       is_executable = False
+block_reason = None
+
+if score is None:
+    block_reason = "no_alpha"
+
+else:
+
+    # Kill switch → ejecutable (cerrar)
+    if score <= -0.40:
+        is_executable = True
+        block_reason = "kill_switch"
+
+    # Alpha suficiente
+    elif score >= current_threshold:
+        is_executable = True
+
+    # Alpha insuficiente
+    else:
+        block_reason = "alpha_below_threshold"
+
+# Si el alpha_engine ya generó un motivo explícito
+if data.get("reason"):
+    block_reason = data["reason"] 
 
         rows.append({
             "ticker": ticker,
@@ -318,6 +335,7 @@ async def universe():
             "confidence": data.get("confidence"),
             "positionValue": positions.get(ticker.upper(), {}).get("market_value", 0),
             "executable": is_executable,
+            "block_reason": block_reason,
             "mode_context": mode # Para que el front sepa por qué el threshold es ese
         })
 
