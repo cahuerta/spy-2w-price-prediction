@@ -25,6 +25,7 @@ from screener import run_screener_async
 from decider import run_decider
 from model_runner import run_all_models
 from evaluator import evaluate_all
+from alpha_engine import compute_and_persist_alpha
 
 from market_state_evaluator import run_market_state
 from market_qualitative_evaluator import evaluate_qualitative_market
@@ -91,6 +92,21 @@ async def _run_pipeline_logic(request: Request):
         logger.info("📊 [4/8] Evaluator...")
         evaluate_all()
         logger.info("ℹ️ Evaluator executed")
+
+        # -------------------------------------------------
+        # 5️⃣ ALPHA ENGINE
+        # -------------------------------------------------
+        logger.info("🧠 [5/9] Alpha engine...")
+
+        tickers_file = DATA_PATH / "tickers.json"
+        tickers = json.loads(tickers_file.read_text())
+
+        alpha_out = compute_and_persist_alpha(tickers)
+
+        logger.info(
+            f"✅ Alpha engine OK | valid_alphas={alpha_out.get('valid_alphas')} "
+            f"| universe={alpha_out.get('universe_size')}"
+        )
 
         # -------------------------------------------------
         # 5️⃣ MARKET QUANT
