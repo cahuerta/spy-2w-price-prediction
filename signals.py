@@ -124,7 +124,7 @@ def rolling_metrics(evals: List[Dict], window_days: int):
         age = max(0, (now - d).days)
         w = np.exp(-max(0, age - 7) / (SIGNAL_DECAY_DAYS / 2))
 
-        hits.append(1.0 if e.get("decision_correct") else 0.0)
+        hits.append(1.0 if e.get("hit_sign") else 0.0)
         errors.append(abs(e.get("error_return_pct", 0)))
         weights.append(w)
 
