@@ -56,6 +56,25 @@ class TradingEngine:
         Devuelve la cuenta Alpaca para el dashboard
         """
         return self.client.get_account()
+        def get_positions(self):
+
+    try:
+        alpaca_positions = self.client.get_all_positions()
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo posiciones: {e}")
+        return {}
+
+    result = {}
+
+    for p in alpaca_positions:
+        result[p.symbol] = {
+            "qty": float(p.qty),
+            "market_value": float(p.market_value),
+            "avg_entry_price": float(p.avg_entry_price),
+            "unrealized_pl": float(p.unrealized_pl),
+        }
+
+    return result
     async def execute_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
         action = decision.get("action")
         ticker = decision.get("ticker", "").upper()
