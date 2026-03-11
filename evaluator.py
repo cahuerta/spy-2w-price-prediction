@@ -294,10 +294,10 @@ def evaluate_all(
             eval_dir = eval_root / ticker
             eval_dir.mkdir(parents=True, exist_ok=True)
 
-                eval_file = eval_dir / f"{target_date}.json"
+            eval_file = eval_dir / f"{target_date}.json"
 
         if not eval_file.exists():
-        pending.append(pred_file)
+            pending.append(pred_file)
 
     
 
