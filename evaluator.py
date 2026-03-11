@@ -278,16 +278,31 @@ def evaluate_all(
         [pred_root / ticker] if ticker else [d for d in pred_root.iterdir() if d.is_dir()]
     )
 
+    today = datetime.utcnow().date()
+    horizon = 10
+    target_date = (today - timedelta(days=horizon)).strftime("%Y-%m-%d")
+
     pending = []
 
     for td in ticker_dirs:
-        (eval_root / td.name).mkdir(parents=True, exist_ok=True)
-        for f in td.glob("*.json"):
-            if not (eval_root / td.name / f.name).exists():
-                pending.append(f)
 
-    if dry_run:
-        return {"pending": len(pending)}
+        ticker = td.name
+        pred_file = pred_root / ticker / f"{target_date}.json"
+
+        if pred_file.exists():
+
+            eval_dir = eval_root / ticker
+            eval_dir.mkdir(parents=True, exist_ok=True)
+
+            eval_file = eval_dir / f"{target_date}.json"
+
+        if not eval_file.exists():
+            pending.append(pred_file)
+
+    
+
+        if dry_run:
+            return {"pending": len(pending)}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers or MAX_WORKERS) as ex:
         future_map = {ex.submit(evaluate_prediction, f): f for f in pending}
