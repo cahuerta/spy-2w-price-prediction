@@ -151,7 +151,7 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
 
     # Si aún no corresponde evaluar → no hacer nada
     if target_date > today:
-    
+        pass
 
     real_price = get_price_today(ticker, today)
 
