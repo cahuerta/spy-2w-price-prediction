@@ -294,15 +294,15 @@ def evaluate_all(
             eval_dir = eval_root / ticker
             eval_dir.mkdir(parents=True, exist_ok=True)
 
-            eval_file = eval_dir / f"{target_date}.json"
+                eval_file = eval_dir / f"{target_date}.json"
 
         if not eval_file.exists():
-            pending.append(pred_file)
+        pending.append(pred_file)
 
     
 
-            if dry_run:
-                return {"pending": len(pending)}
+    if dry_run:
+        return {"pending": len(pending)}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers or MAX_WORKERS) as ex:
         future_map = {ex.submit(evaluate_prediction, f): f for f in pending}
