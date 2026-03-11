@@ -292,13 +292,29 @@ def evaluate_all(
         [pred_root / ticker] if ticker else [d for d in pred_root.iterdir() if d.is_dir()]
     )
 
+    today = datetime.utcnow().date()
+
     pending = []
 
     for td in ticker_dirs:
+
         (eval_root / td.name).mkdir(parents=True, exist_ok=True)
-        for f in td.glob("*.json"):
-            if not (eval_root / td.name / f.name).exists():
-                pending.append(f)
+
+        for h in range(1, 11):
+
+            pred_date = today - timedelta(days=h)
+
+            pred_file = td / f"{pred_date}.json"
+
+            if not pred_file.exists():
+                continue
+
+            eval_file = eval_root / td.name / f"{pred_date}.json"
+
+            if eval_file.exists():
+                continue
+
+            pending.append(pred_file)
 
     if dry_run:
         return {"pending": len(pending)}
