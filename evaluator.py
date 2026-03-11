@@ -296,8 +296,8 @@ def evaluate_all(
 
             eval_file = eval_dir / f"{target_date}.json"
 
-        if not eval_file.exists():
-            pending.append(pred_file)
+            if not eval_file.exists():
+                pending.append(pred_file)
 
     
 
