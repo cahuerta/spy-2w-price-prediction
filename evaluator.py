@@ -151,9 +151,9 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
 
     # Si aún no corresponde evaluar → no hacer nada
     if target_date > today:
-        pass
+        global_ready = target_date <= today
 
-    real_price = get_price_today(ticker, today)
+    real_price = get_price_today(ticker, today) if global_ready else None
 
     price_now = float(p["price_now"])
     price_pred = float(p["price_pred"])
@@ -292,29 +292,13 @@ def evaluate_all(
         [pred_root / ticker] if ticker else [d for d in pred_root.iterdir() if d.is_dir()]
     )
 
-    today = datetime.utcnow().date()
-
     pending = []
 
     for td in ticker_dirs:
-
         (eval_root / td.name).mkdir(parents=True, exist_ok=True)
-
-        for h in range(1, 11):
-
-            pred_date = today - timedelta(days=h)
-
-            pred_file = td / f"{pred_date}.json"
-
-            if not pred_file.exists():
-                continue
-
-            eval_file = eval_root / td.name / f"{pred_date}.json"
-
-            if eval_file.exists():
-                continue
-
-            pending.append(pred_file)
+        for f in td.glob("*.json"):
+            if not (eval_root / td.name / f.name).exists():
+                pending.append(f)
 
     if dry_run:
         return {"pending": len(pending)}
