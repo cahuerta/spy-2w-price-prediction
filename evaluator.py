@@ -301,8 +301,8 @@ def evaluate_all(
 
     
 
-        if dry_run:
-            return {"pending": len(pending)}
+            if dry_run:
+                return {"pending": len(pending)}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers or MAX_WORKERS) as ex:
         future_map = {ex.submit(evaluate_prediction, f): f for f in pending}
