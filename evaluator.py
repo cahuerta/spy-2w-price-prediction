@@ -149,11 +149,7 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
     # Target date real
     target_date = base_date + timedelta(days=horizon)
 
-    # Si aún no corresponde evaluar → no hacer nada
-    if target_date > today:
-        global_ready = target_date <= today
-
-    real_price = get_price_today(ticker, today) if global_ready else None
+    real_price = get_price_today(ticker, today)
 
     price_now = float(p["price_now"])
     price_pred = float(p["price_pred"])
@@ -212,45 +208,35 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
 
 
 def evaluate_models(pred: Dict[str, Any], price_real: float):
-
-    p = pred.get("prediction", {})
-    price_now = float(p.get("price_now"))
-
-    base_date = parse_date(p["date_base"])
+    ticker = pred["meta"]["ticker"]
     today = datetime.utcnow().date()
-
-    h = (today - base_date).days
-
-    if h < 1 or h > 10:
-        return {}
-
-    curve = pred.get("price_curve", {})
-    path = curve.get("price_path", [])
-
     models = {}
 
-    if h <= 9:
+    # Bucle de horizonte 1 a 10
+    for h in range(1, 11):
+        target_date = today - timedelta(days=h)
+        date_str = target_date.strftime("%Y-%m-%d")
+        file_path = Path(DATA_PATH) / "predictions" / ticker / f"{date_str}.json"
 
-        if len(path) < h:
-            return {}
-
-        price_pred = float(path[h-1])
-
-    else:
-
-        price_pred = float(p.get("price_pred"))
-
-    pred_ret = (price_pred / price_now - 1) * 100
-    real_ret = (price_real / price_now - 1) * 100
-
-    models[f"H{h}"] = {
-        "pred_price": round(price_pred,4),
-        "pred_return": round(pred_ret,4),
-        "real_return": round(real_ret,4),
-        "error_pct": round(abs(pred_ret-real_ret),4),
-        "hit_sign": bool(np.sign(pred_ret)==np.sign(real_ret))
-    }
-
+        if file_path.exists():
+            old_pred = load_json(file_path)
+            old_p = old_pred.get("prediction", {})
+            curve = old_pred.get("price_curve", {}).get("price_path", [])
+            
+            if len(curve) >= h:
+                price_now = float(old_p.get("price_now"))
+                price_pred = float(curve[h-1])
+                
+                pred_ret = (price_pred / price_now - 1) * 100
+                real_ret = (price_real / price_now - 1) * 100
+                
+                models[f"H{h}"] = {
+                    "pred_price": round(price_pred, 4),
+                    "pred_return": round(pred_ret, 4),
+                    "real_return": round(real_ret, 4),
+                    "error_pct": round(abs(pred_ret - real_ret), 4),
+                    "hit_sign": bool(np.sign(pred_ret) == np.sign(real_ret))
+                }
     return models
 
 def summarize_models(models: Dict[str, Any]):
