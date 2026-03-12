@@ -145,7 +145,24 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
     # la fecha de la predicción es el nombre del archivo
     base_date = parse_date(prediction_path.stem)
     if base_date is None:
-        return EvaluationResult(...)
+        if base_date is None:
+            return EvaluationResult(
+                meta={},
+                prediction_date=None,
+                evaluation_date=str(today),
+                price_now=None,
+                price_pred=None,
+                price_real=None,
+                predicted_return_pct=None,
+     ...        real_return_pct=None,
+                error_price_pct=None,
+                error_return_pct=None,
+                hit_sign=None,
+                hit_threshold=None,
+                recommendation=None,
+                decision_correct=None,
+                evaluated_at=datetime.utcnow().isoformat(),
+            )
 
     real_price = get_price_today(ticker, today)
 
@@ -308,18 +325,20 @@ def evaluate_all(
         for fut in concurrent.futures.as_completed(future_map):
             f = future_map[fut]
             try:
-                ev = fut.result()
-                if ev:
-                    ev_dict = asdict(ev)
-                    pred = load_json(f)
+                
+                    
+                 ev = fut.result()
+                 if ev:
+                     ev_dict = asdict(ev)
+                     pred = load_json(f)
 
-                    # MODELS PRIMERO
-                    models_diag = evaluate_models(pred, ev_dict.get("price_real"))
-                    models_summary = summarize_models(models_diag)
+                     # MODELS PRIMERO
+                     models_diag = evaluate_models(pred, ev_dict.get("price_real"))
+                     models_summary = summarize_models(models_diag)
 
-                    ev_dict["models_diagnostics"] = models_diag
-                    ev_dict["models_summary"] = models_summary
-                    save_json(
+                     ev_dict["models_diagnostics"] = models_diag
+                     ev_dict["models_summary"] = models_summary
+                     save_json(
                         eval_root / f.parent.name / f.name,
                         ev_dict,
                     )
