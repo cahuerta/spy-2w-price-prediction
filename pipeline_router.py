@@ -83,7 +83,8 @@ async def _run_pipeline_logic(request: Request):
         # 3️⃣ MODEL RUNNER
         # -------------------------------------------------
         logger.info("📈 [3/8] Model runner...")
-        run_all_models()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, run_all_models)
         logger.info("✅ Model runner OK")
 
         # -------------------------------------------------
@@ -93,21 +94,7 @@ async def _run_pipeline_logic(request: Request):
         evaluate_all()
         logger.info("ℹ️ Evaluator executed")
 
-        # -------------------------------------------------
-        # 5️⃣ ALPHA ENGINE
-        # -------------------------------------------------
-        logger.info("🧠 [5/9] Alpha engine...")
-
-        tickers_file = DATA_PATH / "tickers.json"
-        tickers = json.loads(tickers_file.read_text())
-
-        alpha_out = compute_and_persist_alpha(tickers)
-
-        logger.info(
-            f"✅ Alpha engine OK | valid_alphas={alpha_out.get('valid_alphas')} "
-            f"| universe={alpha_out.get('universe_size')}"
-        )
-
+     
         # -------------------------------------------------
         # 5️⃣ MARKET QUANT
         # -------------------------------------------------
@@ -124,7 +111,23 @@ async def _run_pipeline_logic(request: Request):
             f"✅ Market qual OK | impact={qual_ctx.impact_score:.3f} "
             f"| conf={qual_ctx.aggregated_confidence:.2f}"
         )
+      
+        # -------------------------------------------------
+        # 5️⃣ ALPHA ENGINE
+        # -------------------------------------------------
+        logger.info("🧠 [5/9] Alpha engine...")
 
+        tickers_file = DATA_PATH / "tickers.json"
+        tickers = json.loads(tickers_file.read_text())
+
+        alpha_out = compute_and_persist_alpha(tickers)
+
+        logger.info(
+            f"✅ Alpha engine OK | valid_alphas={alpha_out.get('valid_alphas')} "
+            f"| universe={alpha_out.get('universe_size')}"
+        )  
+        
+        
         # -------------------------------------------------
         # 7️⃣ MARKET ORCHESTRATOR
         # -------------------------------------------------
