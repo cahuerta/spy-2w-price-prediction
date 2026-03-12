@@ -140,14 +140,12 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
     horizon = int(meta.get("horizon_days", 1))
     theta = float(meta.get("theta", 0.75))
 
-    base_date = parse_date(p["date_base"])
-    if base_date is None:
-        return None
-
     today = datetime.utcnow().date()
 
-    # Target date real
-    target_date = base_date + timedelta(days=horizon)
+    # la fecha de la predicción es el nombre del archivo
+    base_date = parse_date(prediction_path.stem)
+    if base_date is None:
+        return EvaluationResult(...)
 
     real_price = get_price_today(ticker, today)
 
