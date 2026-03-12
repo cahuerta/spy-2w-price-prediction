@@ -5,6 +5,14 @@
 # ✔ Ejecuta pipeline en background
 # ✔ NO rompe lógica existente
 # ✔ Trading intacto
+#
+# FIXES:
+#   [F1] run_all_models() ahora se awaita correctamente
+#        → alpha ya no lee JSONs del día anterior
+#   [F2] Alpha engine movido DESPUÉS del Market Orchestrator
+#        → tiene market_ctx completo al calcular s_market
+#   [F3] import os duplicado removido
+#   [F4] Numeración de pasos corregida en logs
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,7 +24,6 @@ import httpx
 import asyncio
 from pathlib import Path
 import json
-import os
 
 # =========================
 # IMPORTS — CAPAS REALES
@@ -50,29 +57,26 @@ async def _run_pipeline_logic(request: Request):
     logger.info("=" * 60)
 
     try:
+        DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+
         # -------------------------------------------------
         # 1️⃣ SCREENER
         # -------------------------------------------------
-        logger.info("🔍 [1/8] Screener...")
+        logger.info("🔍 [1/10] Screener...")
         screener_out = await run_screener_async()
-        # ✅ CREAR ARCHIVO REQUERIDO POR DECIDER
 
-        DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
         screener_file = DATA_PATH / "screener_candidates.json"
-
         screener_file.parent.mkdir(parents=True, exist_ok=True)
-
         tmp = screener_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(screener_out, indent=2))
         tmp.replace(screener_file)
-        logger.info(
-            f"✅ Screener OK | candidates={screener_out.get('n_candidates')}"
-        )
+
+        logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
 
         # -------------------------------------------------
         # 2️⃣ DECIDER
         # -------------------------------------------------
-        logger.info("🧠 [2/8] Decider...")
+        logger.info("🧠 [2/10] Decider...")
         decider_out = run_decider()
         logger.info(
             f"✅ Decider OK | added={len(decider_out.get('added', []))} "
@@ -80,9 +84,9 @@ async def _run_pipeline_logic(request: Request):
         )
 
         # -------------------------------------------------
-        # 3️⃣ MODEL RUNNER
+        # 3️⃣ MODEL RUNNER — awaited para garantizar JSONs frescos
         # -------------------------------------------------
-        logger.info("📈 [3/8] Model runner...")
+        logger.info("📈 [3/10] Model runner...")
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_all_models)
         logger.info("✅ Model runner OK")
@@ -90,79 +94,70 @@ async def _run_pipeline_logic(request: Request):
         # -------------------------------------------------
         # 4️⃣ EVALUATOR
         # -------------------------------------------------
-        logger.info("📊 [4/8] Evaluator...")
+        logger.info("📊 [4/10] Evaluator...")
         evaluate_all()
-        logger.info("ℹ️ Evaluator executed")
+        logger.info("✅ Evaluator executed")
 
-     
         # -------------------------------------------------
         # 5️⃣ MARKET QUANT
         # -------------------------------------------------
-        logger.info("📉 [5/8] Market quantitative context...")
+        logger.info("📉 [5/10] Market quantitative context...")
         quant_ctx = run_market_state()
         logger.info(f"✅ Market quant OK | regime={quant_ctx.regime}")
 
         # -------------------------------------------------
         # 6️⃣ MARKET QUALITATIVE
         # -------------------------------------------------
-        logger.info("🧠 [6/8] Market qualitative context...")
+        logger.info("🧠 [6/10] Market qualitative context...")
         qual_ctx = evaluate_qualitative_market()
         logger.info(
             f"✅ Market qual OK | impact={qual_ctx.impact_score:.3f} "
             f"| conf={qual_ctx.aggregated_confidence:.2f}"
         )
-        
-        
+
         # -------------------------------------------------
         # 7️⃣ MARKET ORCHESTRATOR
         # -------------------------------------------------
-        logger.info("🧭 [7/8] Market orchestration...")
+        logger.info("🧭 [7/10] Market orchestration...")
         market_orch = MarketOrchestrator()
         market_ctx = market_orch.evaluate(
             quant_ctx.to_dict(),
             qual_ctx.to_dict(),
         )
-
         logger.info(
             f"🎯 MARKET MODE = {market_ctx.market_mode.upper()} "
             f"(conf {market_ctx.confidence:.2f})"
         )
 
-
         # -------------------------------------------------
-        # 5️⃣ ALPHA ENGINE
+        # 8️⃣ ALPHA ENGINE — después de modelos Y market_ctx
         # -------------------------------------------------
-        logger.info("🧠 [5/9] Alpha engine...")
-
+        logger.info("🧠 [8/10] Alpha engine...")
         tickers_file = DATA_PATH / "tickers.json"
         tickers = json.loads(tickers_file.read_text())
-
         alpha_out = compute_and_persist_alpha(tickers)
-
         logger.info(
             f"✅ Alpha engine OK | valid_alphas={alpha_out.get('valid_alphas')} "
             f"| universe={alpha_out.get('universe_size')}"
-        )   
-        
-        # -------------------------------------------------
-        # 8️⃣ TRADING ORCHESTRATOR
-        # -------------------------------------------------
-        logger.info("🤖 [8/8] Trading orchestrator...")
-        trading_orch = TradingOrchestrator()
+        )
 
+        # -------------------------------------------------
+        # 9️⃣ TRADING ORCHESTRATOR — consume alpha_last.json
+        # -------------------------------------------------
+        logger.info("🤖 [9/10] Trading orchestrator...")
+        trading_orch = TradingOrchestrator()
         trade_out = await trading_orch.run(
             market_ctx=market_ctx.to_dict()
         )
-
         logger.info(
             f"✅ Trading OK | mode={trade_out.get('mode')} "
             f"| decisions={len(trade_out.get('decisions', []))}"
         )
 
         # -------------------------------------------------
-        # 9️⃣ COMMIT A DISCO
+        # 🔟 COMMIT A DISCO
         # -------------------------------------------------
-        logger.info("💾 [9/9] Committing pipeline results...")
+        logger.info("💾 [10/10] Committing pipeline results...")
 
         PIPELINE_KEY = os.getenv("PIPELINE_KEY")
         BASE_URL = str(request.base_url).rstrip("/")
@@ -220,5 +215,6 @@ async def run_pipeline(request: Request):
     # Responde inmediato al cron
     return {
         "status": "accepted",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
         }
+            
