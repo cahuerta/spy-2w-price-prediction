@@ -111,21 +111,6 @@ async def _run_pipeline_logic(request: Request):
             f"✅ Market qual OK | impact={qual_ctx.impact_score:.3f} "
             f"| conf={qual_ctx.aggregated_confidence:.2f}"
         )
-      
-        # -------------------------------------------------
-        # 5️⃣ ALPHA ENGINE
-        # -------------------------------------------------
-        logger.info("🧠 [5/9] Alpha engine...")
-
-        tickers_file = DATA_PATH / "tickers.json"
-        tickers = json.loads(tickers_file.read_text())
-
-        alpha_out = compute_and_persist_alpha(tickers)
-
-        logger.info(
-            f"✅ Alpha engine OK | valid_alphas={alpha_out.get('valid_alphas')} "
-            f"| universe={alpha_out.get('universe_size')}"
-        )  
         
         
         # -------------------------------------------------
@@ -143,6 +128,22 @@ async def _run_pipeline_logic(request: Request):
             f"(conf {market_ctx.confidence:.2f})"
         )
 
+
+        # -------------------------------------------------
+        # 5️⃣ ALPHA ENGINE
+        # -------------------------------------------------
+        logger.info("🧠 [5/9] Alpha engine...")
+
+        tickers_file = DATA_PATH / "tickers.json"
+        tickers = json.loads(tickers_file.read_text())
+
+        alpha_out = compute_and_persist_alpha(tickers)
+
+        logger.info(
+            f"✅ Alpha engine OK | valid_alphas={alpha_out.get('valid_alphas')} "
+            f"| universe={alpha_out.get('universe_size')}"
+        )   
+        
         # -------------------------------------------------
         # 8️⃣ TRADING ORCHESTRATOR
         # -------------------------------------------------
