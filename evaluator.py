@@ -308,20 +308,18 @@ def evaluate_all(
         for fut in concurrent.futures.as_completed(future_map):
             f = future_map[fut]
             try:
-                
-                    
-                 ev = fut.result()
-                 if ev:
-                     ev_dict = asdict(ev)
-                     pred = load_json(f)
+                ev = fut.result()
+                if ev:
+                    ev_dict = asdict(ev)
+                    pred = load_json(f)
 
-                     # MODELS PRIMERO
-                     models_diag = evaluate_models(pred, ev_dict.get("price_real"))
-                     models_summary = summarize_models(models_diag)
+                    # MODELS PRIMERO
+                    models_diag = evaluate_models(pred, ev_dict.get("price_real"))
+                    models_summary = summarize_models(models_diag)
 
-                     ev_dict["models_diagnostics"] = models_diag
-                     ev_dict["models_summary"] = models_summary
-                     save_json(
+                    ev_dict["models_diagnostics"] = models_diag
+                    ev_dict["models_summary"] = models_summary
+                    save_json(
                         eval_root / f.parent.name / f.name,
                         ev_dict,
                     )
