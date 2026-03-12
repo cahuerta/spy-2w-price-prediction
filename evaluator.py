@@ -17,9 +17,11 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.common.exceptions import APIError
 
+
 # ======================================================
 # CONFIG
 # ======================================================
+
 DATA_PATH = os.getenv("DATA_PATH", "/data")
 MAX_WORKERS = min(int(os.getenv("EVAL_MAX_WORKERS", "4")), 16)
 YF_TIMEOUT = 10
@@ -29,9 +31,11 @@ PRICE_CACHE = {}
 
 logger = logging.getLogger(__name__)
 
+
 # ======================================================
 # STRUCT
 # ======================================================
+
 @dataclass
 class EvaluationResult:
     meta: Dict[str, Any]
@@ -54,6 +58,7 @@ class EvaluationResult:
 # ======================================================
 # UTILS
 # ======================================================
+
 def load_json(path: str | Path) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -66,9 +71,12 @@ def save_json(path: str | Path, data: Dict[str, Any]) -> bool:
     try:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+
         return True
+
     except Exception as e:
         logger.error(f"Save failed {path}: {e}")
         return False
@@ -82,7 +90,7 @@ def parse_date(s: str):
 
 
 # ======================================================
-# PRECIO REAL HOY (último close disponible)
+# PRECIO REAL HOY
 # ======================================================
 
 def get_price_today(ticker: str, today):
@@ -93,6 +101,7 @@ def get_price_today(ticker: str, today):
         return PRICE_CACHE[key]
 
     try:
+
         client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
         request = StockBarsRequest(
@@ -103,6 +112,7 @@ def get_price_today(ticker: str, today):
         )
 
         bars = client.get_stock_bars(request).df
+
         if bars is None or bars.empty:
             return None
 
@@ -123,7 +133,7 @@ def get_price_today(ticker: str, today):
 
 
 # ======================================================
-# EVALUACIÓN INDIVIDUAL (LOOKBACK CORRECTO)
+# EVALUACIÓN INDIVIDUAL
 # ======================================================
 
 def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
@@ -142,27 +152,26 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
 
     today = datetime.utcnow().date()
 
-    # la fecha de la predicción es el nombre del archivo
     base_date = parse_date(prediction_path.stem)
+
     if base_date is None:
-        if base_date is None:
-            return EvaluationResult(
-                meta={},
-                prediction_date=None,
-                evaluation_date=str(today),
-                price_now=None,
-                price_pred=None,
-                price_real=None,
-                predicted_return_pct=None,
-     ...        real_return_pct=None,
-                error_price_pct=None,
-                error_return_pct=None,
-                hit_sign=None,
-                hit_threshold=None,
-                recommendation=None,
-                decision_correct=None,
-                evaluated_at=datetime.utcnow().isoformat(),
-            )
+        return EvaluationResult(
+            meta={},
+            prediction_date=None,
+            evaluation_date=str(today),
+            price_now=None,
+            price_pred=None,
+            price_real=None,
+            predicted_return_pct=None,
+            real_return_pct=None,
+            error_price_pct=None,
+            error_return_pct=None,
+            hit_sign=None,
+            hit_threshold=None,
+            recommendation=None,
+            decision_correct=None,
+            evaluated_at=datetime.utcnow().isoformat(),
+        )
 
     real_price = get_price_today(ticker, today)
 
@@ -171,8 +180,8 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
     predicted_return = float(p["ret_ens_pct"])
     rec = p["recommendation"]
 
-    # 🔥 Si no hay precio real, igual grabamos archivo
     if real_price is None:
+
         return EvaluationResult(
             meta=meta,
             prediction_date=str(base_date),
@@ -198,8 +207,10 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
 
     if rec == "COMPRA":
         decision_correct = real_return >= 0
+
     elif rec == "VENDE":
         decision_correct = real_return <= 0
+
     else:
         decision_correct = abs(real_return) < theta
 
@@ -222,41 +233,56 @@ def evaluate_prediction(prediction_path: Path) -> Optional[EvaluationResult]:
     )
 
 
+# ======================================================
+# EVALUACIÓN MODELOS
+# ======================================================
+
 def evaluate_models(pred: Dict[str, Any], price_real: float):
+
     ticker = pred["meta"]["ticker"]
     today = datetime.utcnow().date()
+
     models = {}
 
-    # Bucle de horizonte 1 a 10
     for h in range(1, 11):
+
         target_date = today - timedelta(days=h)
         date_str = target_date.strftime("%Y-%m-%d")
+
         file_path = Path(DATA_PATH) / "predictions" / ticker / f"{date_str}.json"
 
         if file_path.exists():
+
             old_pred = load_json(file_path)
             old_p = old_pred.get("prediction", {})
             curve = old_pred.get("price_curve", {}).get("price_path", [])
-            
+
             if len(curve) >= h:
+
                 price_now = float(old_p.get("price_now"))
                 price_pred = float(curve[h-1])
-                
+
                 pred_ret = (price_pred / price_now - 1) * 100
                 real_ret = (price_real / price_now - 1) * 100
-                
+
                 models[f"H{h}"] = {
                     "pred_price": round(price_pred, 4),
                     "pred_return": round(pred_ret, 4),
                     "real_return": round(real_ret, 4),
                     "error_pct": round(abs(pred_ret - real_ret), 4),
-                    "hit_sign": bool(np.sign(pred_ret) == np.sign(real_ret))
+                    "hit_sign": bool(np.sign(pred_ret) == np.sign(real_ret)),
                 }
+
     return models
+
+
+# ======================================================
+# SUMMARY
+# ======================================================
 
 def summarize_models(models: Dict[str, Any]):
 
-    errors = {k:v["error_pct"] for k,v in models.items() if v["error_pct"] is not None}
+    errors = {k: v["error_pct"] for k, v in models.items() if v["error_pct"] is not None}
 
     if not errors:
         return {}
@@ -269,12 +295,14 @@ def summarize_models(models: Dict[str, Any]):
     return {
         "best_model": best,
         "worst_model": worst,
-        "mean_error": round(mean_error,4)
+        "mean_error": round(mean_error, 4),
     }
+
 
 # ======================================================
 # EVALUACIÓN MASIVA
 # ======================================================
+
 def evaluate_all(
     ticker: Optional[str] = None,
     max_workers: Optional[int] = None,
@@ -290,7 +318,9 @@ def evaluate_all(
         return results
 
     ticker_dirs = (
-        [pred_root / ticker] if ticker else [d for d in pred_root.iterdir() if d.is_dir()]
+        [pred_root / ticker]
+        if ticker
+        else [d for d in pred_root.iterdir() if d.is_dir()]
     )
 
     today = datetime.utcnow().date()
@@ -314,38 +344,47 @@ def evaluate_all(
             if not eval_file.exists():
                 pending.append(pred_file)
 
-    
-
     if dry_run:
         return {"pending": len(pending)}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers or MAX_WORKERS) as ex:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers or MAX_WORKERS
+    ) as ex:
+
         future_map = {ex.submit(evaluate_prediction, f): f for f in pending}
 
         for fut in concurrent.futures.as_completed(future_map):
+
             f = future_map[fut]
+
             try:
-                
-                    
-                 ev = fut.result()
-                 if ev:
-                     ev_dict = asdict(ev)
-                     pred = load_json(f)
 
-                     # MODELS PRIMERO
-                     models_diag = evaluate_models(pred, ev_dict.get("price_real"))
-                     models_summary = summarize_models(models_diag)
+                ev = fut.result()
 
-                     ev_dict["models_diagnostics"] = models_diag
-                     ev_dict["models_summary"] = models_summary
-                     save_json(
+                if ev:
+
+                    ev_dict = asdict(ev)
+                    pred = load_json(f)
+
+                    models_diag = evaluate_models(pred, ev_dict.get("price_real"))
+                    models_summary = summarize_models(models_diag)
+
+                    ev_dict["models_diagnostics"] = models_diag
+                    ev_dict["models_summary"] = models_summary
+
+                    save_json(
                         eval_root / f.parent.name / f.name,
                         ev_dict,
                     )
+
                     results["evaluated"].append(str(f))
+
                 else:
+
                     results["skipped"].append(str(f))
+
             except Exception as e:
+
                 logger.error(f"Error evaluating {f}: {e}")
                 results["errors"].append(str(f))
 
@@ -361,6 +400,12 @@ def evaluate_all(
 # ======================================================
 # COMPAT
 # ======================================================
+
 def evaluate_all_compat(ticker: Optional[str] = None) -> Dict[str, List[str]]:
+
     r = evaluate_all(ticker)
-    return {"evaluated": r["evaluated"], "skipped": r["skipped"]}
+
+    return {
+        "evaluated": r["evaluated"],
+        "skipped": r["skipped"],
+    }
