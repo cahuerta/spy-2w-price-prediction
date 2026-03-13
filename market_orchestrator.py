@@ -1,5 +1,5 @@
 """
-market_orchestrator.py — V2.1 PRODUCCIÓN REAL NUMÉRICO ESTRICTO
+market_orchestrator.py — V2.2 PRODUCCIÓN REAL NUMÉRICO ESTRICTO
 
 ORQUESTADOR DE ENTORNO DE MERCADO
 
@@ -8,9 +8,17 @@ ORQUESTADOR DE ENTORNO DE MERCADO
 ✔ NO inventa confidence
 ✔ NO fallback
 ✔ NO defaults silenciosos
-✔ Ajuste score estructural + impacto macro
+✔ Ajuste score estructural + impacto macro ponderado por confianza
 ✔ Hysteresis limpio
 ✔ Contratos intactos
+
+FIX v2.2:
+  [F1] impact_score ahora se pondera por qual_conf antes de sumarse al score
+       raw_score = base_score + (impact_score * qual_conf)
+       Antes: 0.50 + (-0.168) = 0.332 → defensive  ❌
+       Ahora: 0.50 + (-0.168 * 0.66) = 0.389 → neutral ✅
+       Efecto: noticias con baja confianza tienen menos peso,
+               noticias con alta confianza tienen peso casi completo.
 """
 
 from dataclasses import dataclass, asdict
@@ -103,8 +111,12 @@ class MarketOrchestrator:
 
         # =========================================================
         # SCORE FINAL AJUSTADO
+        # [F1] Impacto ponderado por confianza de las noticias
+        #      Alta confianza → impacto casi completo
+        #      Baja confianza → impacto atenuado
         # =========================================================
-        raw_score = base_score + impact_score
+        weighted_impact = impact_score * qual_conf
+        raw_score = base_score + weighted_impact
         final_score = max(0.0, min(raw_score, 1.0))
 
         # =========================================================
@@ -121,8 +133,8 @@ class MarketOrchestrator:
 
         reason_parts = [
             f"Base regime={quant_regime} ({base_score:.2f})",
-            f"Impact={impact_score:.3f}",
-            f"Score={final_score:.2f}",
+            f"Impact={impact_score:.3f} × Conf={qual_conf:.2f} → weighted={weighted_impact:.3f}",
+            f"Score={final_score:.3f}",
         ]
 
         # =========================================================
@@ -157,10 +169,10 @@ class MarketOrchestrator:
         # =========================================================
         if next_mode != self._last_mode:
             logger.info(
-                f"🎯 MODE CHANGE: {self._last_mode} → {next_mode} | score={final_score:.2f} | conf={confidence:.2f}"
+                f"🎯 MODE CHANGE: {self._last_mode} → {next_mode} | score={final_score:.3f} | conf={confidence:.2f}"
             )
         else:
-            logger.debug(f"Mode stable: {next_mode}")
+            logger.debug(f"Mode stable: {next_mode} | score={final_score:.3f}")
 
         self._last_mode = next_mode
 
@@ -175,6 +187,7 @@ class MarketOrchestrator:
             source={
                 "quant_regime": quant_regime,
                 "impact_score": impact_score,
+                "weighted_impact": round(weighted_impact, 4),
                 "aggregated_confidence": qual_conf,
                 "base_score": base_score,
                 "final_score": final_score,
