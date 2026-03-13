@@ -1,5 +1,13 @@
 # =========================================================
-# portfolio_store.py — PORTFOLIO STATE MANAGER v1.5 STABLE
+# portfolio_store.py — PORTFOLIO STATE MANAGER v1.6 STABLE
+# =========================================================
+#
+# FIX v1.6:
+#   [F1] load_positions() ya NO sobreescribe el store si el broker
+#        devuelve una lista vacía. Antes: broker {} → _save_raw([])
+#        → Capital Governor leía 0 posiciones → desync.
+#        Ahora: broker vacío → fallback a positions.json en disco.
+#
 # =========================================================
 
 import json
@@ -117,32 +125,46 @@ def _fetch_positions_api():
 # =========================================================
 
 def load_positions() -> List[Dict[str, Any]]:
-
+    """
+    Fuente de verdad: broker (Alpaca).
+    Si el broker devuelve posiciones reales → guardar y retornar.
+    Si el broker devuelve vacío → NO sobreescribir, leer desde disco.
+    Si disco también vacío → retornar [].
+    """
     _ensure_store()
 
-    engine = get_engine()
-    data = engine.get_positions()
-    
-    if isinstance(data, dict):
-        data = [{"ticker": t, **v} for t, v in data.items()]
-
-    if data:
-
-        _save_raw(data)
-
-        return data
-
     try:
+        engine = get_engine()
+        data = engine.get_positions()
 
+        if isinstance(data, dict):
+            data = [{"ticker": t, **v} for t, v in data.items()]
+
+        # [F1] Solo sincronizar si el broker tiene posiciones reales
+        if data:
+            logger.info(f"✅ Broker positions: {len(data)}")
+            _save_raw(data)
+            return data
+
+        # Broker vacío → puede ser cierre real o error transitorio
+        # En ambos casos, NO sobreescribir — leer desde disco
+        logger.info("⚠️ Broker devolvió 0 posiciones → leyendo desde disco")
+
+    except Exception as e:
+        logger.warning(f"⚠️ Broker get_positions falló: {e} → leyendo desde disco")
+
+    # Fallback: leer desde positions.json
+    try:
         data = json.loads(POSITIONS_FILE.read_text())
 
         if isinstance(data, dict):
             data = [{"ticker": t, **v} for t, v in data.items()]
 
+        logger.info(f"📂 Disco positions: {len(data)}")
         return data
 
-    except Exception:
-
+    except Exception as e:
+        logger.error(f"❌ Error leyendo positions.json: {e}")
         return []
 
 # =========================================================
@@ -152,6 +174,18 @@ def load_positions() -> List[Dict[str, Any]]:
 def save_positions(positions: List[Dict[str, Any]]):
 
     _save_raw(positions)
+
+# =========================================================
+# CLEAR POSITIONS (llamar cuando broker confirma portfolio vacío)
+# =========================================================
+
+def clear_positions():
+    """
+    Llamar explícitamente cuando se confirma que el broker
+    no tiene posiciones abiertas (portfolio realmente vacío).
+    """
+    logger.info("🧹 Clearing positions store (broker confirmed empty)")
+    _save_raw([])
 
 # =========================================================
 # PRICE UPDATE
@@ -219,13 +253,14 @@ def portfolio_metrics() -> PortfolioMetrics:
 
         anchors_count=anchors,
 
-        total_value=round(total_value,2),
+        total_value=round(total_value, 2),
 
-        unrealized_pnl_pct=round((unrealized/entry_value*100) if entry_value else 0,2),
+        unrealized_pnl_pct=round((unrealized / entry_value * 100) if entry_value else 0, 2),
 
-        anchor_exposure_ratio=round(ratio,4),
+        anchor_exposure_ratio=round(ratio, 4),
 
-        anchor_exposure_pct=round(ratio*100,1),
+        anchor_exposure_pct=round(ratio * 100, 1),
 
         timestamp=_now()
     )
+    
