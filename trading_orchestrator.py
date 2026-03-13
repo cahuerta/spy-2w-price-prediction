@@ -1,6 +1,14 @@
 # =========================================================
-# trading_orchestrator.py — V3.0 ALPHA-CONSUMER
+# trading_orchestrator.py — V3.1 ALPHA-CONSUMER
 # ALPHA ENGINE EXTERNO | ORCHESTRATOR SOLO LEE
+# =========================================================
+#
+# FIX v3.1:
+#   [F1] Filtro real_positions: solo intenta cerrar tickers
+#        que realmente existen en el broker (evita "position not found")
+#   [F2] clear_positions() tras confirmar que todos los cierres
+#        fueron exitosos Y el broker confirma portfolio vacío
+#
 # =========================================================
 
 import logging
@@ -12,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from broker import get_engine
 
-from portfolio_store import load_positions, save_positions
+from portfolio_store import load_positions, save_positions, clear_positions
 
 from capital_governor import CapitalGovernor
 
@@ -49,7 +57,7 @@ class TradingOrchestrator:
 
         self.governor = CapitalGovernor(self.fixed_capital)
 
-        logger.info(f"🚀 v3.0 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.1 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
     # =========================================================
     # MAIN RUN
@@ -81,10 +89,15 @@ class TradingOrchestrator:
                 if positions:
                     save_positions(positions)
                     logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
-        portfolio_tickers = {p["ticker"].upper() for p in positions}
+
+        # [F1] Tickers realmente existentes en broker (fuente de verdad para cierres)
+        broker_positions = load_positions()
+        real_positions = {p["ticker"].upper() for p in broker_positions}
+
+        portfolio_tickers = real_positions
         mode = market_ctx.get("market_mode", "neutral")
 
-        logger.info(f"📊 Portfolio: {len(positions)} | Mode: {mode}")
+        logger.info(f"📊 Portfolio: {len(positions)} | Real en broker: {len(real_positions)} | Mode: {mode}")
 
         # 2️⃣ LOAD LAST ALPHA (NO RECOMPUTE)
         alpha_data = self._load_last_alpha()
@@ -110,6 +123,12 @@ class TradingOrchestrator:
         for decision in pm_decisions:
             if decision.get("action") == "CLOSE":
                 ticker = decision.get("ticker", "").upper()
+
+                # [F1] Solo cerrar si realmente existe en broker
+                if ticker not in real_positions:
+                    logger.warning(f"⚠️ SKIP CLOSE {ticker} → no existe en broker")
+                    continue
+
                 alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
 
                 if alpha_score >= self.alpha_hold_shield:
@@ -126,6 +145,12 @@ class TradingOrchestrator:
         for ticker in portfolio_tickers:
             alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
             if alpha_score <= self.alpha_kill:
+
+                # [F1] Solo cerrar si realmente existe en broker
+                if ticker not in real_positions:
+                    logger.warning(f"⚠️ SKIP KILL {ticker} → no existe en broker")
+                    continue
+
                 closes.append({
                     "action": "CLOSE",
                     "ticker": ticker,
@@ -150,7 +175,7 @@ class TradingOrchestrator:
                 opens.append({
                     "action": "OPEN",
                     "ticker": ticker,
-                    "target_pct": 0.05,  # ← ahora sí ejecutable
+                    "target_pct": 0.05,
                     "reason": f"ALPHA_INJECT_{score:.3f}",
                     "alpha": score
                 })
@@ -184,6 +209,7 @@ class TradingOrchestrator:
         # 7️⃣ EXECUTION
         results = []
         executed = 0
+        close_successes = []
 
         for order in final_queue[:self.daily_limit]:
             try:
@@ -198,6 +224,9 @@ class TradingOrchestrator:
                 })
                 executed += 1
 
+                if order["action"] == "CLOSE":
+                    close_successes.append(order["ticker"])
+
                 await asyncio.sleep(0.8)
 
             except Exception as e:
@@ -206,6 +235,23 @@ class TradingOrchestrator:
                     "status": "error",
                     "error": str(e)
                 })
+
+        # [F2] Si todos los cierres fueron exitosos y broker confirma vacío → limpiar store
+        if close_successes:
+            all_closes_ok = len(close_successes) == len(closes)
+            try:
+                broker_after = self.broker.get_positions()
+                if isinstance(broker_after, dict):
+                    broker_after = list(broker_after.values())
+                broker_empty = len(broker_after) == 0
+            except Exception:
+                broker_empty = False
+
+            if all_closes_ok and broker_empty:
+                logger.info("🧹 Todos los cierres OK + broker vacío → clear_positions()")
+                clear_positions()
+            else:
+                logger.info(f"📂 Cierres parciales o broker aún tiene posiciones → manteniendo store")
 
         self.flag_file.write_text(datetime.now(timezone.utc).isoformat())
 
@@ -294,3 +340,4 @@ class TradingOrchestrator:
             return True
         last_run = datetime.fromisoformat(self.flag_file.read_text().strip())
         return last_run.date() != datetime.now(timezone.utc).date()
+            
