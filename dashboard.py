@@ -345,7 +345,7 @@ async def universe():
         rows.append({
             "ticker": ticker,
             "alpha": score,
-            "confidence": data.get("confidence"),
+            "confidence": data.get("components", {}).get("confidence"),
             "positionValue": positions.get(ticker.upper(), {}).get("market_value", 0),
             "executable": is_executable,
             "block_reason": block_reason,
