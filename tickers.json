@@ -8,7 +8,6 @@
   "BIP",
   "MAIN",
   "MELI",
-
   "SQM.SN",
   "COPEC.SN",
   "ENELAM.SN",
@@ -29,9 +28,12 @@
   "RIPLEY.SN",
   "SONDA.SN",
   "CUPRUM.SN",
-
   "ENTEL.SN",
   "ENJOY.SN",
   "LIPIGAS.SN",
   "LTM.SN"
+  "WMT",
+  "VZ", 
+  "SO",
+  "BRK.B"
 ]
