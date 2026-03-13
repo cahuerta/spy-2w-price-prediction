@@ -185,7 +185,30 @@ class TradingOrchestrator:
         unique_opens = list(opens_dict.values())
 
         # 5️⃣ GOVERNOR
-        sized_opens = self.governor.adjust_sizing(positions, unique_opens)
+        # Anclas de rotación (PM Defensivo) → ES calculado POST-cierre
+        # Normales (alpha injection) → sizing estándar con portfolio actual
+        anchor_opens = [
+            o for o in unique_opens
+            if o.get("is_anchor") or o.get("reason", "").startswith("ANCHOR_ROTATE")
+        ]
+        normal_opens = [o for o in unique_opens if o not in anchor_opens]
+
+        close_tickers = [c["ticker"] for c in closes]
+
+        sized_anchors = self.governor.adjust_sizing_after_closes(
+            positions, close_tickers, anchor_opens
+        ) if anchor_opens else []
+
+        sized_normals = self.governor.adjust_sizing(
+            positions, normal_opens
+        ) if normal_opens else []
+
+        sized_opens = sized_anchors + sized_normals
+
+        logger.info(
+            f"📐 Sizing | anchors={len(sized_anchors)} "
+            f"normals={len(sized_normals)} total={len(sized_opens)}"
+        )
 
         # 6️⃣ FINAL FILTER
         final_queue = closes[:]
