@@ -1,11 +1,16 @@
 # =========================================================
-# model_runner.py — MODEL EXECUTION & PERSISTENCE LAYER
+# model_runner.py — MODEL EXECUTION LAYER
 # =========================================================
-# ✔ Ejecuta model.py
-# ✔ Guarda predicciones en /data/predictions/{ticker}/
-# ✔ Formato 100% compatible con dashboard.py
-# ✔ Atomic write (seguro en cron)
-# ✔ NO decide | NO evalúa | NO señales
+# ✔ Ejecuta model.py (que llama MasterOrchestrator)
+# ✔ NO graba en disco — el orquestador es el dueño
+# ✔ Filtra SKIP y ERROR antes de gastar tiempo en el pipeline
+# ✔ Atomic write eliminado de acá — solo el orquestador escribe
+#
+# FIXES vMR-2:
+#   [MR1] Respetar status=SKIP de model.py — no correr orquestador
+#   [MR2] Respetar status=ERROR — loggear y continuar
+#   [MR3] NO guardar resultado — orquestador ya grabó
+#   [MR4] Conteo separado: ok / failed / skipped
 # =========================================================
 
 import os
@@ -14,7 +19,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-from model import run_model   # 🔑 TU MOTOR REAL
+from model import run_model
 
 # =========================================================
 # CONFIG
@@ -23,6 +28,7 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 PREDICTIONS_PATH = DATA_PATH / "predictions"
 TICKERS_FILE = DATA_PATH / "tickers.json"
 MODEL_HORIZON = int(os.getenv("MODEL_HORIZON_DAYS", "10"))
+
 # =========================================================
 # LOGGING
 # =========================================================
@@ -32,12 +38,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("model_runner")
 
-# =========================================================
-# 🔍 AUDITORÍA DE RUTAS (FIX 1)
-# =========================================================
 logger.info(f"[MODEL_RUNNER] DATA_PATH = {DATA_PATH.resolve()}")
 logger.info(f"[MODEL_RUNNER] DATA_PATH exists = {DATA_PATH.exists()}")
 logger.info(f"[MODEL_RUNNER] PREDICTIONS_PATH = {PREDICTIONS_PATH.resolve()}")
+
 
 # =========================================================
 # HELPERS
@@ -57,65 +61,58 @@ def load_tickers() -> list[str]:
     raise RuntimeError("Formato inválido en tickers.json")
 
 
-def save_json_atomic(path: Path, data: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(path)
-
-
 # =========================================================
-# CORE
+# CORE — [MR3] NO graba, el orquestador ya lo hizo
 # =========================================================
 def run_model_for_ticker(ticker: str) -> dict:
     logger.info(f"📈 Ejecutando modelo para {ticker}")
 
-    result = run_model(
-    ticker=ticker,
-    horizon=MODEL_HORIZON
-    )
+    result = run_model(ticker=ticker, horizon=MODEL_HORIZON)
 
-    today = datetime.utcnow().date().isoformat()
+    # [MR1] Filtrar SKIP — datos insuficientes, no correr orquestador
+    if result.get("status") == "SKIP":
+        logger.info(f"⏭️  [{ticker}] SKIP: {result.get('message', '')}")
+        return result
 
-    # =====================================================
-    # 📁 Asegurar directorio del ticker (FIX 2)
-    # =====================================================
-    ticker_dir = PREDICTIONS_PATH / ticker
-    ticker_dir.mkdir(parents=True, exist_ok=True)
+    # [MR2] Filtrar ERROR — algo falló en el orquestador
+    if result.get("status") == "ERROR":
+        logger.warning(f"⚠️  [{ticker}] ERROR: {result.get('message', '')}")
+        return result
 
-    out_file = ticker_dir / f"{today}.json"
-
-    save_json_atomic(out_file, result)
-
-    # =====================================================
-    # ✅ Verificación post-escritura (FIX 3)
-    # =====================================================
-    if not out_file.exists():
-        raise RuntimeError(
-            f"[MODEL_RUNNER] Archivo NO existe tras grabar: {out_file}"
-        )
-
-    logger.info(f"💾 Guardado: {out_file.resolve()}")
+    # [MR3] Resultado válido — el orquestador YA grabó en disco
+    # NO llamar save_json aquí
+    logger.info(f"✅ [{ticker}] OK")
     return result
 
 
+# =========================================================
+# BATCH
+# =========================================================
 def run_all_models():
     tickers = load_tickers()
     logger.info(f"🚀 Ejecutando modelo para {len(tickers)} tickers")
 
-    ok, failed = 0, 0
+    # [MR4] Conteo separado para visibilidad real en logs
+    ok, failed, skipped = 0, 0, 0
 
     for t in tickers:
         try:
-            run_model_for_ticker(t)
-            ok += 1
+            result = run_model_for_ticker(t)
+
+            status = result.get("status")
+            if status == "SKIP":
+                skipped += 1
+            elif status == "ERROR":
+                failed += 1
+            else:
+                ok += 1
+
         except Exception as e:
             failed += 1
-            logger.error(f"❌ {t} falló: {e}")
+            logger.error(f"❌ {t} error inesperado: {e}")
 
     logger.info(
-        f"🏁 MODEL RUN FINALIZADO | OK={ok} | FAIL={failed}"
+        f"🏁 MODEL RUN FINALIZADO | OK={ok} | FAIL={failed} | SKIP={skipped}"
     )
 
 
