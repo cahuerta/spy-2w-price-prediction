@@ -1,5 +1,5 @@
 # =========================================================
-# trading_orchestrator.py — V3.1 ALPHA-CONSUMER
+# trading_orchestrator.py — V3.2 ALPHA-CONSUMER
 # ALPHA ENGINE EXTERNO | ORCHESTRATOR SOLO LEE
 # =========================================================
 #
@@ -9,18 +9,25 @@
 #   [F2] clear_positions() tras confirmar que todos los cierres
 #        fueron exitosos Y el broker confirma portfolio vacío
 #
+# FIX v3.2:
+#   [F3] Enriquecer posiciones con price_now desde caché ANTES
+#        de pasarlas al PM — evita "invalid_price" cuando el broker
+#        no incluye price_now en las posiciones retornadas.
+#        Fallback en cascada: caché → entry_price (nunca 0).
+#   [F4] Cancelar órdenes pendientes (held_for_orders) antes de
+#        intentar nuevas órdenes de cierre sobre el mismo ticker.
 # =========================================================
 
 import logging
 import asyncio
 import os
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from pathlib import Path
 from broker import get_engine
 
-from portfolio_store import load_positions, save_positions, clear_positions
+from portfolio_store import load_positions, save_positions, clear_positions, update_prices
 
 from capital_governor import CapitalGovernor
 
@@ -47,17 +54,111 @@ class TradingOrchestrator:
         self.daily_limit = int(os.getenv("MAX_ORDERS_DAY", "15"))
 
         # Alpha thresholds
-        self.alpha_growth = float(os.getenv("ALPHA_GROWTH", "0.65"))
-        self.alpha_neutral = float(os.getenv("ALPHA_NEUTRAL", "0.75"))
+        self.alpha_growth    = float(os.getenv("ALPHA_GROWTH",    "0.65"))
+        self.alpha_neutral   = float(os.getenv("ALPHA_NEUTRAL",   "0.75"))
         self.alpha_defensive = float(os.getenv("ALPHA_DEFENSIVE", "0.85"))
 
-        self.alpha_elite = float(os.getenv("ALPHA_ELITE", "0.88"))
+        self.alpha_elite      = float(os.getenv("ALPHA_ELITE",  "0.88"))
         self.alpha_hold_shield = float(os.getenv("ALPHA_SHIELD", "0.75"))
-        self.alpha_kill = float(os.getenv("ALPHA_KILL", "-0.40"))
+        self.alpha_kill       = float(os.getenv("ALPHA_KILL",   "-0.40"))
 
         self.governor = CapitalGovernor(self.fixed_capital)
 
-        logger.info(f"🚀 v3.1 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.2 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+
+    # =========================================================
+    # [F3] ENRIQUECER POSICIONES CON PRECIO ACTUAL
+    # =========================================================
+    def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
+        """
+        Agrega price_now a cada posición desde market_data_cache.
+        Fallback: usar current_price del broker, luego entry_price.
+        Nunca deja price_now en 0 o None — PMNeutral necesita un precio válido.
+        """
+        try:
+            from market_data_cache import get_last_price_from_cache
+        except ImportError:
+            get_last_price_from_cache = None
+
+        enriched = []
+        price_map = {}
+
+        for pos in positions:
+            ticker = str(pos.get("ticker", "")).upper()
+            pos = dict(pos)  # copia para no mutar el original
+
+            # Precio ya existe y es válido
+            existing = pos.get("price_now")
+            if existing and float(existing) > 0:
+                enriched.append(pos)
+                continue
+
+            # Intentar desde caché de mercado
+            cache_price = None
+            if get_last_price_from_cache:
+                try:
+                    cache_price = get_last_price_from_cache(ticker)
+                except Exception:
+                    pass
+
+            # Intentar desde current_price del broker (Alpaca lo incluye a veces)
+            broker_price = pos.get("current_price") or pos.get("lastday_price")
+
+            # Fallback final: entry_price (nunca 0)
+            entry_price = float(pos.get("entry_price", 0) or 0)
+
+            if cache_price and float(cache_price) > 0:
+                pos["price_now"] = float(cache_price)
+                price_map[ticker] = float(cache_price)
+                logger.debug(f"💰 {ticker} price_now desde caché: {cache_price}")
+            elif broker_price and float(broker_price) > 0:
+                pos["price_now"] = float(broker_price)
+                price_map[ticker] = float(broker_price)
+                logger.debug(f"💰 {ticker} price_now desde broker field: {broker_price}")
+            elif entry_price > 0:
+                pos["price_now"] = entry_price
+                logger.warning(f"⚠️ {ticker} price_now fallback a entry_price: {entry_price}")
+            else:
+                pos["price_now"] = 1.0  # guardia absoluta — nunca llega 0 al PM
+                logger.error(f"❌ {ticker} sin precio disponible — usando 1.0 como guardia")
+
+            enriched.append(pos)
+
+        # Persistir precios actualizados en portfolio_store
+        if price_map:
+            try:
+                update_prices(price_map)
+            except Exception as e:
+                logger.warning(f"⚠️ update_prices falló: {e}")
+
+        return enriched
+
+    # =========================================================
+    # [F4] CANCELAR ÓRDENES PENDIENTES
+    # =========================================================
+    async def _cancel_pending_orders(self, tickers: List[str]):
+        """
+        Cancela órdenes abiertas para los tickers que se quieren cerrar.
+        Evita el error 'held_for_orders' al intentar vender qty bloqueada.
+        """
+        if not hasattr(self.broker, "cancel_orders_for_ticker"):
+            # Si el broker no tiene el método, intentar cancel_all_orders
+            if hasattr(self.broker, "cancel_all_orders"):
+                try:
+                    await self.broker.cancel_all_orders()
+                    logger.info("🗑 Órdenes pendientes canceladas (cancel_all)")
+                except Exception as e:
+                    logger.warning(f"⚠️ cancel_all_orders falló: {e}")
+            return
+
+        for ticker in tickers:
+            try:
+                result = self.broker.cancel_orders_for_ticker(ticker)
+                if asyncio.iscoroutine(result):
+                    await result
+                logger.info(f"🗑 Órdenes canceladas para {ticker}")
+            except Exception as e:
+                logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
     # MAIN RUN
@@ -89,6 +190,9 @@ class TradingOrchestrator:
                 if positions:
                     save_positions(positions)
                     logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
+
+        # [F3] Enriquecer posiciones con precio actual ANTES de pasar al PM
+        positions = self._enrich_positions_with_price(positions)
 
         # [F1] Tickers realmente existentes en broker (fuente de verdad para cierres)
         broker_positions = load_positions()
@@ -146,7 +250,6 @@ class TradingOrchestrator:
             alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
             if alpha_score <= self.alpha_kill:
 
-                # [F1] Solo cerrar si realmente existe en broker
                 if ticker not in real_positions:
                     logger.warning(f"⚠️ SKIP KILL {ticker} → no existe en broker")
                     continue
@@ -159,6 +262,12 @@ class TradingOrchestrator:
                 logger.warning(f"💀 KILL {ticker} | alpha={alpha_score:.3f}")
 
         closes = list({c["ticker"]: c for c in closes}.values())
+
+        # [F4] Cancelar órdenes pendientes para tickers que se quieren cerrar
+        if closes:
+            close_tickers = [c["ticker"] for c in closes]
+            await self._cancel_pending_orders(close_tickers)
+            await asyncio.sleep(0.5)  # pequeña pausa para que el broker procese
 
         # 📈 PM OPENS
         for decision in pm_decisions:
@@ -185,18 +294,16 @@ class TradingOrchestrator:
         unique_opens = list(opens_dict.values())
 
         # 5️⃣ GOVERNOR
-        # Anclas de rotación (PM Defensivo) → ES calculado POST-cierre
-        # Normales (alpha injection) → sizing estándar con portfolio actual
         anchor_opens = [
             o for o in unique_opens
             if o.get("is_anchor") or o.get("reason", "").startswith("ANCHOR_ROTATE")
         ]
         normal_opens = [o for o in unique_opens if o not in anchor_opens]
 
-        close_tickers = [c["ticker"] for c in closes]
+        close_tickers_list = [c["ticker"] for c in closes]
 
         sized_anchors = self.governor.adjust_sizing_after_closes(
-            positions, close_tickers, anchor_opens
+            positions, close_tickers_list, anchor_opens
         ) if anchor_opens else []
 
         sized_normals = self.governor.adjust_sizing(
@@ -253,6 +360,7 @@ class TradingOrchestrator:
                 await asyncio.sleep(0.8)
 
             except Exception as e:
+                logger.error(f"❌ EXECUTION ERROR for {order.get('ticker')}: {e}")
                 results.append({
                     "ticker": order.get("ticker"),
                     "status": "error",
@@ -274,7 +382,7 @@ class TradingOrchestrator:
                 logger.info("🧹 Todos los cierres OK + broker vacío → clear_positions()")
                 clear_positions()
             else:
-                logger.info(f"📂 Cierres parciales o broker aún tiene posiciones → manteniendo store")
+                logger.info("📂 Cierres parciales o broker aún tiene posiciones → manteniendo store")
 
         self.flag_file.write_text(datetime.now(timezone.utc).isoformat())
 
@@ -291,6 +399,34 @@ class TradingOrchestrator:
             "alpha_timestamp": alpha_data.get("timestamp"),
             "results": results
         }
+
+    # =========================================================
+    # PREVIEW (sin ejecutar)
+    # =========================================================
+    async def preview_executability(self, market_ctx: Dict) -> Dict:
+        positions = self._enrich_positions_with_price(load_positions())
+        alpha_data = self._load_last_alpha()
+        alpha_map = {
+            t.upper(): d
+            for t, d in alpha_data.get("results", {}).items()
+            if isinstance(d, dict)
+        }
+        mode = market_ctx.get("market_mode", "neutral")
+        threshold = self._alpha_threshold(mode)
+
+        rows = []
+        for ticker, data in alpha_map.items():
+            score = data.get("alpha_score", 0)
+            rows.append({
+                "ticker": ticker,
+                "alpha": score,
+                "executable": score >= threshold,
+                "mode": mode,
+                "threshold": threshold,
+            })
+
+        rows.sort(key=lambda x: x["alpha"] or 0, reverse=True)
+        return {"mode": mode, "threshold": threshold, "rows": rows}
 
     # =========================================================
     # HELPERS
@@ -363,4 +499,3 @@ class TradingOrchestrator:
             return True
         last_run = datetime.fromisoformat(self.flag_file.read_text().strip())
         return last_run.date() != datetime.now(timezone.utc).date()
-            
