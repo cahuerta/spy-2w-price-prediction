@@ -1,10 +1,18 @@
+# ======================================================
 # signals.py — VERSIÓN ABSOLUTA FINAL (ENTERPRISE 10/10)
-# =====================================================
+# ======================================================
 # ✅ Compatible con model.py + evaluator.py
 # ✅ Fundamental (model2_improved) como CONTEXTO (NO score)
 # ✅ Cache + concurrencia + TTL
 # ✅ NO altera hit-rate ni ranking
-# =====================================================
+#
+# FIXES v4.3-signals:
+#   [S1] ret_ens_pct None → abs(None) crash en compute_signal
+#   [S2] rolling_metrics None → alpha_engine recibe None en vez de dict default
+#   [S3] price_now / price_pred None → round(None) crash
+#   [S4] compute_signal retornaba dict vacío en errores → alpha_engine hacía .get() sobre None
+#   [S5] confidence_score con metrics=None → retornaba None, ahora retorna 0.0
+# ======================================================
 
 import os
 import json
@@ -19,9 +27,9 @@ import argparse
 import concurrent.futures
 from threading import Lock
 
-# =====================================================
+# ======================================================
 # FUNDAMENTAL CONTEXT (SAFE IMPORT)
-# =====================================================
+# ======================================================
 try:
     from model2 import fundamental_signal_context
     FUNDAMENTAL_AVAILABLE = True
@@ -30,9 +38,9 @@ except Exception:
     def fundamental_signal_context(ticker: str) -> Dict[str, Any]:
         return {"usable": False}
 
-# =====================================================
+# ======================================================
 # Configuración ENV
-# =====================================================
+# ======================================================
 DATA_PATH = os.getenv("DATA_PATH", "/data")
 DEFAULT_WINDOW = int(os.getenv("SIGNAL_WINDOW", "30"))
 MIN_CONFIDENCE = float(os.getenv("SIGNAL_MIN_CONFIDENCE", "0.4"))
@@ -41,9 +49,17 @@ MAX_CONCURRENT = int(os.getenv("SIGNAL_MAX_CONCURRENT", "4"))
 SIGNAL_DECAY_DAYS = int(os.getenv("SIGNAL_DECAY_DAYS", "14"))
 CACHE_TTL = int(os.getenv("SIGNAL_CACHE_TTL", "300"))
 
-# =====================================================
+# Métricas por defecto cuando no hay historial de evaluaciones
+_DEFAULT_METRICS = {
+    "n": 0,
+    "effective_n": 0.0,
+    "hit_rate": 0.45,
+    "mae_return_pct": 10.0,
+}
+
+# ======================================================
 # Logging
-# =====================================================
+# ======================================================
 def setup_logging(verbose: bool = False):
     level = logging.DEBUG if verbose else logging.INFO
     try:
@@ -65,15 +81,15 @@ def setup_logging(verbose: bool = False):
 
 logger = logging.getLogger(__name__)
 
-# =====================================================
+# ======================================================
 # Cache thread-safe
-# =====================================================
+# ======================================================
 _signals_cache: Dict[str, Dict] = {}
 _cache_lock = Lock()
 
-# =====================================================
+# ======================================================
 # Utils
-# =====================================================
+# ======================================================
 def load_json(path: str | Path):
     try:
         with open(path, "r") as f:
@@ -104,10 +120,11 @@ def parse_date(s: str):
     except Exception:
         return None
 
-# =====================================================
+
+# ======================================================
 # Rolling metrics (decay)
-# =====================================================
-def rolling_metrics(evals: List[Dict], window_days: int):
+# ======================================================
+def rolling_metrics(evals: List[Dict], window_days: int) -> Optional[Dict]:
     if not evals:
         return None
 
@@ -125,7 +142,7 @@ def rolling_metrics(evals: List[Dict], window_days: int):
         w = np.exp(-max(0, age - 7) / (SIGNAL_DECAY_DAYS / 2))
 
         hits.append(1.0 if e.get("hit_sign") else 0.0)
-        errors.append(abs(e.get("error_return_pct", 0)))
+        errors.append(abs(e.get("error_return_pct") or 0))
         weights.append(w)
 
     if not weights or sum(weights) == 0:
@@ -138,27 +155,41 @@ def rolling_metrics(evals: List[Dict], window_days: int):
         "mae_return_pct": float(np.average(errors, weights=weights)),
     }
 
-# =====================================================
+
+# ======================================================
 # Confidence score
-# =====================================================
-def confidence_score(ret_pct: float, metrics: Dict) -> Optional[float]:
+# ======================================================
+def confidence_score(ret_pct: float, metrics: Dict) -> float:
+    """
+    [S5] Nunca retorna None — retorna 0.0 si no hay métricas válidas.
+    Alpha engine puede asumir que confidence es siempre float.
+    """
     if not metrics:
-        return None
+        return 0.0
+
+    # [S5] ret_pct debe ser float válido
+    if ret_pct is None:
+        return 0.0
 
     strength = min(abs(ret_pct) / 3.0, 1.0)
-    acc = metrics["hit_rate"]
-    err = 1.0 / (1.0 + metrics["mae_return_pct"] / 10.0)
-    size = min(metrics["effective_n"] / 10.0, 0.3)
+    acc = metrics.get("hit_rate") or 0.45
+    mae = metrics.get("mae_return_pct") or 10.0
+    eff_n = metrics.get("effective_n") or 0.0
+
+    err = 1.0 / (1.0 + mae / 10.0)
+    size = min(eff_n / 10.0, 0.3)
 
     score = 0.35 * strength + 0.35 * acc + 0.2 * err + 0.1 * size
 
-    if metrics["effective_n"] < MIN_HISTORY:
+    if eff_n < MIN_HISTORY:
         score *= 0.7
 
     return round(float(np.clip(score, 0, 1)), 3)
 
-def signal_quality(conf: Optional[float]) -> str:
-    if conf is None:
+
+def signal_quality(conf: float) -> str:
+    # [S5] conf es ahora siempre float, pero por seguridad mantenemos el guard
+    if conf is None or conf == 0.0:
         return "NO_DATA"
     if conf >= 0.70:
         return "🔥 STRONG"
@@ -168,10 +199,17 @@ def signal_quality(conf: Optional[float]) -> str:
         return "⚠️ WEAK"
     return "❌ NOISE"
 
-# =====================================================
+
+# ======================================================
 # Compute signal (CORE)
-# =====================================================
+# ======================================================
 def compute_signal(ticker: str, window_days: int = DEFAULT_WINDOW) -> Dict[str, Any]:
+    """
+    Retorna siempre un dict con al menos {"ticker": ticker, "error": ...}
+    NUNCA retorna None — alpha_engine puede hacer .get() sin riesgo.
+
+    [S4] Todos los early-returns son dicts válidos, no None.
+    """
     cache_key = f"{ticker}_{window_days}"
 
     with _cache_lock:
@@ -185,48 +223,100 @@ def compute_signal(ticker: str, window_days: int = DEFAULT_WINDOW) -> Dict[str, 
 
     preds = list_json_files(pred_dir)
     if not preds:
-        return {"ticker": ticker, "error": "NO_PREDICTIONS"}
+        return {"ticker": ticker, "error": "NO_PREDICTIONS", "confidence": 0.0, "rolling_metrics": _DEFAULT_METRICS}
 
     last = load_json(pred_dir / preds[-1])
-    if "prediction" not in last or "meta" not in last:
-        return {"ticker": ticker, "error": "INVALID_PREDICTION"}
+    if not last or "prediction" not in last or "meta" not in last:
+        return {"ticker": ticker, "error": "INVALID_PREDICTION", "confidence": 0.0, "rolling_metrics": _DEFAULT_METRICS}
 
     p = last["prediction"]
+
+    # --------------------------------------------------
+    # [S1] Validar ret_ens_pct antes de cualquier operación
+    # --------------------------------------------------
+    ret_ens_pct = p.get("ret_ens_pct")
+    if ret_ens_pct is None:
+        logger.warning(f"⚠️ [{ticker}] ret_ens_pct es None en JSON de predicción — ticker saltado")
+        return {
+            "ticker": ticker,
+            "error": "ret_ens_pct_null",
+            "confidence": 0.0,
+            "rolling_metrics": _DEFAULT_METRICS,
+        }
+
+    ret_ens_pct = float(ret_ens_pct)
+
+    # --------------------------------------------------
+    # [S3] Validar price_now y price_pred
+    # --------------------------------------------------
+    price_now = p.get("price_now")
+    price_pred = p.get("price_pred")
+
+    if price_now is None or price_pred is None:
+        logger.warning(f"⚠️ [{ticker}] price_now o price_pred es None")
+        return {
+            "ticker": ticker,
+            "error": "price_null",
+            "confidence": 0.0,
+            "rolling_metrics": _DEFAULT_METRICS,
+        }
+
+    price_now = float(price_now)
+    price_pred = float(price_pred)
+
+    # --------------------------------------------------
+    # Evaluaciones + métricas
+    # --------------------------------------------------
     evals = [load_json(eval_dir / f) for f in list_json_files(eval_dir)]
-
     metrics = rolling_metrics(evals, window_days)
-    conf = confidence_score(p["ret_ens_pct"], metrics) if metrics else None
-    quality = signal_quality(conf)
-    strength = min(abs(p["ret_ens_pct"]) / 3.0, 1.0)
 
-    # =========================
+    # [S2] rolling_metrics nunca llega como None al alpha_engine
+    metrics_safe = metrics if metrics is not None else _DEFAULT_METRICS
+
+    # --------------------------------------------------
+    # Confidence + quality
+    # --------------------------------------------------
+    conf = confidence_score(ret_ens_pct, metrics)  # [S5] siempre float
+    quality = signal_quality(conf)
+    strength = min(abs(ret_ens_pct) / 3.0, 1.0)   # [S1] ret_ens_pct ya validado
+
+    # --------------------------------------------------
     # FUNDAMENTAL CONTEXT
-    # =========================
-    fundamental = fundamental_signal_context(ticker) if FUNDAMENTAL_AVAILABLE else {"usable": False}
+    # --------------------------------------------------
+    fundamental = (
+        fundamental_signal_context(ticker)
+        if FUNDAMENTAL_AVAILABLE
+        else {"usable": False}
+    )
+
+    # Asegurar que fundamental nunca sea None
+    if fundamental is None:
+        fundamental = {"usable": False}
 
     fundamental_flag = None
     if fundamental.get("usable"):
-        mp = fundamental.get("mispricing_pct", 0)
-        if mp <= -30:
-            fundamental_flag = "🟢 DEEP_VALUE"
-        elif mp >= 30:
-            fundamental_flag = "🔴 OVERHEATED"
+        mp = fundamental.get("mispricing_pct")
+        if mp is not None:
+            if mp <= -30:
+                fundamental_flag = "🟢 DEEP_VALUE"
+            elif mp >= 30:
+                fundamental_flag = "🔴 OVERHEATED"
 
     result = {
         "ticker": ticker,
-        "date": p["date_base"],
-        "recommendation": p["recommendation"],
-        "ret_ens_pct": round(p["ret_ens_pct"], 2),
-        "price_now": round(p["price_now"], 2),
-        "price_pred": round(p["price_pred"], 2),
-        "confidence": conf,
+        "date": p.get("date_base"),
+        "recommendation": p.get("recommendation"),
+        "ret_ens_pct": round(ret_ens_pct, 2),
+        "price_now": round(price_now, 2),
+        "price_pred": round(price_pred, 2),
+        "confidence": conf,                          # [S5] siempre float
         "quality": quality,
         "signal_strength": round(strength, 3),
-        "rolling_metrics": metrics,
+        "rolling_metrics": metrics_safe,             # [S2] siempre dict
         "fundamental": fundamental if fundamental.get("usable") else None,
         "fundamental_flag": fundamental_flag,
-        "horizon_days": last["meta"]["horizon_days"],
-        "theta": last["meta"]["theta"],
+        "horizon_days": last["meta"].get("horizon_days"),
+        "theta": last["meta"].get("theta"),
         "_cached_at": datetime.utcnow().isoformat(),
     }
 
@@ -235,9 +325,10 @@ def compute_signal(ticker: str, window_days: int = DEFAULT_WINDOW) -> Dict[str, 
 
     return result
 
-# =====================================================
+
+# ======================================================
 # Batch
-# =====================================================
+# ======================================================
 def compute_all_signals(window_days: int = DEFAULT_WINDOW) -> List[Dict[str, Any]]:
     tickers = load_universe()
     if not tickers:
@@ -250,14 +341,23 @@ def compute_all_signals(window_days: int = DEFAULT_WINDOW) -> List[Dict[str, Any
             try:
                 out.append(f.result())
             except Exception as e:
-                out.append({"ticker": futs[f], "error": str(e)})
+                # [S4] Incluso si compute_signal explota inesperadamente, retornar dict válido
+                ticker = futs[f]
+                logger.error(f"❌ compute_signal thread error {ticker}: {e}")
+                out.append({
+                    "ticker": ticker,
+                    "error": str(e),
+                    "confidence": 0.0,
+                    "rolling_metrics": _DEFAULT_METRICS,
+                })
 
     out.sort(key=lambda s: (-(s.get("confidence") or 0), -(s.get("signal_strength") or 0)))
     return out
 
-# =====================================================
+
+# ======================================================
 # CLI
-# =====================================================
+# ======================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--window", type=int, default=DEFAULT_WINDOW)
@@ -269,9 +369,10 @@ if __name__ == "__main__":
     signals = compute_all_signals(args.window)
 
     for s in signals:
-        if s.get("confidence", 0) >= args.min_conf:
+        if (s.get("confidence") or 0) >= args.min_conf:
             print(
-                f"{s['ticker']:>6} | {s['quality']:>8} | "
-                f"{s.get('fundamental_flag','–'):>12} | "
-                f"{s['confidence']:.3f} | {s['ret_ens_pct']:+.2f}%"
-            )
+                f"{s['ticker']:>6} | {s.get('quality', 'N/A'):>8} | "
+                f"{s.get('fundamental_flag', '–'):>12} | "
+                f"{s.get('confidence', 0):.3f} | {s.get('ret_ens_pct', 0):+.2f}%"
+        )
+                
