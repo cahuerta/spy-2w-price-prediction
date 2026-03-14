@@ -10,24 +10,68 @@ DATA_DIR = "predictions_data"   # donde escriben H1-H10
 FINAL_DIR = "/data/predictions" # donde va el resultado final
 
 # ======================================================
+# FIXES v7.1:
+#   [O1] extract_price_prediction — valor existe pero es None → float(None) crash
+#   [O2] extract_return_pct — mismo patrón que O1
+#   [O3] collect_results — normalized_ret None si extract_return_pct falla
+#   [O4] build_model_json — h10_json puede tener prediction con nulls
+#   [O5] run() — raise RuntimeError si < 5 modelos, pero model_runner
+#                lo captura como ERROR y NO graba nada (correcto)
+#   [O6] ÚNICO DUEÑO DE ESCRITURA — solo el orquestador graba en disco
+#        model_runner NO debe volver a guardar el resultado
+# ======================================================
+
+
+# ======================================================
 # UTILIDADES
 # ======================================================
 
 def extract_price_prediction(data):
-    for k in ["price_pred"]:
-        if k in data:
-            return float(data[k])
-    if "prediction" in data:
-        return float(data["prediction"]["price_pred"])
+    """
+    [O1] Verifica que el valor no sea None antes de float().
+    Retorna None si no hay precio válido.
+    """
+    val = data.get("price_pred")
+    if val is not None:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            pass
+
+    pred = data.get("prediction")
+    if isinstance(pred, dict):
+        val = pred.get("price_pred")
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+
     return None
 
 
 def extract_return_pct(data):
+    """
+    [O2] Verifica que el valor no sea None antes de float().
+    Retorna 0.0 como fallback seguro.
+    """
     for k in ["return_pct", "ret_ens_pct"]:
-        if k in data:
-            return float(data[k])
-    if "prediction" in data:
-        return float(data["prediction"]["ret_ens_pct"])
+        val = data.get(k)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+
+    pred = data.get("prediction")
+    if isinstance(pred, dict):
+        val = pred.get("ret_ens_pct")
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+
     return 0.0
 
 
@@ -70,21 +114,26 @@ class MasterOrchestrator:
 
                         data["horizon"] = h
 
+                        # [O1] extract_price_prediction ya es null-safe
                         price = extract_price_prediction(data)
                         if price is None:
+                            print(f"⚠️ H{h} sin price_pred válido — saltando")
                             continue
 
                         if self.price_today is None:
-                            self.price_today = (
+                            raw_price = (
                                 data.get("price_now")
                                 or data.get("price_today")
-                                or data.get("prediction", {}).get("price_now")
+                                or (data.get("prediction") or {}).get("price_now")
                             )
-                            if self.price_today is None:
-                                raise RuntimeError("price_today missing")
-                            self.price_today = float(self.price_today)
+                            if raw_price is None:
+                                print(f"⚠️ H{h} sin price_today — saltando")
+                                continue
+                            self.price_today = float(raw_price)
 
                         data["price_pred"] = price
+
+                        # [O3] extract_return_pct ya es null-safe, siempre float
                         data["normalized_ret"] = extract_return_pct(data)
 
                         curve.append(data)
@@ -126,7 +175,7 @@ class MasterOrchestrator:
         return {
             "days":       list(range(1, 10)),
             "price_path": smoothed.tolist(),
-            "price_now":  self.price_today   # ← NUEVO: el frontend lo necesita
+            "price_now":  self.price_today
         }
 
 
@@ -150,10 +199,24 @@ class MasterOrchestrator:
         if self.h10_json is None:
             raise RuntimeError("H10 missing")
 
+        # [O4] Validar que prediction exista y tenga campos críticos sin nulls
+        pred = self.h10_json.get("prediction")
+        if not pred or not isinstance(pred, dict):
+            raise RuntimeError(
+                f"[{self.ticker}] H10 prediction inválido o None"
+            )
+
+        required_fields = ["price_pred", "price_now", "ret_ens_pct", "theta_dynamic_pct"]
+        null_fields = [f for f in required_fields if pred.get(f) is None]
+        if null_fields:
+            raise RuntimeError(
+                f"[{self.ticker}] H10 campos críticos null: {null_fields}"
+            )
+
         final_json = self.h10_json.copy()
 
-        h10_price      = extract_price_prediction(self.h10_json)
-        curve_adjust   = self.analyze_curve(curve)
+        h10_price    = extract_price_prediction(self.h10_json)  # [O1] null-safe
+        curve_adjust = self.analyze_curve(curve)
 
         # consenso entre modelos
         consensus        = np.std([r["price_pred"] for r in self.results if r["horizon"] < 10])
@@ -169,11 +232,6 @@ class MasterOrchestrator:
         )
 
         final_json["price_curve"] = curve
-
-        # ── ANTES: solo guardaba el conteo ──────────────────────────
-        # final_json["ensemble_models"] = len(self.results)
-        #
-        # ── AHORA: guarda conteo + detalle de cada H ────────────────
         final_json["ensemble_models"] = len(self.results)
 
         final_json["models_diagnostics"] = {
@@ -189,13 +247,11 @@ class MasterOrchestrator:
 
 
 # ======================================================
-# RUN
+# RUN — [O6] ÚNICO DUEÑO DE ESCRITURA EN DISCO
 # ======================================================
 
     def run(self):
         os.makedirs(DATA_DIR, exist_ok=True)
-
-        valid_models = 0
 
         for i in range(1, 11):
             try:
@@ -204,17 +260,16 @@ class MasterOrchestrator:
                     [sys.executable, f"predictors_engine/predictor_h{i}.py", self.ticker],
                     check=True
                 )
-                valid_models += 1
-
             except subprocess.CalledProcessError as e:
                 print(f"❌ H{i} FALLÓ → revisar predictor_h{i}.py")
                 print(f"   Error: {e}")
 
         self.collect_results()
 
+        # [O5] Mínimo 5 modelos — si no, RuntimeError sube a model_runner
         if len(self.results) < 5:
             raise RuntimeError(
-                f"❌ Ensemble inválido → solo {len(self.results)} modelos válidos (mínimo 5)"
+                f"Ensemble inválido → solo {len(self.results)} modelos válidos (mínimo 5)"
             )
 
         missing = [h for h in range(1, 11) if h not in [r["horizon"] for r in self.results]]
@@ -222,18 +277,22 @@ class MasterOrchestrator:
             print(f"⚠️ Horizontes faltantes: {missing}")
 
         curve      = self.build_price_curve()
+
+        # [O4] build_model_json lanza RuntimeError si hay nulls → NO se graba nada
         final_json = self.build_model_json(curve)
 
+        # [O6] ÚNICA ESCRITURA — orquestador es el dueño del disco
         ticker_dir = os.path.join(FINAL_DIR, self.ticker)
         os.makedirs(ticker_dir, exist_ok=True)
 
         file_name   = datetime.utcnow().strftime("%Y-%m-%d") + ".json"
         output_file = os.path.join(ticker_dir, file_name)
 
-        os.makedirs(DATA_DIR, exist_ok=True)
-
-        with open(output_file, "w") as f:
+        # Escritura atómica con .tmp
+        tmp_file = output_file + ".tmp"
+        with open(tmp_file, "w") as f:
             json.dump(final_json, f, indent=2)
+        os.replace(tmp_file, output_file)
 
         print(f"💾 ENSEMBLE guardado: {output_file}")
         return final_json
@@ -246,7 +305,7 @@ class MasterOrchestrator:
 if __name__ == "__main__":
     ticker = (sys.argv[1] if len(sys.argv) > 1 else "SPY").upper()
 
-    print(f"🎯 MasterOrchestrator v7 → {ticker}")
+    print(f"🎯 MasterOrchestrator v7.1 → {ticker}")
     print("=" * 60)
 
     orch   = MasterOrchestrator(ticker)
