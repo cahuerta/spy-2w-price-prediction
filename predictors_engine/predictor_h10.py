@@ -2,6 +2,11 @@
 predictor_h10.py
 Adaptación de model.py para funcionar como H10 dentro del orchestrator.
 NO cambia la lógica matemática.
+
+FIX v10.1:
+  [N1] feat.iloc[-1] puede tener NaN en hurst_120/lags para tickers
+       con datos irregulares → ValueError: Input X contains NaN en PCA.
+       Fix: buscar última fila válida sin NaN en feature_cols.
 """
 
 import os
@@ -270,8 +275,23 @@ def _run_full_math_engine(
     y = train_df["y_fwd"].values
     model.fit(X, y)
 
-    last_row = feat.iloc[-1]
-    X_last = last_row[feature_cols].values.reshape(1, -1)
+    # [N1] feat.iloc[-1] puede tener NaN en hurst_120/lags para tickers
+    # con datos irregulares → ValueError: Input X contains NaN en PCA.
+    # Buscamos la última fila sin NaN en feature_cols.
+    feat_only = feat[feature_cols]
+    valid_rows = feat_only.dropna()
+    if len(valid_rows) == 0:
+        # Fallback: ffill + 0 si no hay ninguna fila limpia
+        last_values = feat_only.ffill().fillna(0).iloc[-1].values
+    else:
+        last_values = valid_rows.iloc[-1].values
+    # Guardia final para inf/-inf
+    if not np.all(np.isfinite(last_values)):
+        last_values = np.nan_to_num(last_values, nan=0.0, posinf=0.0, neginf=0.0)
+    X_last = last_values.reshape(1, -1)
+
+    # price_now desde última fila válida de Close (no feat.iloc[-1])
+    price_now = float(feat["Close"].dropna().iloc[-1])
 
     y_global = float(model.predict(X_last)[0])
 
@@ -291,7 +311,7 @@ def _run_full_math_engine(
 
     y_ens = w * y_knn + (1 - w) * y_global
 
-    recent_vol = float(feat["rv_60"].iloc[-1])
+    recent_vol = float(feat["rv_60"].dropna().iloc[-1])
     if not np.isfinite(recent_vol) or recent_vol <= 0:
         recent_vol = 0.02
 
@@ -302,7 +322,6 @@ def _run_full_math_engine(
 
     theta_dynamic = base_theta * vol_adjustment * quality_adjustment
 
-    price_now = float(last_row["Close"])
     price_pred = float(price_now * np.exp(y_ens))
 
     recommendation = (
@@ -404,3 +423,4 @@ if __name__ == "__main__":
 
     print(format_report(result))
     print(f"\n💾 Guardado: {output_path}")
+    
