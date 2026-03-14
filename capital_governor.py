@@ -1,5 +1,5 @@
-# capital_governor.py — CAPITAL GOVERNOR v2.6
-# ✅ 100% backward compatible v2.5
+# capital_governor.py — CAPITAL GOVERNOR v2.7
+# ✅ 100% backward compatible v2.6
 # ✅ Normaliza posiciones del broker (market_value/qty → price_now)
 # ✅ adjust_sizing con fallback cuando portfolio vacío
 # ✅ fixed_capital obligatorio
@@ -8,9 +8,15 @@
 #
 # FIX v2.6:
 #   [F1] adjust_sizing_after_closes(): calcula ES proyectado POST-cierre
-#        antes de evaluar aperturas de anclas.
-#        Antes: ES calculado con posiciones cíclicas → 54% → bloquea anclas
-#        Ahora: simula portfolio sin las posiciones cerradas → ES real → anclas entran
+#
+# FIX v2.7:
+#   [F2] ES se normalizaba sobre el portafolio concentrado (~$53k) sin
+#        considerar que representa solo el 5.3% del capital total ($1M).
+#        Resultado: ES=60% bloqueaba aperturas cuando el riesgo real era ~3%.
+#        Fix: calcular effective_es = es_portfolio × (total_value / fixed_capital)
+#        El umbral de bloqueo ahora se aplica sobre el ES efectivo del capital total.
+#   [F3] Umbral de bloqueo ajustado: 45% sobre ES efectivo (era 45% sobre ES portafolio)
+#        Equivale a bloquear solo cuando el portafolio completo tiene riesgo extremo real.
 
 from dataclasses import dataclass, asdict
 from typing import List, Dict
@@ -31,12 +37,17 @@ LOOKBACK_DAYS = 252
 CONFIDENCE_LEVEL = 0.95
 MARKET_BENCHMARK = "SPY"
 
+# [F2] Umbral de ES efectivo (sobre capital total, no sobre portafolio concentrado)
+ES_BLOCK_THRESHOLD = float(os.getenv("ES_BLOCK_THRESHOLD", "0.20"))  # 20% del capital total
+
 
 @dataclass
 class CapitalState:
     volatility_annual: float
     var_95_annual: float
     expected_shortfall_95_annual: float
+    effective_es: float                  # [F2] ES normalizado por peso en capital total
+    portfolio_weight: float              # [F2] % del capital total invertido
     beta_vs_spy: float
     total_value: float
     cash_reserve: float
@@ -53,17 +64,13 @@ class CapitalGovernor:
         if fixed_capital is None:
             fixed_capital = float(os.getenv("FIXED_CAPITAL", 1_000_000))
         self.fixed_capital = fixed_capital
-        logger.info(f"🏛 CapitalGovernor v2.6 | Capital: ${fixed_capital:,.0f}")
+        logger.info(f"🏛 CapitalGovernor v2.7 | Capital: ${fixed_capital:,.0f}")
 
     # =========================================================
     # NORMALIZADOR — broker → formato interno
     # =========================================================
     @staticmethod
     def _normalize_positions(positions: List[Dict]) -> List[Dict]:
-        """
-        Acepta posiciones del broker (market_value + avg_entry_price)
-        o el formato interno (price_now) y devuelve siempre formato interno.
-        """
         normalized = []
         for p in positions:
             pos = dict(p)
@@ -159,6 +166,11 @@ class CapitalGovernor:
 
         cash_reserve = self.fixed_capital - total_value
 
+        # [F2] ES efectivo = ES del portafolio × peso del portafolio en capital total
+        # Ejemplo: ES=60%, portafolio=$53k de $1M → effective_es = 60% × 5.3% = 3.2%
+        portfolio_weight = total_value / self.fixed_capital if self.fixed_capital > 0 else 0
+        effective_es = es_annual * portfolio_weight
+
         days = len(prices)
         data_quality = (
             "EXCELLENT" if days >= LOOKBACK_DAYS else
@@ -171,7 +183,9 @@ class CapitalGovernor:
         now_cl = now_utc.astimezone(CL_TIMEZONE)
 
         logger.info(
-            f"🏛 Vol:{portfolio_vol:.1%} VaR:{var_annual:.1%} ES:{es_annual:.1%} "
+            f"🏛 Vol:{portfolio_vol:.1%} VaR:{var_annual:.1%} "
+            f"ES:{es_annual:.1%} EffES:{effective_es:.1%} "
+            f"Weight:{portfolio_weight:.1%} "
             f"Beta:{beta:.2f} Cash:${cash_reserve:,.0f} Quality:{data_quality}"
         )
 
@@ -179,6 +193,8 @@ class CapitalGovernor:
             volatility_annual=round(float(portfolio_vol), 4),
             var_95_annual=round(float(var_annual), 4),
             expected_shortfall_95_annual=round(float(es_annual), 4),
+            effective_es=round(float(effective_es), 4),       # [F2]
+            portfolio_weight=round(float(portfolio_weight), 4), # [F2]
             beta_vs_spy=round(float(beta), 3),
             total_value=round(float(total_value), 2),
             cash_reserve=round(float(cash_reserve), 2),
@@ -188,13 +204,9 @@ class CapitalGovernor:
         )
 
     # =========================================================
-    # ADJUST SIZING — governor estándar (aperturas sin cierres previos)
+    # ADJUST SIZING — governor estándar
     # =========================================================
     def adjust_sizing(self, current_positions: List[Dict], candidates: List[Dict]) -> List[Dict]:
-        """
-        Sizing estándar — evalúa riesgo con portfolio actual.
-        Para rotaciones usar adjust_sizing_after_closes().
-        """
         if not current_positions:
             logger.info("📭 Portfolio vacío → sizing conservador sin cálculo de riesgo")
             safety_buffer = self.fixed_capital * 0.10
@@ -207,10 +219,12 @@ class CapitalGovernor:
             logger.error(f"❌ Error evaluando riesgo para sizing: {e}")
             return []
 
-        if state.expected_shortfall_95_annual > 0.45:
+        # [F2] Usar effective_es en vez de es_annual para el umbral de bloqueo
+        if state.effective_es > ES_BLOCK_THRESHOLD:
             logger.warning(
-                f"🛑 RIESGO EXTREMO: ES {state.expected_shortfall_95_annual:.2%}. "
-                f"Bloqueando aperturas."
+                f"🛑 RIESGO EXTREMO: EffES {state.effective_es:.2%} > {ES_BLOCK_THRESHOLD:.0%}. "
+                f"Bloqueando aperturas. (ES portafolio: {state.expected_shortfall_95_annual:.2%}, "
+                f"peso: {state.portfolio_weight:.1%})"
             )
             return []
 
@@ -220,12 +234,13 @@ class CapitalGovernor:
         logger.info(
             f"💰 Cash Reserve: ${state.cash_reserve:,.0f} | "
             f"Buffer: ${safety_buffer:,.0f} | "
-            f"Power: ${effective_buying_power:,.0f}"
+            f"Power: ${effective_buying_power:,.0f} | "
+            f"EffES: {state.effective_es:.2%}"
         )
 
         return self._size_candidates(
             candidates, effective_buying_power,
-            es=state.expected_shortfall_95_annual
+            es=state.effective_es  # [F2] pasar effective_es al sizer
         )
 
     # =========================================================
@@ -237,26 +252,11 @@ class CapitalGovernor:
         closes: List[str],
         candidates: List[Dict],
     ) -> List[Dict]:
-        """
-        [F1] Calcula el ES proyectado DESPUÉS de ejecutar los cierres,
-        luego decide si las anclas pueden entrar.
-
-        Parámetros:
-            current_positions: posiciones actuales (antes de cerrar)
-            closes: lista de tickers que se van a cerrar
-            candidates: anclas candidatas a abrir
-
-        Flujo:
-            1. Simula portfolio sin los tickers cerrados
-            2. Recalcula ES con portfolio limpio
-            3. Si ES <= 45% → anclas pueden entrar
-        """
         if not candidates:
             return []
 
         closes_upper = {c.upper() for c in closes}
 
-        # Simular portfolio post-cierre
         positions_after = [
             p for p in current_positions
             if p.get("ticker", "").upper() not in closes_upper
@@ -268,14 +268,12 @@ class CapitalGovernor:
             f"después={len(positions_after)}"
         )
 
-        # Portfolio queda vacío tras cierres → capital libre total
         if not positions_after:
             logger.info("✅ Portfolio vacío post-cierre → capital libre para anclas")
             safety_buffer = self.fixed_capital * 0.10
             buying_power = self.fixed_capital - safety_buffer
             return self._size_candidates(candidates, buying_power, es=0.0)
 
-        # Evaluar riesgo con portfolio limpio post-cierre
         try:
             normalized = self._normalize_positions(positions_after)
             state = self.evaluate(normalized)
@@ -285,12 +283,14 @@ class CapitalGovernor:
 
         logger.info(
             f"📊 ES post-cierre: {state.expected_shortfall_95_annual:.2%} | "
+            f"EffES post-cierre: {state.effective_es:.2%} | "
             f"Cash post-cierre: ${state.cash_reserve:,.0f}"
         )
 
-        if state.expected_shortfall_95_annual > 0.45:
+        # [F2] Usar effective_es también en post-cierre
+        if state.effective_es > ES_BLOCK_THRESHOLD:
             logger.warning(
-                f"🛑 ES post-cierre aún alto: {state.expected_shortfall_95_annual:.2%}. "
+                f"🛑 EffES post-cierre aún alto: {state.effective_es:.2%}. "
                 f"Bloqueando anclas."
             )
             return []
@@ -298,13 +298,11 @@ class CapitalGovernor:
         safety_buffer = self.fixed_capital * 0.10
         buying_power = max(0, state.cash_reserve - safety_buffer)
 
-        logger.info(
-            f"💰 Buying power para anclas: ${buying_power:,.0f}"
-        )
+        logger.info(f"💰 Buying power para anclas: ${buying_power:,.0f}")
 
         return self._size_candidates(
             candidates, buying_power,
-            es=state.expected_shortfall_95_annual
+            es=state.effective_es  # [F2]
         )
 
     # =========================================================
@@ -316,10 +314,10 @@ class CapitalGovernor:
         buying_power: float,
         es: float,
     ) -> List[Dict]:
-        """Sizing atómico — compartido por adjust_sizing y adjust_sizing_after_closes."""
-        if es > 0.35:
+        # [F2] risk_factor ahora usa effective_es que ya está normalizado
+        if es > 0.10:
             risk_factor = 0.5
-        elif es > 0.25:
+        elif es > 0.05:
             risk_factor = 0.8
         else:
             risk_factor = 1.0
@@ -348,7 +346,7 @@ class CapitalGovernor:
                 cand.setdefault("meta", {})["governor_adj"] = {
                     "original_shares": requested_shares,
                     "risk_factor": risk_factor,
-                    "es_at_execution": round(es, 4),
+                    "effective_es_at_execution": round(es, 4),
                 }
                 adjusted.append(cand)
                 remaining_power -= final_shares * price
@@ -371,6 +369,6 @@ if __name__ == "__main__":
 
     gov = CapitalGovernor(fixed_capital=1_000_000)
     state = gov.evaluate(positions)
-    print("🏛 CAPITAL GOVERNOR v2.6 HEDGE FUND")
+    print("🏛 CAPITAL GOVERNOR v2.7")
     print(json.dumps(state.to_dict(), indent=2))
-        
+                                                         
