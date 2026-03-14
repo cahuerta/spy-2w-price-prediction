@@ -4,17 +4,21 @@
 #
 # FIX v2:
 #   [F1] Sharpe y Max Drawdown → solo retornos de COMPRA
-#        (lo que realmente se ejecutó)
 #   [F2] Win Rate → todas las decisiones (COMPRA + VENDE + MANTÉN)
-#        Vender a tiempo es un win, se mantiene con decision_correct
-#   [F3] Se agrega buy_sharpe_ratio y buy_max_drawdown_pct
-#        como campos explícitos (backward compatible)
+#   [F3] buy_sharpe_ratio y buy_max_drawdown_pct explícitos
 #   [F4] evaluated_buy_predictions como contador de COMPRAs evaluadas
+#
+# FIX v3 (equity-curve):
+#   [EC1] Agrupación diaria — evita zigzag intraday por múltiples
+#         evaluaciones el mismo día (retorno diario = promedio del día)
+#   [EC2] ticker vacío → se lee desde path del archivo como fallback
+#   [EC3] n_trades ahora refleja días únicos, no evaluaciones individuales
 # =========================================================
 
 import os
 import json
 import numpy as np
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
@@ -81,12 +85,10 @@ def compute_model_metrics():
 
     errors = []
 
-    # [F1] retornos separados: todos vs solo COMPRA
-    returns_all = []       # para referencia interna (no se usa en Sharpe)
-    returns_buy = []       # [F1] Sharpe y MaxDD solo sobre COMPRAs
-    evaluated_buy = 0      # [F4] contador de COMPRAs evaluadas
+    returns_all = []
+    returns_buy = []
+    evaluated_buy = 0
 
-    # métricas por modelo H1-H10
     model_errors: Dict[str, List[float]] = {}
     model_hits: Dict[str, List[int]] = {}
 
@@ -103,8 +105,6 @@ def compute_model_metrics():
 
         evaluated += 1
 
-        # [F2] Win Rate: todas las decisiones (decision_correct ya evalúa
-        # COMPRA/VENDE/MANTÉN correctamente — vender a tiempo es un win)
         if data.get("decision_correct") is True:
             correct += 1
 
@@ -114,13 +114,11 @@ def compute_model_metrics():
         real_ret = float(data["real_return_pct"])
         returns_all.append(real_ret)
 
-        # [F1] Solo acumular retornos de COMPRA para Sharpe/MaxDD
         rec = (data.get("recommendation") or "").strip().upper()
         if rec == "COMPRA":
             returns_buy.append(real_ret)
             evaluated_buy += 1
 
-        # métricas por modelo H1-H10
         models = data.get("models_diagnostics", {})
         for model, mdata in models.items():
             err = mdata.get("error_pct")
@@ -132,14 +130,12 @@ def compute_model_metrics():
 
     pending = total - evaluated
 
-    # [F2] Win Rate sobre todas las decisiones evaluadas
     win_rate = round((correct / evaluated) * 100, 2) if evaluated > 0 else None
     avg_error = round(np.mean(errors), 4) if errors else None
 
     sharpe = None
     max_dd = None
 
-    # [F1] Sharpe y MaxDD solo sobre retornos de COMPRA
     if returns_buy:
         buy_arr = np.array(returns_buy) / 100.0
 
@@ -154,7 +150,6 @@ def compute_model_metrics():
         drawdowns = (equity_curve - running_max) / running_max
         max_dd = round(float(np.min(drawdowns)) * 100, 2)
 
-    # performance por modelo H1-H10
     models_perf = {}
     for model in model_errors:
         errs = model_errors.get(model, [])
@@ -168,14 +163,14 @@ def compute_model_metrics():
         }
 
     return {
-        "win_rate_pct": win_rate,                        # todas las decisiones
+        "win_rate_pct": win_rate,
         "avg_prediction_error_pct": avg_error,
         "total_predictions": total,
-        "evaluated_predictions": evaluated,              # todas evaluadas
-        "evaluated_buy_predictions": evaluated_buy,      # [F4] solo COMPRAs
+        "evaluated_predictions": evaluated,
+        "evaluated_buy_predictions": evaluated_buy,
         "pending_predictions": pending,
-        "sharpe_ratio": sharpe,                          # [F1] solo COMPRAs
-        "max_drawdown_pct": max_dd,                      # [F1] solo COMPRAs
+        "sharpe_ratio": sharpe,
+        "max_drawdown_pct": max_dd,
         "models_performance": models_perf,
     }
 
@@ -186,8 +181,6 @@ def compute_model_metrics():
 
 @router.get("/performance")
 async def performance():
-
-    # ================= ACCOUNT PERFORMANCE =================
 
     try:
         engine = get_engine()
@@ -217,13 +210,11 @@ async def performance():
             META_FILE.write_text(json.dumps(meta, indent=2))
 
         total_return_pct = round(
-            (equity - initial_equity) / initial_equity * 100,
-            2,
+            (equity - initial_equity) / initial_equity * 100, 2,
         )
 
         drawdown_pct = round(
-            (equity - high_water_mark) / high_water_mark * 100,
-            2,
+            (equity - high_water_mark) / high_water_mark * 100, 2,
         )
 
     else:
@@ -231,8 +222,6 @@ async def performance():
         total_return_pct = None
         drawdown_pct = None
         high_water_mark = None
-
-    # ================= MODEL METRICS =================
 
     model_metrics = compute_model_metrics()
 
@@ -242,38 +231,31 @@ async def performance():
         "drawdown_pct": drawdown_pct,
         "high_water_mark": high_water_mark,
         "since": meta["start_date"] if meta else None,
-
-        # Model quality — win rate sobre TODAS las decisiones
         "win_rate_pct": model_metrics["win_rate_pct"],
         "avg_prediction_error_pct": model_metrics["avg_prediction_error_pct"],
         "total_predictions": model_metrics["total_predictions"],
         "evaluated_predictions": model_metrics["evaluated_predictions"],
-        "evaluated_buy_predictions": model_metrics["evaluated_buy_predictions"],  # [F4]
+        "evaluated_buy_predictions": model_metrics["evaluated_buy_predictions"],
         "pending_predictions": model_metrics["pending_predictions"],
-
-        # Sharpe y MaxDD solo sobre COMPRAs ejecutadas [F1]
         "sharpe_ratio": model_metrics["sharpe_ratio"],
         "max_drawdown_pct": model_metrics["max_drawdown_pct"],
-
-        # Performance por modelo H1-H10
         "models_performance": model_metrics["models_performance"],
     }
-    
+
+
 # =========================================================
-# AGREGAR AL FINAL DE performance_router.py
-# =========================================================
-# /dashboard/equity-curve
-# Construye la curva de equity acumulada desde evaluaciones
-# Solo usa recomendaciones COMPRA (consistente con Sharpe/MaxDD)
+# EQUITY CURVE ENDPOINT
 # =========================================================
 
 @router.get("/equity-curve")
 async def equity_curve():
     """
     Retorna la curva de equity acumulada desde evaluaciones históricas.
-    - Solo cuenta retornos de COMPRA (lo que realmente se ejecutó)
-    - Usa capital inicial desde account_meta.json
-    - Formato: [{date, equity, return_pct}, ...]
+
+    [EC1] Agrupa por día — evita zigzag intraday por múltiples
+          evaluaciones el mismo día. Retorno diario = promedio del día.
+    [EC2] Fallback de ticker desde el path del archivo de evaluación.
+    [EC3] n_trades = días únicos con al menos una COMPRA evaluada.
     """
 
     files = list_evaluation_files()
@@ -281,24 +263,23 @@ async def equity_curve():
     if not files:
         return {"curve": [], "initial_equity": None, "current_equity": None}
 
-    # ── Recolectar retornos de COMPRA ordenados por fecha ──────────
-    entries = []
+    # ── Recolectar retornos de COMPRA agrupados por fecha ──────────
+    # [EC1] defaultdict para acumular múltiples retornos por día
+    daily_returns: dict = defaultdict(list)
+    daily_tickers: dict = defaultdict(list)
 
     for f in files:
         data = load_json(f)
         if not data:
             continue
 
-        # Solo evaluaciones con retorno real
         if data.get("real_return_pct") is None:
             continue
 
-        # Solo COMPRAs (consistente con Sharpe/MaxDD)
         rec = (data.get("recommendation") or "").strip().upper()
         if rec != "COMPRA":
             continue
 
-        # Fecha del cierre de la evaluación
         date_str = (
             data.get("evaluation_date")
             or data.get("close_date")
@@ -307,35 +288,46 @@ async def equity_curve():
         if not date_str:
             continue
 
-        entries.append({
-            "date": date_str[:10],  # solo YYYY-MM-DD
-            "return_pct": float(data["real_return_pct"]),
-            "ticker": data.get("ticker", ""),
-            "recommendation": rec,
-        })
+        date_key = date_str[:10]
 
-    if not entries:
+        daily_returns[date_key].append(float(data["real_return_pct"]))
+
+        # [EC2] ticker vacío → fallback desde path del archivo
+        ticker = data.get("ticker") or ""
+        if not ticker:
+            # path: /data/evaluations/AAPL/2026-03-11.json → "AAPL"
+            try:
+                ticker = f.parent.name
+            except Exception:
+                ticker = ""
+
+        daily_tickers[date_key].append(ticker)
+
+    if not daily_returns:
         return {"curve": [], "initial_equity": None, "current_equity": None}
-
-    # ── Ordenar por fecha ──────────────────────────────────────────
-    entries.sort(key=lambda x: x["date"])
 
     # ── Capital inicial desde meta ─────────────────────────────────
     meta = load_json(META_FILE)
     initial_equity = float(meta["initial_equity"]) if meta else 100_000.0
 
-    # ── Construir curva acumulada ──────────────────────────────────
+    # ── Construir curva diaria acumulada ───────────────────────────
+    # [EC1] Un punto por día, retorno = promedio de todas las COMPRAs del día
     curve = []
     equity = initial_equity
 
-    for e in entries:
-        ret = e["return_pct"] / 100.0
-        equity = equity * (1 + ret)
+    for date in sorted(daily_returns.keys()):
+        rets = daily_returns[date]
+        avg_ret = float(np.mean(rets))           # promedio del día
+        equity = equity * (1 + avg_ret / 100.0)
+
+        tickers_today = list(set(daily_tickers[date]))
+
         curve.append({
-            "date": e["date"],
+            "date": date,
             "equity": round(equity, 2),
-            "return_pct": round(e["return_pct"], 4),
-            "ticker": e["ticker"],
+            "return_pct": round(avg_ret, 4),     # retorno promedio del día
+            "n_trades": len(rets),               # cuántas COMPRAs ese día
+            "tickers": tickers_today,
         })
 
     current_equity = curve[-1]["equity"] if curve else initial_equity
@@ -344,7 +336,10 @@ async def equity_curve():
         "curve": curve,
         "initial_equity": round(initial_equity, 2),
         "current_equity": round(current_equity, 2),
-        "n_trades": len(curve),
+        "n_days": len(curve),        # [EC3] días únicos con COMPRAs
+        "n_trades": sum(            # total de evaluaciones individuales
+            p["n_trades"] for p in curve
+        ),
         "updated_at": datetime.utcnow().isoformat(),
-    }
+        }
     
