@@ -259,3 +259,92 @@ async def performance():
         "models_performance": model_metrics["models_performance"],
     }
     
+# =========================================================
+# AGREGAR AL FINAL DE performance_router.py
+# =========================================================
+# /dashboard/equity-curve
+# Construye la curva de equity acumulada desde evaluaciones
+# Solo usa recomendaciones COMPRA (consistente con Sharpe/MaxDD)
+# =========================================================
+
+@router.get("/equity-curve")
+async def equity_curve():
+    """
+    Retorna la curva de equity acumulada desde evaluaciones históricas.
+    - Solo cuenta retornos de COMPRA (lo que realmente se ejecutó)
+    - Usa capital inicial desde account_meta.json
+    - Formato: [{date, equity, return_pct}, ...]
+    """
+
+    files = list_evaluation_files()
+
+    if not files:
+        return {"curve": [], "initial_equity": None, "current_equity": None}
+
+    # ── Recolectar retornos de COMPRA ordenados por fecha ──────────
+    entries = []
+
+    for f in files:
+        data = load_json(f)
+        if not data:
+            continue
+
+        # Solo evaluaciones con retorno real
+        if data.get("real_return_pct") is None:
+            continue
+
+        # Solo COMPRAs (consistente con Sharpe/MaxDD)
+        rec = (data.get("recommendation") or "").strip().upper()
+        if rec != "COMPRA":
+            continue
+
+        # Fecha del cierre de la evaluación
+        date_str = (
+            data.get("evaluation_date")
+            or data.get("close_date")
+            or data.get("date_base")
+        )
+        if not date_str:
+            continue
+
+        entries.append({
+            "date": date_str[:10],  # solo YYYY-MM-DD
+            "return_pct": float(data["real_return_pct"]),
+            "ticker": data.get("ticker", ""),
+            "recommendation": rec,
+        })
+
+    if not entries:
+        return {"curve": [], "initial_equity": None, "current_equity": None}
+
+    # ── Ordenar por fecha ──────────────────────────────────────────
+    entries.sort(key=lambda x: x["date"])
+
+    # ── Capital inicial desde meta ─────────────────────────────────
+    meta = load_json(META_FILE)
+    initial_equity = float(meta["initial_equity"]) if meta else 100_000.0
+
+    # ── Construir curva acumulada ──────────────────────────────────
+    curve = []
+    equity = initial_equity
+
+    for e in entries:
+        ret = e["return_pct"] / 100.0
+        equity = equity * (1 + ret)
+        curve.append({
+            "date": e["date"],
+            "equity": round(equity, 2),
+            "return_pct": round(e["return_pct"], 4),
+            "ticker": e["ticker"],
+        })
+
+    current_equity = curve[-1]["equity"] if curve else initial_equity
+
+    return {
+        "curve": curve,
+        "initial_equity": round(initial_equity, 2),
+        "current_equity": round(current_equity, 2),
+        "n_trades": len(curve),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    
