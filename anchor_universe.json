@@ -3,60 +3,160 @@
     "ticker": "KO",
     "name": "Coca-Cola",
     "reason": "Consumer staples, beta 0.6, dividendo 60 años consecutivos",
-    "sector": "consumer_staples"
+    "sector": "consumer_staples",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "PG",
     "name": "Procter & Gamble",
     "reason": "Consumer staples global, muy estable, dividendo 67 años",
-    "sector": "consumer_staples"
+    "sector": "consumer_staples",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "JNJ",
     "name": "Johnson & Johnson",
     "reason": "Healthcare defensivo clásico, dividendo 60 años",
-    "sector": "healthcare"
+    "sector": "healthcare",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "MCD",
     "name": "McDonald's",
     "reason": "Consumer defensivo global, pricing power, dividendo estable",
-    "sector": "consumer_discretionary"
+    "sector": "consumer_discretionary",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "GILD",
     "name": "Gilead Sciences",
     "reason": "Pharma defensivo, bajo beta, alto alpha actual",
-    "sector": "healthcare"
+    "sector": "healthcare",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "GLW",
     "name": "Corning",
     "reason": "Industrial defensivo, bajo beta, alto alpha actual",
-    "sector": "industrials"
+    "sector": "industrials",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "WMT",
     "name": "Walmart",
     "reason": "Retail defensivo, crisis-proof, crece en recesión",
-    "sector": "consumer_staples"
+    "sector": "consumer_staples",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "VZ",
     "name": "Verizon",
     "reason": "Telecom, beta 0.4, dividendo alto y estable",
-    "sector": "telecom"
+    "sector": "telecom",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "SO",
     "name": "Southern Company",
     "reason": "Utilities, máxima estabilidad, regulado, dividendo garantizado",
-    "sector": "utilities"
+    "sector": "utilities",
+    "market": "US",
+    "flag": "🇺🇸"
   },
   {
     "ticker": "BRK.B",
     "name": "Berkshire Hathaway B",
     "reason": "El ancla de anclas — diversificado, sin dividendo, máxima solidez",
-    "sector": "financials"
+    "sector": "financials",
+    "market": "US",
+    "flag": "🇺🇸"
+  },
+  {
+    "ticker": "IBE.MC",
+    "name": "Iberdrola",
+    "reason": "Utilities europeo, regulado, dividendo garantizado — equivalente a SO",
+    "sector": "utilities",
+    "market": "ES",
+    "flag": "🇪🇸"
+  },
+  {
+    "ticker": "SAN.MC",
+    "name": "Banco Santander",
+    "reason": "Financiero europeo líder, dividendo alto y consistente",
+    "sector": "financials",
+    "market": "ES",
+    "flag": "🇪🇸"
+  },
+  {
+    "ticker": "OR.PA",
+    "name": "L'Oréal",
+    "reason": "Consumer staples premium global, muy estable — equivalente a PG",
+    "sector": "consumer_staples",
+    "market": "FR",
+    "flag": "🇫🇷"
+  },
+  {
+    "ticker": "AIR.PA",
+    "name": "Airbus",
+    "reason": "Industrial defensivo europeo, backlog de 10 años, sin equivalente en lista USA",
+    "sector": "industrials",
+    "market": "FR",
+    "flag": "🇫🇷"
+  },
+  {
+    "ticker": "DTE.DE",
+    "name": "Deutsche Telekom",
+    "reason": "Telecom Europa, beta bajo, dividendo estable — equivalente a VZ",
+    "sector": "telecom",
+    "market": "DE",
+    "flag": "🇩🇪"
+  },
+  {
+    "ticker": "NOVN.SW",
+    "name": "Novartis",
+    "reason": "Healthcare defensivo europeo, dividendo 25+ años — equivalente a JNJ",
+    "sector": "healthcare",
+    "market": "CH",
+    "flag": "🇨🇭"
+  },
+  {
+    "ticker": "NESN.SW",
+    "name": "Nestlé",
+    "reason": "Consumer staples más defensivo de Europa, dividendo 25+ años — equivalente a KO",
+    "sector": "consumer_staples",
+    "market": "CH",
+    "flag": "🇨🇭"
+  },
+  {
+    "ticker": "RY.TO",
+    "name": "Royal Bank of Canada",
+    "reason": "Banco más sólido de Norteamérica, dividendo estable, AAA implícito",
+    "sector": "financials",
+    "market": "CA",
+    "flag": "🇨🇦"
+  },
+  {
+    "ticker": "ENB.TO",
+    "name": "Enbridge",
+    "reason": "Utilities/energía Canadá, dividendo 28 años consecutivos, regulado",
+    "sector": "utilities",
+    "market": "CA",
+    "flag": "🇨🇦"
+  },
+  {
+    "ticker": "MFC.TO",
+    "name": "Manulife Financial",
+    "reason": "Financiero/seguros defensivo Canada, bajo beta, dividendo constante",
+    "sector": "financials",
+    "market": "CA",
+    "flag": "🇨🇦"
   }
 ]
