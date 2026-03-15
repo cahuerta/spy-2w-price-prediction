@@ -1,7 +1,7 @@
 # =========================================================
 # screener_data_layer.py
 # Screener Profesional — ESTABLE Y OPTIMIZADO
-# Universo = sp500.json con rotación diaria
+# Universo = SP500 local (primario) con rotación diaria
 # Datos = Yahoo (rápido y concurrente)
 # =========================================================
 
@@ -23,7 +23,7 @@ from datetime import date
 LOOKBACK_DAYS     = int(os.getenv("SCREENER_LOOKBACK", "90"))
 MIN_REQUIRED_DAYS = 15
 MAX_CONCURRENT    = 8
-MAX_UNIVERSE      = 300   # slice diario
+MAX_UNIVERSE      = 300
 
 BASE_DIR         = Path(__file__).resolve().parent
 LOCAL_SP500_FILE = BASE_DIR / "sp500.json"
@@ -37,7 +37,7 @@ if not logger.handlers:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%H:%M:%S"
     )
 
 # =========================================================
@@ -76,18 +76,18 @@ def _get_sp500_local() -> List[str]:
 def _daily_slice(symbols: List[str], slice_size: int = MAX_UNIVERSE) -> List[str]:
     """
     Rotación por día del año.
-    Con 534 tickers y slice=300 -> ciclo completo cada 2 días.
+    Con ~549 tickers y slice=300 → ciclo completo cada 2 días.
 
-    día 0  -> [0:300]
-    día 1  -> [267:534] (wrap si necesario)
-    día 2  -> igual que día 0
+    día 0 → [0:300]
+    día 1 → [150:450]  (avanza medio slice)
+    día 2 → [300:549] + [0:51]  (wrap circular)
     """
     total = len(symbols)
     if total <= slice_size:
         return symbols
 
     day_of_year = date.today().timetuple().tm_yday  # 1..365
-    step        = slice_size // 2                   # avanza medio slice por día
+    step        = slice_size // 2                   # avanza 150 por día
     offset      = (day_of_year * step) % total
 
     if offset + slice_size <= total:
@@ -97,23 +97,26 @@ def _daily_slice(symbols: List[str], slice_size: int = MAX_UNIVERSE) -> List[str
 
 
 def _discover_universe() -> List[str]:
-    logger.info("Discovering universe (rotacion diaria)...")
+    logger.info("🔍 Discovering universe (rotación diaria)...")
 
     symbols = _get_sp500_local()
     if not symbols:
-        logger.warning("No symbols available")
+        logger.warning("⚠️ No symbols available")
         return []
 
     sliced = _daily_slice(symbols)
 
-    usa = sum(1 for s in sliced if not any(s.endswith(x) for x in (".MC", ".DE", ".PA", ".AS")))
-    eu  = len(sliced) - usa
+    intl = sum(1 for s in sliced if any(
+        s.upper().endswith(x) for x in (".MC", ".DE", ".PA", ".AS", ".SW", ".TO", ".SN", ".SCL")
+    ))
+    usa = len(sliced) - intl
 
     logger.info(
-        f"Slice hoy: {len(sliced)} tickers "
-        f"({usa} USA / {eu} Europa) "
-        f"dia {date.today().timetuple().tm_yday}"
+        f"📊 Slice hoy: {len(sliced)} tickers "
+        f"({usa} USA / {intl} Internacional) "
+        f"— día {date.today().timetuple().tm_yday}"
     )
+
     return sliced
 
 # =========================================================
@@ -150,7 +153,7 @@ def _fetch_from_yahoo(symbol):
             period=f"{LOOKBACK_DAYS}d",
             progress=False,
             auto_adjust=True,
-            threads=False,
+            threads=False
         )
         if df is None or df.empty:
             return None
@@ -162,6 +165,7 @@ def _fetch_from_yahoo(symbol):
 # PUBLIC API (CONTRATO NO CAMBIA)
 # =========================================================
 def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
+
     data = _fetch_from_yahoo(symbol)
     if data is None:
         return None
@@ -181,18 +185,17 @@ def fetch_symbol_data(symbol: str) -> Optional[Dict[str, Any]]:
 
 def fetch_multiple_symbols(
     symbols:        Optional[List[str]] = None,
-    max_concurrent: Optional[int]       = None,
-) -> List[Dict[str, Any]]:
-
+    max_concurrent: Optional[int]       = None
+):
     if symbols is None:
         symbols = _discover_universe()
 
     if not symbols:
-        logger.warning("No symbols discovered")
+        logger.warning("⚠️ No symbols discovered")
         return []
 
     workers = max_concurrent or MAX_CONCURRENT
-    logger.info(f"Fetching {len(symbols)} symbols (workers={workers})")
+    logger.info(f"Fetching data for {len(symbols)} symbols (workers={workers})")
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(fetch_symbol_data, symbols))
