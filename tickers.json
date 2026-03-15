@@ -8,6 +8,13 @@
   "BIP",
   "MAIN",
   "MELI",
+  "WMT",
+  "VZ",
+  "SO",
+  "BRK.B",
+  "GILD",
+  "GLW",
+
   "SQM.SN",
   "COPEC.SN",
   "ENELAM.SN",
@@ -32,8 +39,19 @@
   "ENJOY.SN",
   "LIPIGAS.SN",
   "LTM.SN",
-  "WMT",
-  "VZ", 
-  "SO",
-  "BRK.B"
+
+  "IBE.MC",
+  "SAN.MC",
+
+  "OR.PA",
+  "AIR.PA",
+
+  "DTE.DE",
+
+  "NOVN.SW",
+  "NESN.SW",
+
+  "RY.TO",
+  "ENB.TO",
+  "MFC.TO"
 ]
