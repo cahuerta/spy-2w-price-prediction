@@ -11,11 +11,19 @@ from providers.yahoo_provider import get_price_history as yahoo_fetch
 from providers.twelve_provider import get_price_history as twelve_fetch
 from providers import chile_provider
 
+# ← CAMBIO 1: importar EODHD (solo si tienes la key configurada)
+EODHD_ENABLED = bool(os.getenv("EODHD_API_KEY"))
+if EODHD_ENABLED:
+    from providers.eodhd_provider import get_price_history as eodhd_fetch
+
 from market_data_cache import load_meta_cache
 
 logger = logging.getLogger("data_provider")
 
 DEFAULT_PROVIDER = os.getenv("DATA_PROVIDER", "cache").lower()
+
+# ← CAMBIO 2: sufijos europeos que van directo a EODHD
+EUROPEAN_SUFFIXES = (".MC", ".DE", ".XETRA", ".F", ".PA", ".AS", ".MI", ".BE")
 
 
 def get_fundamental_meta(ticker: str):
@@ -34,10 +42,11 @@ def get_price_history(
     Fachada con lógica de Fallback robusta.
 
     Orden de prioridad:
-    1. Cache (rápido)
-    2. Chile provider (si ticker .SN/.SCL)
-    3. Yahoo Finance
-    4. Twelve Data
+    1. Cache        (rápido)
+    2. Chile        (si ticker .SN/.SCL)
+    3. EODHD        (Europa + USA — si EODHD_API_KEY está configurada)
+    4. Yahoo Finance
+    5. Twelve Data
     """
 
     ticker_upper = ticker.upper()
@@ -64,12 +73,7 @@ def get_price_history(
     if ticker_upper.endswith((".SN", ".SCL")):
         try:
             logger.info(f"[DATA_PROVIDER] CHILE_PROVIDER → {ticker_upper}")
-
-            df = chile_provider.get_price_history(
-                ticker,
-                period,
-                interval
-            )
+            df = chile_provider.get_price_history(ticker, period, interval)
 
             if df is not None and not df.empty:
                 df = df.dropna()
@@ -80,16 +84,28 @@ def get_price_history(
             logger.warning(f"[DATA_PROVIDER] Chile provider error {ticker_upper}: {e}")
 
     # -----------------------------------------------------
-    # PASO 3 — YAHOO
+    # PASO 3 — EODHD (Europa nativo + USA confiable)
+    # ← CAMBIO 3: bloque nuevo, solo activo si tienes la key
+    # -----------------------------------------------------
+    if EODHD_ENABLED:
+        try:
+            logger.info(f"[DATA_PROVIDER] EODHD → {ticker_upper}")
+            df = eodhd_fetch(ticker, period, interval)
+
+            if df is not None and not df.empty:
+                df = df.dropna()
+                if not df.empty:
+                    return df
+
+        except Exception as e:
+            logger.warning(f"[DATA_PROVIDER] EODHD error {ticker_upper}: {e}")
+
+    # -----------------------------------------------------
+    # PASO 4 — YAHOO
     # -----------------------------------------------------
     try:
         logger.info(f"[DATA_PROVIDER] YAHOO → {ticker_upper}")
-
-        df = yahoo_fetch(
-            ticker,
-            period,
-            interval
-        )
+        df = yahoo_fetch(ticker, period, interval)
 
         if df is not None and not df.empty:
             df = df.dropna()
@@ -100,16 +116,11 @@ def get_price_history(
         logger.warning(f"[DATA_PROVIDER] Yahoo error {ticker_upper}: {e}")
 
     # -----------------------------------------------------
-    # PASO 4 — TWELVE DATA (último recurso)
+    # PASO 5 — TWELVE DATA (último recurso)
     # -----------------------------------------------------
     try:
         logger.info(f"[DATA_PROVIDER] TWELVE → {ticker_upper}")
-
-        df = twelve_fetch(
-            ticker,
-            period,
-            interval
-        )
+        df = twelve_fetch(ticker, period, interval)
 
         if df is not None and not df.empty:
             df = df.dropna()
@@ -125,5 +136,5 @@ def get_price_history(
     logger.critical(
         f"[DATA_PROVIDER] No se pudieron obtener datos para {ticker_upper}"
     )
-
     return pd.DataFrame()
+    
