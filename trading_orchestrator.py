@@ -1,5 +1,5 @@
 # =========================================================
-# trading_orchestrator.py — V3.2 ALPHA-CONSUMER
+# trading_orchestrator.py — V3.3 ALPHA-CONSUMER
 # ALPHA ENGINE EXTERNO | ORCHESTRATOR SOLO LEE
 # =========================================================
 #
@@ -16,6 +16,14 @@
 #        Fallback en cascada: caché → entry_price (nunca 0).
 #   [F4] Cancelar órdenes pendientes (held_for_orders) antes de
 #        intentar nuevas órdenes de cierre sobre el mismo ticker.
+#
+# FIX v3.3:
+#   [F5] _enrich_opens_with_price_and_shares(): los candidatos de
+#        Alpha Injection solo traían target_pct pero NO entry_price
+#        ni shares. El Governor (_size_candidates) los descartaba
+#        siempre → decisions=0 → nunca hubo aperturas.
+#        Fix: convertir target_pct → shares usando precio del caché
+#        ANTES de pasar al Governor.
 # =========================================================
 
 import logging
@@ -58,13 +66,13 @@ class TradingOrchestrator:
         self.alpha_neutral   = float(os.getenv("ALPHA_NEUTRAL",   "0.75"))
         self.alpha_defensive = float(os.getenv("ALPHA_DEFENSIVE", "0.85"))
 
-        self.alpha_elite      = float(os.getenv("ALPHA_ELITE",  "0.88"))
+        self.alpha_elite       = float(os.getenv("ALPHA_ELITE",  "0.88"))
         self.alpha_hold_shield = float(os.getenv("ALPHA_SHIELD", "0.75"))
-        self.alpha_kill       = float(os.getenv("ALPHA_KILL",   "-0.40"))
+        self.alpha_kill        = float(os.getenv("ALPHA_KILL",   "-0.40"))
 
         self.governor = CapitalGovernor(self.fixed_capital)
 
-        logger.info(f"🚀 v3.2 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.3 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
     # =========================================================
     # [F3] ENRIQUECER POSICIONES CON PRECIO ACTUAL
@@ -131,6 +139,76 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.warning(f"⚠️ update_prices falló: {e}")
 
+        return enriched
+
+    # =========================================================
+    # [F5] ENRIQUECER OPENS CON PRECIO Y SHARES — FIX v3.3
+    # =========================================================
+    def _enrich_opens_with_price_and_shares(self, opens: List[Dict]) -> List[Dict]:
+        """
+        Convierte target_pct → entry_price + shares usando el caché de mercado.
+
+        Problema raíz (v3.2): los candidatos de Alpha Injection llegaban al
+        Governor solo con target_pct=0.05. El Governor (_size_candidates) espera
+        entry_price y shares → los descartaba siempre → decisions=0.
+
+        Fallback de precio: caché → entry_price/price_now ya incluido en la orden.
+        Si no hay precio disponible, el ticker se salta con warning.
+        """
+        try:
+            from market_data_cache import get_last_price_from_cache
+        except ImportError:
+            get_last_price_from_cache = None
+
+        enriched = []
+
+        for o in opens:
+            ticker = o.get("ticker", "").upper()
+
+            # Si ya viene con shares y precio válido, pasar directo
+            if o.get("shares", 0) > 0 and (o.get("entry_price") or o.get("price_now")):
+                enriched.append(o)
+                continue
+
+            price = None
+
+            # 1️⃣ Intentar desde caché de mercado (precio de cierre más reciente)
+            if get_last_price_from_cache:
+                try:
+                    price = get_last_price_from_cache(ticker)
+                except Exception:
+                    pass
+
+            # 2️⃣ Fallback: precio ya incluido en la orden (pm_decisions puede traerlo)
+            if not price or float(price) <= 0:
+                price = o.get("entry_price") or o.get("price_now")
+
+            if not price or float(price) <= 0:
+                logger.warning(f"⚠️ {ticker} sin precio para sizing — saltado")
+                continue
+
+            price = float(price)
+            target_pct = float(o.get("target_pct", 0.05))
+            shares = int((self.fixed_capital * target_pct) // price)
+
+            if shares <= 0:
+                logger.warning(
+                    f"⚠️ {ticker} shares=0 con price={price:.2f} "
+                    f"target_pct={target_pct:.1%} capital={self.fixed_capital:,.0f} — saltado"
+                )
+                continue
+
+            o = dict(o)
+            o["entry_price"] = price
+            o["shares"] = shares
+            enriched.append(o)
+
+            logger.info(
+                f"💡 [F5] {ticker} enriquecido: {shares}s @ ${price:.2f} "
+                f"(target={target_pct:.1%} → ${shares * price:,.0f})"
+            )
+
+        logger.info(f"📦 Opens enriquecidos: {len(enriched)}/{len(opens)} válidos")
         return enriched
 
     # =========================================================
@@ -293,6 +371,9 @@ class TradingOrchestrator:
         opens_dict = {o["ticker"].upper(): o for o in opens}
         unique_opens = list(opens_dict.values())
 
+        # [F5] Enriquecer opens con precio y shares ANTES del Governor
+        unique_opens = self._enrich_opens_with_price_and_shares(unique_opens)
+
         # 5️⃣ GOVERNOR
         anchor_opens = [
             o for o in unique_opens
@@ -452,50 +533,4 @@ class TradingOrchestrator:
         return {
             "growth": self.alpha_growth,
             "defensive": self.alpha_defensive
-        }.get(mode, self.alpha_neutral)
-
-    async def _get_pm_decisions(
-        self,
-        mode: str,
-        positions: List[Dict],
-        signals: Dict,
-        anchor: List
-    ) -> List[Dict]:
-
-        decisions = []
-
-        try:
-            if mode == "growth":
-                pm = PMGrowth(self.fixed_capital)
-                for pos in positions:
-                    d = pm.evaluate_position(pos, signals.get(pos["ticker"]))
-                    if isinstance(d, dict):
-                        decisions.append(d)
-
-            elif mode == "defensive":
-                pm = PMDefensive()
-                raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
-
-                if isinstance(raw, list):
-                    decisions.extend([
-                        r if isinstance(r, dict) else r.to_dict()
-                        for r in raw
-                    ])
-                elif isinstance(raw, dict):
-                    decisions.extend(raw.get("decisions", []))
-
-            else:
-                pm = PMNeutral()
-                raw = pm.evaluate_portfolio(positions)
-                decisions.extend(raw.get("decisions", []))
-
-        except Exception as e:
-            logger.error(f"PM error: {e}")
-
-        return decisions
-
-    def _daily_flag_check(self) -> bool:
-        if not self.flag_file.exists():
-            return True
-        last_run = datetime.fromisoformat(self.flag_file.read_text().strip())
-        return last_run.date() != datetime.now(timezone.utc).date()
+        }.get(mode, sel
