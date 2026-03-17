@@ -13,10 +13,24 @@
 #        → tiene market_ctx completo al calcular s_market
 #   [F3] import os duplicado removido
 #   [F4] Numeración de pasos corregida en logs
+#
+# FIX v2.0 — SMART SKIP:
+#   [F5] Pasos 1-4 (Screener, Decider, Models, Evaluator) se
+#        saltean automáticamente si ya existe output del día.
+#        El pipeline puede llamarse N veces al día — solo la
+#        primera vez corre la matemática pesada. Las siguientes
+#        van directo al trading (pasos 5-9), que SIEMPRE corre.
+#
+#        Archivos que se chequean:
+#          - Screener:  screener_candidates.json  (mtime hoy UTC)
+#          - Decider:   tickers.json              (mtime hoy UTC)
+#          - Models:    predictions/**/<HOY>.json (cualquiera)
+#          - Evaluator: evaluations/<HOY>/        (cualquier json)
+#                    o  evaluations/*<HOY>*.json
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import traceback
 import os
@@ -47,6 +61,50 @@ logger = logging.getLogger("pipeline")
 
 
 # =========================================================
+# [F5] SMART SKIP — detectores de output del día
+# =========================================================
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _file_is_from_today(path: Path) -> bool:
+    """True si el archivo existe y fue modificado hoy (UTC)."""
+    if not path.exists():
+        return False
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return mtime.strftime("%Y-%m-%d") == _today_utc()
+
+
+def _screener_done_today(data_path: Path) -> bool:
+    return _file_is_from_today(data_path / "screener_candidates.json")
+
+
+def _decider_done_today(data_path: Path) -> bool:
+    return _file_is_from_today(data_path / "tickers.json")
+
+
+def _models_done_today(data_path: Path) -> bool:
+    """True si hay al menos un JSON de predicción con fecha de hoy."""
+    today = _today_utc()
+    pred_path = data_path / "predictions"
+    if not pred_path.exists():
+        return False
+    return any(pred_path.glob(f"**/{today}.json"))
+
+
+def _evaluator_done_today(data_path: Path) -> bool:
+    """True si hay al menos un JSON de evaluación con fecha de hoy."""
+    today = _today_utc()
+    eval_path = data_path / "evaluations"
+    if not eval_path.exists():
+        return False
+    by_folder = (eval_path / today).exists() and any((eval_path / today).glob("*.json"))
+    by_name   = any(eval_path.glob(f"*{today}*.json"))
+    return by_folder or by_name
+
+
+# =========================================================
 # BACKGROUND PIPELINE LOGIC
 # =========================================================
 async def _run_pipeline_logic(request: Request):
@@ -58,55 +116,74 @@ async def _run_pipeline_logic(request: Request):
 
     try:
         DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+        today = _today_utc()
 
         # -------------------------------------------------
         # 1️⃣ SCREENER
         # -------------------------------------------------
-        logger.info("🔍 [1/10] Screener...")
-        screener_out = await run_screener_async()
+        if _screener_done_today(DATA_PATH):
+            screener_file = DATA_PATH / "screener_candidates.json"
+            screener_out = json.loads(screener_file.read_text())
+            logger.info(f"⚡ [1/10] Screener SKIP — output de hoy existe | candidates={screener_out.get('n_candidates')}")
+        else:
+            logger.info("🔍 [1/10] Screener...")
+            screener_out = await run_screener_async()
 
-        screener_file = DATA_PATH / "screener_candidates.json"
-        screener_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = screener_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(screener_out, indent=2))
-        tmp.replace(screener_file)
+            screener_file = DATA_PATH / "screener_candidates.json"
+            screener_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = screener_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(screener_out, indent=2))
+            tmp.replace(screener_file)
 
-        logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
+            logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
 
         # -------------------------------------------------
         # 2️⃣ DECIDER
         # -------------------------------------------------
-        logger.info("🧠 [2/10] Decider...")
-        decider_out = run_decider()
-        logger.info(
-            f"✅ Decider OK | added={len(decider_out.get('added', []))} "
-            f"| total={decider_out.get('total')}"
-        )
+        if _decider_done_today(DATA_PATH):
+            tickers_data = json.loads((DATA_PATH / "tickers.json").read_text())
+            total = len(tickers_data) if isinstance(tickers_data, list) else tickers_data.get("total", "?")
+            logger.info(f"⚡ [2/10] Decider SKIP — tickers.json de hoy existe | total={total}")
+            decider_out = {"total": total, "added": []}
+        else:
+            logger.info("🧠 [2/10] Decider...")
+            decider_out = run_decider()
+            logger.info(
+                f"✅ Decider OK | added={len(decider_out.get('added', []))} "
+                f"| total={decider_out.get('total')}"
+            )
 
         # -------------------------------------------------
-        # 3️⃣ MODEL RUNNER — awaited para garantizar JSONs frescos
+        # 3️⃣ MODEL RUNNER
         # -------------------------------------------------
-        logger.info("📈 [3/10] Model runner...")
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, run_all_models)
-        logger.info("✅ Model runner OK")
+        if _models_done_today(DATA_PATH):
+            pred_count = sum(1 for _ in (DATA_PATH / "predictions").glob(f"**/{today}.json"))
+            logger.info(f"⚡ [3/10] Models SKIP — {pred_count} predicciones de hoy ya existen")
+        else:
+            logger.info("📈 [3/10] Model runner...")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, run_all_models)
+            logger.info("✅ Model runner OK")
 
         # -------------------------------------------------
         # 4️⃣ EVALUATOR
         # -------------------------------------------------
-        logger.info("📊 [4/10] Evaluator...")
-        evaluate_all()
-        logger.info("✅ Evaluator executed")
+        if _evaluator_done_today(DATA_PATH):
+            logger.info("⚡ [4/10] Evaluator SKIP — evaluaciones de hoy ya existen")
+        else:
+            logger.info("📊 [4/10] Evaluator...")
+            evaluate_all()
+            logger.info("✅ Evaluator executed")
 
         # -------------------------------------------------
-        # 5️⃣ MARKET QUANT
+        # 5️⃣ MARKET QUANT — siempre corre
         # -------------------------------------------------
         logger.info("📉 [5/10] Market quantitative context...")
         quant_ctx = run_market_state()
         logger.info(f"✅ Market quant OK | regime={quant_ctx.regime}")
 
         # -------------------------------------------------
-        # 6️⃣ MARKET QUALITATIVE
+        # 6️⃣ MARKET QUALITATIVE — siempre corre
         # -------------------------------------------------
         logger.info("🧠 [6/10] Market qualitative context...")
         qual_ctx = evaluate_qualitative_market()
@@ -116,7 +193,7 @@ async def _run_pipeline_logic(request: Request):
         )
 
         # -------------------------------------------------
-        # 7️⃣ MARKET ORCHESTRATOR
+        # 7️⃣ MARKET ORCHESTRATOR — siempre corre
         # -------------------------------------------------
         logger.info("🧭 [7/10] Market orchestration...")
         market_orch = MarketOrchestrator()
@@ -130,7 +207,7 @@ async def _run_pipeline_logic(request: Request):
         )
 
         # -------------------------------------------------
-        # 8️⃣ ALPHA ENGINE — después de modelos Y market_ctx
+        # 8️⃣ ALPHA ENGINE — siempre corre (relee predicciones del disco)
         # -------------------------------------------------
         logger.info("🧠 [8/10] Alpha engine...")
         tickers_file = DATA_PATH / "tickers.json"
@@ -142,7 +219,7 @@ async def _run_pipeline_logic(request: Request):
         )
 
         # -------------------------------------------------
-        # 9️⃣ TRADING ORCHESTRATOR — consume alpha_last.json
+        # 9️⃣ TRADING ORCHESTRATOR — siempre corre
         # -------------------------------------------------
         logger.info("🤖 [9/10] Trading orchestrator...")
         trading_orch = TradingOrchestrator()
@@ -209,12 +286,10 @@ async def run_pipeline(request: Request):
     if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
         raise HTTPException(403, "Invalid pipeline key")
 
-    # Lanza pipeline en background
     asyncio.create_task(_run_pipeline_logic(request))
 
-    # Responde inmediato al cron
     return {
         "status": "accepted",
         "timestamp": datetime.utcnow().isoformat(),
         }
-            
+    
