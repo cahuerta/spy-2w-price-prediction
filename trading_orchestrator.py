@@ -533,4 +533,50 @@ class TradingOrchestrator:
         return {
             "growth": self.alpha_growth,
             "defensive": self.alpha_defensive
-        }.get(mode, sel
+        }.get(mode, self.alpha_neutral)
+
+    async def _get_pm_decisions(
+        self,
+        mode: str,
+        positions: List[Dict],
+        signals: Dict,
+        anchor: List
+    ) -> List[Dict]:
+
+        decisions = []
+
+        try:
+            if mode == "growth":
+                pm = PMGrowth(self.fixed_capital)
+                for pos in positions:
+                    d = pm.evaluate_position(pos, signals.get(pos["ticker"]))
+                    if isinstance(d, dict):
+                        decisions.append(d)
+
+            elif mode == "defensive":
+                pm = PMDefensive()
+                raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
+
+                if isinstance(raw, list):
+                    decisions.extend([
+                        r if isinstance(r, dict) else r.to_dict()
+                        for r in raw
+                    ])
+                elif isinstance(raw, dict):
+                    decisions.extend(raw.get("decisions", []))
+
+            else:
+                pm = PMNeutral()
+                raw = pm.evaluate_portfolio(positions)
+                decisions.extend(raw.get("decisions", []))
+
+        except Exception as e:
+            logger.error(f"PM error: {e}")
+
+        return decisions
+
+    def _daily_flag_check(self) -> bool:
+        if not self.flag_file.exists():
+            return True
+        last_run = datetime.fromisoformat(self.flag_file.read_text().strip())
+        return last_run.date() != datetime.now(timezone.utc).date()
