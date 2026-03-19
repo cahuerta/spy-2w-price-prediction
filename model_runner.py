@@ -11,9 +11,14 @@
 #   [MR2] Respetar status=ERROR — loggear y continuar
 #   [MR3] NO guardar resultado — orquestador ya grabó
 #   [MR4] Conteo separado: ok / failed / skipped
+#
+# FIXES vMR-3:
+#   [MR5] gc.collect() entre tickers — libera RAM acumulada
+#         Complementa el fix O7 de master_orchestrator V7.3
 # =========================================================
 
 import os
+import gc
 import json
 import logging
 from pathlib import Path
@@ -110,6 +115,12 @@ def run_all_models():
         except Exception as e:
             failed += 1
             logger.error(f"❌ {t} error inesperado: {e}")
+
+        finally:
+            # [MR5] Liberar memoria entre tickers
+            # Los módulos de predictores quedan cacheados en importlib (correcto)
+            # pero los datos de entrenamiento (DataFrames, modelos sklearn) se liberan
+            gc.collect()
 
     logger.info(
         f"🏁 MODEL RUN FINALIZADO | OK={ok} | FAIL={failed} | SKIP={skipped}"
