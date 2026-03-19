@@ -42,7 +42,8 @@ MAX_ANCHOR_EXPOSURE_PCT = float(os.getenv("PM_DEF_MAX_ANCHOR_EXPO", "0.30"))
 ANCHOR_MIN_ALPHA = float(os.getenv("PM_DEF_ANCHOR_MIN_ALPHA", "0.65"))
 
 # Paths de archivos
-ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", "/data/anchor_universe.json"))
+_BASE_DIR = Path(__file__).resolve().parent  # directorio del repo donde vive pm_defensive.py
+ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", str(_BASE_DIR / "anchor_universe.json")))
 ALPHA_FILE = DATA_PATH / "alpha_last.json"
 
 logger = logging.getLogger("pm_defensive")
