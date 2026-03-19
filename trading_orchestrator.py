@@ -35,13 +35,29 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = CapitalGovernor(self.fixed_capital)
-        logger.info(f"🚀 v3.3 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.4 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
     def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
+        """
+        V3.4 — Precio directo desde Alpaca vía broker.get_positions().
+        Alpaca devuelve current_price en tiempo real → fuente más confiable para cierres.
+
+        Cascada:
+          1. broker.get_positions() → current_price de Alpaca (tiempo real)
+          2. entry_price guardado en el store
+          3. 1.0 como guardia de emergencia (loggea error)
+        """
+        # Obtener precios frescos del broker en una sola llamada
+        broker_price_map = {}
         try:
-            from market_data_cache import get_last_price_from_cache
-        except ImportError:
-            get_last_price_from_cache = None
+            broker_data = self.broker.get_positions()  # dict {TICKER: {current_price, ...}}
+            for ticker, data in broker_data.items():
+                cp = data.get("current_price") or data.get("price_now")
+                if cp and float(cp) > 0:
+                    broker_price_map[ticker.upper()] = float(cp)
+            logger.info(f"💹 Precios Alpaca obtenidos: {len(broker_price_map)} tickers")
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo obtener precios del broker: {e}")
 
         enriched = []
         price_map = {}
@@ -50,36 +66,25 @@ class TradingOrchestrator:
             ticker = str(pos.get("ticker", "")).upper()
             pos = dict(pos)
 
-            existing = pos.get("price_now")
-            if existing and float(existing) > 0:
-                enriched.append(pos)
-                continue
+            if ticker in broker_price_map:
+                # Fuente 1: Alpaca live — precio real en tiempo real
+                pos["price_now"] = broker_price_map[ticker]
+                price_map[ticker] = broker_price_map[ticker]
+                logger.debug(f"💹 {ticker} precio Alpaca: {broker_price_map[ticker]:.2f}")
 
-            cache_price = None
-            if get_last_price_from_cache:
-                try:
-                    cache_price = get_last_price_from_cache(ticker)
-                except Exception:
-                    pass
+            elif float(pos.get("entry_price", 0) or 0) > 0:
+                # Fuente 2: entry_price como fallback
+                pos["price_now"] = float(pos["entry_price"])
+                logger.warning(f"⚠️ {ticker} sin precio Alpaca — usando entry_price: {pos['price_now']:.2f}")
 
-            broker_price = pos.get("current_price") or pos.get("lastday_price")
-            entry_price = float(pos.get("entry_price", 0) or 0)
-
-            if cache_price and float(cache_price) > 0:
-                pos["price_now"] = float(cache_price)
-                price_map[ticker] = float(cache_price)
-            elif broker_price and float(broker_price) > 0:
-                pos["price_now"] = float(broker_price)
-                price_map[ticker] = float(broker_price)
-            elif entry_price > 0:
-                pos["price_now"] = entry_price
-                logger.warning(f"⚠️ {ticker} price_now fallback a entry_price: {entry_price}")
             else:
+                # Guardia de emergencia — este ticker NO se puede cerrar correctamente
                 pos["price_now"] = 1.0
-                logger.error(f"❌ {ticker} sin precio disponible — usando 1.0 como guardia")
+                logger.error(f"❌ {ticker} SIN PRECIO DISPONIBLE — usando 1.0, cierre puede fallar")
 
             enriched.append(pos)
 
+        # Persistir precios frescos en el store
         if price_map:
             try:
                 update_prices(price_map)
@@ -175,6 +180,7 @@ class TradingOrchestrator:
                     save_positions(positions)
                     logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
 
+        # V3.4: precio fresco desde Alpaca antes de cualquier evaluación
         positions = self._enrich_positions_with_price(positions)
 
         broker_positions = load_positions()
