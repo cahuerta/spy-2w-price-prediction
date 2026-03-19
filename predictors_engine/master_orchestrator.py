@@ -3,14 +3,15 @@ import json
 import numpy as np
 import pandas as pd
 import sys
-import subprocess
+import importlib
+import gc
 from datetime import datetime
 
 DATA_DIR = "predictions_data"   # donde escriben H1-H10
 FINAL_DIR = "/data/predictions" # donde va el resultado final
 
 # ======================================================
-# FIXES v7.1:
+# FIXES v7.3:
 #   [O1] extract_price_prediction — valor existe pero es None → float(None) crash
 #   [O2] extract_return_pct — mismo patrón que O1
 #   [O3] collect_results — normalized_ret None si extract_return_pct falla
@@ -19,6 +20,8 @@ FINAL_DIR = "/data/predictions" # donde va el resultado final
 #                lo captura como ERROR y NO graba nada (correcto)
 #   [O6] ÚNICO DUEÑO DE ESCRITURA — solo el orquestador graba en disco
 #        model_runner NO debe volver a guardar el resultado
+#   [O7] ELIMINAR SUBPROCESOS — predictores llamados in-process via importlib
+#        para evitar OOM en Render (700 arranques de intérprete Python eliminados)
 # ======================================================
 
 
@@ -247,7 +250,9 @@ class MasterOrchestrator:
 
 
 # ======================================================
-# RUN — [O6] ÚNICO DUEÑO DE ESCRITURA EN DISCO
+# RUN — V7.3 [O7] IN-PROCESS, SIN SUBPROCESOS
+# Antes: subprocess.run(predictor_hN.py) × 10 × 70 tickers = 700 procesos
+# Ahora: importlib.import_module() en el mismo proceso → RAM estable
 # ======================================================
 
     def run(self):
@@ -256,13 +261,36 @@ class MasterOrchestrator:
         for i in range(1, 11):
             try:
                 print(f"🚀 Ejecutando H{i}")
-                subprocess.run(
-                    [sys.executable, f"predictors_engine/predictor_h{i}.py", self.ticker],
-                    check=True
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"❌ H{i} FALLÓ → revisar predictor_h{i}.py")
-                print(f"   Error: {e}")
+
+                # [O7] Importar el módulo del predictor directamente
+                # Si ya fue importado antes (otro ticker), importlib lo reutiliza
+                # sin relanzar el intérprete — ahorro masivo de RAM
+                mod = importlib.import_module(f"predictors_engine.predictor_h{i}")
+
+                # Llamar la función run_predictor_hN(ticker)
+                func = getattr(mod, f"run_predictor_h{i}")
+                result = func(self.ticker)
+
+                if result is None:
+                    print(f"⚠️ H{i} retornó None — datos insuficientes, saltando")
+                    continue
+
+                # Guardar en disco (igual que hacía el __main__ de cada predictor)
+                filename = f"{self.ticker}_H{i}.json"
+                path = os.path.join(DATA_DIR, filename)
+                with open(path, "w") as f:
+                    json.dump(result, f, indent=2, default=str)
+
+            except AttributeError:
+                # La función run_predictor_hN no existe en ese módulo
+                print(f"❌ H{i} FALLÓ → función run_predictor_h{i}() no encontrada en predictor_h{i}.py")
+
+            except Exception as e:
+                print(f"❌ H{i} FALLÓ: {e}")
+
+            finally:
+                # [O7] Liberar memoria explícitamente entre horizontes
+                gc.collect()
 
         self.collect_results()
 
@@ -276,7 +304,7 @@ class MasterOrchestrator:
         if missing:
             print(f"⚠️ Horizontes faltantes: {missing}")
 
-        curve      = self.build_price_curve()
+        curve = self.build_price_curve()
 
         # [O4] build_model_json lanza RuntimeError si hay nulls → NO se graba nada
         final_json = self.build_model_json(curve)
@@ -305,7 +333,7 @@ class MasterOrchestrator:
 if __name__ == "__main__":
     ticker = (sys.argv[1] if len(sys.argv) > 1 else "SPY").upper()
 
-    print(f"🎯 MasterOrchestrator v7.1 → {ticker}")
+    print(f"🎯 MasterOrchestrator v7.3 → {ticker}")
     print("=" * 60)
 
     orch   = MasterOrchestrator(ticker)
@@ -314,3 +342,4 @@ if __name__ == "__main__":
     print("\n🏆 RESULTADO FINAL:")
     print(json.dumps(result["prediction"], indent=2))
     print(f"\n🎯 RECOMENDACIÓN: {result['prediction']['recommendation']}")
+        
