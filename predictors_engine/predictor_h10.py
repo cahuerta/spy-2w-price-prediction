@@ -358,7 +358,7 @@ def _run_full_math_engine(
 # API pública (CONTRATO INTACTO)
 # ======================================================
 
-def run_model(
+def run_predictor_h10 (
     ticker: str = "SPY",
     horizon: int = 1,
     pca_target: int = 50,
@@ -406,7 +406,7 @@ def format_report(result: dict) -> str:
 if __name__ == "__main__":
     ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
 
-    result = run_model(
+    result = run_predictor_h10 (
         ticker=ticker,
         horizon=10,
         pca_target=50,
