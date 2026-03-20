@@ -1,5 +1,5 @@
 """
-pm_defensive.py - DEFENSIVE POSITION MANAGER v1.6 PRODUCCION
+m_defensive.py - DEFENSIVE POSITION MANAGER v1.7 PRODUCCION
 
 DEFENSIVE != CASH
 DEFENSIVE = CAPITAL ANCLADO + RIESGO MINIMO
@@ -12,13 +12,17 @@ NO prediccion agresiva | USA alpha score real
 
 FIX v1.6:
   [F1] Lee anchor_universe.json directamente desde disco
-       Ya no depende de que el orchestrator pase anchor_universe
   [F2] is_anchor_asset() usa lista fija + alpha_score >= 0.65
-       Elimina campos imposibles (is_structural, volatility_1y, etc.)
   [F3] Rotación genera acción OPEN además de ROTATE
-       Para que el orchestrator pueda ejecutar la apertura del ancla
   [F4] _load_alpha_scores() lee alpha_last.json para validar
-       que el ancla tiene alpha real antes de rotar hacia ella
+
+FIX v1.7:
+  [F5] ANCHOR_MIN_ALPHA bajado a 0.30 — en modo defensivo
+       el objetivo es estar anclado, no maximizar alpha.
+       Alpha negativo = cierre. Alpha >= 0.30 = ancla válida.
+  [F6] Apertura proactiva de anchors — si hay cierres y anchors
+       elegibles disponibles, abre hasta 3 anchors directamente
+       sin necesitar non_anchors para rotar.
 """
 
 import os
@@ -39,10 +43,10 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 MAX_HOLD_DAYS_NON_ANCHOR = int(os.getenv("PM_DEF_MAX_HOLD_DAYS", "30"))
 CATASTROPHIC_STOP_PCT = float(os.getenv("PM_DEF_STOP_LOSS_CATA", "0.25"))
 MAX_ANCHOR_EXPOSURE_PCT = float(os.getenv("PM_DEF_MAX_ANCHOR_EXPO", "0.30"))
-ANCHOR_MIN_ALPHA = float(os.getenv("PM_DEF_ANCHOR_MIN_ALPHA", "0.65"))
+ANCHOR_MIN_ALPHA = float(os.getenv("PM_DEF_ANCHOR_MIN_ALPHA", "0.30"))  # [F5]
 
 # Paths de archivos
-_BASE_DIR = Path(__file__).resolve().parent  # directorio del repo donde vive pm_defensive.py
+_BASE_DIR = Path(__file__).resolve().parent
 ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", str(_BASE_DIR / "anchor_universe.json")))
 ALPHA_FILE = DATA_PATH / "alpha_last.json"
 
@@ -76,10 +80,6 @@ def days_between(entry_iso: str) -> int:
 # [F1] CARGA ANCHOR UNIVERSE DESDE DISCO
 # =========================================================
 def _load_anchor_universe() -> List[Dict[str, Any]]:
-    """
-    Lee anchor_universe.json desde disco.
-    Retorna lista vacía si no existe — sistema sigue funcionando.
-    """
     try:
         if not ANCHOR_FILE.exists():
             logger.warning(f"⚠️ anchor_universe.json no encontrado en {ANCHOR_FILE}")
@@ -97,10 +97,6 @@ def _load_anchor_universe() -> List[Dict[str, Any]]:
 # [F4] CARGA ALPHA SCORES DESDE alpha_last.json
 # =========================================================
 def _load_alpha_scores() -> Dict[str, float]:
-    """
-    Lee alpha_last.json y retorna dict {ticker: alpha_score}.
-    Retorna {} si no existe.
-    """
     try:
         if not ALPHA_FILE.exists():
             logger.warning("⚠️ alpha_last.json no encontrado — anclas sin validación de alpha")
@@ -139,33 +135,30 @@ class DefensiveDecision:
 
 
 # =========================================================
-# PM DEFENSIVO v1.6 PRODUCCION
+# PM DEFENSIVO v1.7 PRODUCCION
 # =========================================================
 class PMDefensive:
     """
-    PM DEFENSIVO CON ROTACION ESTRUCTURAL v1.6
+    PM DEFENSIVO CON ROTACION ESTRUCTURAL v1.7
     Preservar poder adquisitivo -> ANCLAS estructurales
+    Alpha anchor >= 0.30 | Alpha no-anchor = elite (sistema normal)
     """
 
     def __init__(self):
         self.tz = CL_TIMEZONE
         self.anchor_exposure_pct = 0.0
-        # [F1] Cargar anclas desde disco al inicializar
         self._anchor_universe = _load_anchor_universe()
         self._anchor_tickers = {a["ticker"].upper() for a in self._anchor_universe}
         logger.info(
-            f"PMDefensive v1.6 PRODUCCION - ANCLAS + ROTACION ACTIVA | "
+            f"PMDefensive v1.7 PRODUCCION - ANCLAS + ROTACION ACTIVA | "
             f"anclas={len(self._anchor_tickers)}: {sorted(self._anchor_tickers)}"
         )
 
     # =========================================================
     # [F2] is_anchor_asset — lista fija + alpha score real
+    # [F5] Umbral anchor = 0.30, alpha negativo = no elegible
     # =========================================================
     def is_anchor_asset(self, candidate: Dict[str, Any], alpha_scores: Dict[str, float] = None) -> bool:
-        """
-        Ancla válida = ticker en anchor_universe.json AND alpha >= ANCHOR_MIN_ALPHA
-        Si alpha_scores no disponible, acepta cualquier ancla del universo.
-        """
         ticker = candidate.get("ticker", "").upper()
 
         if ticker not in self._anchor_tickers:
@@ -188,12 +181,10 @@ class PMDefensive:
         price = float(pos.get("price_now", 0))
         entry_time = str(pos.get("entry_time", ""))
 
-        # [F2] is_anchor ahora también verifica si está en anchor_universe
         is_anchor = bool(pos.get("is_anchor", False)) or (ticker in self._anchor_tickers)
 
         ts = datetime.now(self.tz).isoformat()
 
-        # VALIDACION
         if entry <= 0 or price <= 0:
             return DefensiveDecision(
                 "CLOSE", ticker, "invalid_price_data", ts,
@@ -203,7 +194,6 @@ class PMDefensive:
         ret = pct_change(price, entry)
         age = days_between(entry_time)
 
-        # STOP CATASTROFICO
         if ret <= -CATASTROPHIC_STOP_PCT:
             return DefensiveDecision(
                 "CLOSE", ticker, "catastrophic_loss", ts,
@@ -213,7 +203,6 @@ class PMDefensive:
                 },
             )
 
-        # ANCLA -> HOLD INDEFINIDO
         if is_anchor:
             return DefensiveDecision(
                 "HOLD", ticker, "anchor_hold_indefinite", ts,
@@ -225,14 +214,12 @@ class PMDefensive:
                 },
             )
 
-        # NO-ANCLA envejecido -> CLOSE
         if age >= MAX_HOLD_DAYS_NON_ANCHOR:
             return DefensiveDecision(
                 "CLOSE", ticker, "non_anchor_time_exit", ts,
                 {"days_held": age, "max_days": MAX_HOLD_DAYS_NON_ANCHOR},
             )
 
-        # NO-ANCLA sano -> HOLD temporal
         return DefensiveDecision(
             "HOLD", ticker, "defensive_hold_non_anchor", ts,
             {
@@ -252,10 +239,6 @@ class PMDefensive:
         anchor_candidate: Dict[str, Any],
         alpha_scores: Dict[str, float] = None,
     ) -> List[DefensiveDecision]:
-        """
-        Rota especulativo → ancla estructural.
-        Retorna [CLOSE fragile, OPEN ancla] para que el orchestrator ejecute ambos.
-        """
         if not self.is_anchor_asset(anchor_candidate, alpha_scores):
             return []
 
@@ -297,23 +280,16 @@ class PMDefensive:
         anchor_universe: Optional[List[Dict[str, Any]]] = None,
         total_capital: float = 1000000,
     ) -> List[DefensiveDecision]:
-        """
-        anchor_universe: ignorado — ahora se lee desde disco [F1]
-        Se mantiene el parámetro por compatibilidad con el orchestrator.
-        """
         decisions: List[DefensiveDecision] = []
 
-        # [F4] Cargar alpha scores para validar anclas
         alpha_scores = _load_alpha_scores()
 
         anchors = [p for p in positions if p.get("is_anchor", False) or p.get("ticker", "").upper() in self._anchor_tickers]
         non_anchors = [p for p in positions if p.get("ticker", "").upper() not in self._anchor_tickers and not p.get("is_anchor", False)]
 
-        # Evaluar posiciones existentes
         for pos in positions:
             decisions.append(self.evaluate_position(pos))
 
-        # Anclas elegibles con alpha real — excluir las que ya están en portfolio
         portfolio_tickers = {p.get("ticker", "").upper() for p in positions}
         eligible_anchors = [
             a for a in self._anchor_universe
@@ -332,20 +308,41 @@ class PMDefensive:
         for i, fragile in enumerate(non_anchors[:max_rotations]):
             if rotations_done >= max_rotations:
                 break
-
             anchor = eligible_anchors[rotations_done % len(eligible_anchors)]
             rotation_decisions = self.evaluate_rotation(fragile, anchor, alpha_scores)
-
             if rotation_decisions:
                 decisions.extend(rotation_decisions)
                 rotations_done += 1
+
+        # [F6] APERTURA PROACTIVA DE ANCHORS
+        # Si hay cierres pendientes y anchors elegibles, abrir directamente
+        # sin depender de non_anchors para rotar
+        already_opening = {d.ticker for d in decisions if d.action == "OPEN"}
+        anchors_to_open = [
+            a for a in eligible_anchors
+            if a["ticker"].upper() not in already_opening
+        ]
+
+        ts = datetime.now(self.tz).isoformat()
+        for anchor in anchors_to_open[:3]:
+            anchor_ticker = anchor["ticker"].upper()
+            alpha = alpha_scores.get(anchor_ticker, 0.0)
+            if alpha >= 0:
+                logger.info(f"⚓ OPEN proactivo → {anchor_ticker} | alpha={alpha:.3f}")
+                decisions.append(DefensiveDecision(
+                    "OPEN", anchor_ticker, "anchor_proactive_open", ts, {
+                        "target_pct": 0.05,
+                        "reason": f"ANCHOR_PROACTIVE_alpha={alpha:.3f}",
+                        "is_anchor": True,
+                    }
+                ))
 
         closes = len([d for d in decisions if d.action == "CLOSE"])
         opens  = len([d for d in decisions if d.action == "OPEN"])
         holds  = len([d for d in decisions if d.action == "HOLD"])
 
         logger.info(
-            f"DEFENSIVE v1.6 | pos={len(positions)} anchors={len(anchors)} "
+            f"DEFENSIVE v1.7 | pos={len(positions)} anchors={len(anchors)} "
             f"| closes={closes} opens={opens} holds={holds} rotates={rotations_done} "
             f"| capital=${total_capital:,.0f}"
         )
@@ -381,17 +378,16 @@ if __name__ == "__main__":
         },
     ]
 
-    print("\nPMDefensive v1.6 PRODUCCION - FULL EVAL")
+    print("\nPMDefensive v1.7 PRODUCCION - FULL EVAL")
     results = pm.evaluate_portfolio(test_positions, total_capital=1000000)
 
     print("\nDECISIONES:")
     for decision in results:
         print(json.dumps(decision.to_dict(), indent=2))
 
-    print("\nPMDefensive v1.6 - TEST PASSED")
+    print("\nPMDefensive v1.7 - TEST PASSED")
     print(
         f"Config → TimeMaxNonAnchor: {MAX_HOLD_DAYS_NON_ANCHOR}d | "
         f"CatStop: {CATASTROPHIC_STOP_PCT*100}% | "
         f"AnchorMinAlpha: {ANCHOR_MIN_ALPHA}"
-        )
-        
+)
