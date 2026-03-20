@@ -39,22 +39,27 @@ class TradingOrchestrator:
 
     def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
         """
-        V3.4 — Precio directo desde Alpaca vía broker.get_positions().
-        Alpaca devuelve current_price en tiempo real → fuente más confiable para cierres.
-
+        V3.5 — Precio directo desde Alpaca vía broker.get_positions().
         Cascada:
-          1. broker.get_positions() → current_price de Alpaca (tiempo real)
-          2. entry_price guardado en el store
-          3. 1.0 como guardia de emergencia (loggea error)
+          1. current_price de Alpaca (tiempo real)
+          2. avg_entry_price de Alpaca (fallback mercado cerrado)
+          3. entry_price del store
+          4. 1.0 guardia de emergencia
         """
-        # Obtener precios frescos del broker en una sola llamada
         broker_price_map = {}
         try:
-            broker_data = self.broker.get_positions()  # dict {TICKER: {current_price, ...}}
+            broker_data = self.broker.get_positions()
             for ticker, data in broker_data.items():
                 cp = data.get("current_price") or data.get("price_now")
                 if cp and float(cp) > 0:
                     broker_price_map[ticker.upper()] = float(cp)
+                else:
+                    avg = data.get("avg_entry_price")
+                    if avg and float(avg) > 0:
+                        broker_price_map[ticker.upper()] = float(avg)
+                        logger.warning(
+                            f"⚠️ {ticker} current_price=0 — usando avg_entry_price: {float(avg):.2f}"
+                        )
             logger.info(f"💹 Precios Alpaca obtenidos: {len(broker_price_map)} tickers")
         except Exception as e:
             logger.warning(f"⚠️ No se pudo obtener precios del broker: {e}")
@@ -67,24 +72,20 @@ class TradingOrchestrator:
             pos = dict(pos)
 
             if ticker in broker_price_map:
-                # Fuente 1: Alpaca live — precio real en tiempo real
                 pos["price_now"] = broker_price_map[ticker]
                 price_map[ticker] = broker_price_map[ticker]
                 logger.debug(f"💹 {ticker} precio Alpaca: {broker_price_map[ticker]:.2f}")
 
             elif float(pos.get("entry_price", 0) or 0) > 0:
-                # Fuente 2: entry_price como fallback
                 pos["price_now"] = float(pos["entry_price"])
                 logger.warning(f"⚠️ {ticker} sin precio Alpaca — usando entry_price: {pos['price_now']:.2f}")
 
             else:
-                # Guardia de emergencia — este ticker NO se puede cerrar correctamente
                 pos["price_now"] = 1.0
                 logger.error(f"❌ {ticker} SIN PRECIO DISPONIBLE — usando 1.0, cierre puede fallar")
 
             enriched.append(pos)
 
-        # Persistir precios frescos en el store
         if price_map:
             try:
                 update_prices(price_map)
@@ -134,7 +135,10 @@ class TradingOrchestrator:
             o["entry_price"] = price
             o["shares"] = shares
             enriched.append(o)
-            logger.info(f"💡 {ticker} enriquecido: {shares}s @ ${price:.2f} (target={target_pct:.1%} → ${shares * price:,.0f})")
+            logger.info(
+                f"💡 {ticker} enriquecido: {shares}s @ ${price:.2f} "
+                f"(target={target_pct:.1%} → ${shares * price:,.0f})"
+            )
 
         logger.info(f"📦 Opens enriquecidos: {len(enriched)}/{len(opens)} válidos")
         return enriched
@@ -180,7 +184,6 @@ class TradingOrchestrator:
                     save_positions(positions)
                     logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
 
-        # V3.4: precio fresco desde Alpaca antes de cualquier evaluación
         positions = self._enrich_positions_with_price(positions)
 
         broker_positions = load_positions()
@@ -261,11 +264,16 @@ class TradingOrchestrator:
         opens_dict = {o["ticker"].upper(): o for o in opens}
         unique_opens = self._enrich_opens_with_price_and_shares(list(opens_dict.values()))
 
-        anchor_opens = [o for o in unique_opens if o.get("is_anchor") or o.get("reason", "").startswith("ANCHOR_ROTATE")]
+        anchor_opens = [
+            o for o in unique_opens
+            if o.get("is_anchor") or o.get("reason", "").startswith("ANCHOR")
+        ]
         normal_opens = [o for o in unique_opens if o not in anchor_opens]
         close_tickers_list = [c["ticker"] for c in closes]
 
-        sized_anchors = self.governor.adjust_sizing_after_closes(positions, close_tickers_list, anchor_opens) if anchor_opens else []
+        sized_anchors = self.governor.adjust_sizing_after_closes(
+            positions, close_tickers_list, anchor_opens
+        ) if anchor_opens else []
         sized_normals = self.governor.adjust_sizing(positions, normal_opens) if normal_opens else []
         sized_opens = sized_anchors + sized_normals
 
@@ -300,7 +308,11 @@ class TradingOrchestrator:
                 await asyncio.sleep(0.8)
             except Exception as e:
                 logger.error(f"❌ EXECUTION ERROR for {order.get('ticker')}: {e}")
-                results.append({"ticker": order.get("ticker"), "status": "error", "error": str(e)})
+                results.append({
+                    "ticker": order.get("ticker"),
+                    "status": "error",
+                    "error": str(e)
+                })
 
         if close_successes:
             all_closes_ok = len(close_successes) == len(closes)
@@ -327,7 +339,8 @@ class TradingOrchestrator:
             "elite_executed": elite_count,
             "queue_size": len(final_queue),
             "alpha_timestamp": alpha_data.get("timestamp"),
-            "results": results
+            "results": results,
+            "decisions": pm_decisions,
         }
 
     async def preview_executability(self, market_ctx: Dict) -> Dict:
@@ -362,7 +375,9 @@ class TradingOrchestrator:
             data = json.loads(ALPHA_FILE.read_text())
         except Exception as e:
             raise RuntimeError(f"❌ alpha_last.json corrupto: {e}")
-        logger.info(f"🧠 Alpha loaded | ts={data.get('timestamp')} | universe={data.get('universe_size')}")
+        logger.info(
+            f"🧠 Alpha loaded | ts={data.get('timestamp')} | universe={data.get('universe_size')}"
+        )
         return data
 
     def _alpha_threshold(self, mode: str) -> float:
@@ -371,7 +386,13 @@ class TradingOrchestrator:
             "defensive": self.alpha_defensive
         }.get(mode, self.alpha_neutral)
 
-    async def _get_pm_decisions(self, mode: str, positions: List[Dict], signals: Dict, anchor: List) -> List[Dict]:
+    async def _get_pm_decisions(
+        self,
+        mode: str,
+        positions: List[Dict],
+        signals: Dict,
+        anchor: List
+    ) -> List[Dict]:
         decisions = []
         try:
             if mode == "growth":
@@ -384,7 +405,9 @@ class TradingOrchestrator:
                 pm = PMDefensive()
                 raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
                 if isinstance(raw, list):
-                    decisions.extend([r if isinstance(r, dict) else r.to_dict() for r in raw])
+                    decisions.extend([
+                        r if isinstance(r, dict) else r.to_dict() for r in raw
+                    ])
                 elif isinstance(raw, dict):
                     decisions.extend(raw.get("decisions", []))
             else:
@@ -394,4 +417,3 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
-        
