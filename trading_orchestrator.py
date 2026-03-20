@@ -35,11 +35,11 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = CapitalGovernor(self.fixed_capital)
-        logger.info(f"🚀 v3.4 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.6 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
     def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
         """
-        V3.5 — Precio directo desde Alpaca vía broker.get_positions().
+        V3.6 — Precio directo desde Alpaca vía broker.get_positions().
         Cascada:
           1. current_price de Alpaca (tiempo real)
           2. avg_entry_price de Alpaca (fallback mercado cerrado)
@@ -49,6 +49,10 @@ class TradingOrchestrator:
         broker_price_map = {}
         try:
             broker_data = self.broker.get_positions()
+            if not broker_data:
+                logger.warning("⚠️ Broker devolvió 0 posiciones → leyendo desde disco")
+                disk_positions = load_positions()
+                logger.info(f"📂 Disco positions: {len(disk_positions)}")
             for ticker, data in broker_data.items():
                 cp = data.get("current_price") or data.get("price_now")
                 if cp and float(cp) > 0:
@@ -285,9 +289,14 @@ class TradingOrchestrator:
         for cmd in sized_opens:
             ticker = cmd["ticker"].upper()
             score = alpha_map.get(ticker, {}).get("alpha_score", 0)
+            is_anchor = cmd.get("is_anchor") or cmd.get("reason", "").startswith("ANCHOR")
+
             if score >= self.alpha_elite:
                 elite_count += 1
                 logger.info(f"🔥 ELITE {ticker} {score:.3f}")
+                final_queue.append(cmd)
+            elif is_anchor and score >= 0:
+                logger.info(f"⚓ ANCHOR PASS {ticker} alpha={score:.3f}")
                 final_queue.append(cmd)
             elif score >= threshold:
                 final_queue.append(cmd)
