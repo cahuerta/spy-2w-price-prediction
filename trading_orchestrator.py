@@ -35,17 +35,9 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = CapitalGovernor(self.fixed_capital)
-        logger.info(f"🚀 v3.6 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.7 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
     def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
-        """
-        V3.6 — Precio directo desde Alpaca vía broker.get_positions().
-        Cascada:
-          1. current_price de Alpaca (tiempo real)
-          2. avg_entry_price de Alpaca (fallback mercado cerrado)
-          3. entry_price del store
-          4. 1.0 guardia de emergencia
-        """
         broker_price_map = {}
         try:
             broker_data = self.broker.get_positions()
@@ -183,7 +175,13 @@ class TradingOrchestrator:
         if len(positions) == 0:
             logger.warning("⚠️ positions.json vacío → fallback broker")
             if hasattr(self.broker, "get_positions"):
-                positions = await self.broker.get_positions()
+                raw = self.broker.get_positions()
+                if isinstance(raw, dict):
+                    positions = list(raw.values())
+                elif isinstance(raw, list):
+                    positions = raw
+                else:
+                    positions = []
                 if positions:
                     save_positions(positions)
                     logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
@@ -426,3 +424,4 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
+        
