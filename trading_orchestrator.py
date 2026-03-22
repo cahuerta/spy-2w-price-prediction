@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO)
 
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 ALPHA_FILE = DATA_PATH / "alpha_last.json"
+ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
 
 
 class TradingOrchestrator:
@@ -35,7 +36,17 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = CapitalGovernor(self.fixed_capital)
-        logger.info(f"🚀 v3.7 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v3.8 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+
+    def _load_anchor_tickers(self) -> set:
+        try:
+            data = json.loads(ANCHOR_FILE.read_text())
+            tickers = {a["ticker"].upper() for a in data if "ticker" in a}
+            logger.info(f"⚓ Anchor universe cargado: {len(tickers)} tickers")
+            return tickers
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo cargar anchor_universe.json: {e}")
+            return set()
 
     def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
         broker_price_map = {}
@@ -165,6 +176,8 @@ class TradingOrchestrator:
         anchor_universe: List = None
     ) -> Dict:
 
+        anchor_tickers = self._load_anchor_tickers()
+
         if hasattr(self.broker, "sync_positions_from_broker"):
             sync_result = self.broker.sync_positions_from_broker()
             if asyncio.iscoroutine(sync_result):
@@ -269,6 +282,7 @@ class TradingOrchestrator:
         anchor_opens = [
             o for o in unique_opens
             if o.get("is_anchor") or o.get("reason", "").startswith("ANCHOR")
+               or o.get("ticker", "").upper() in anchor_tickers
         ]
         normal_opens = [o for o in unique_opens if o not in anchor_opens]
         close_tickers_list = [c["ticker"] for c in closes]
@@ -287,13 +301,13 @@ class TradingOrchestrator:
         for cmd in sized_opens:
             ticker = cmd["ticker"].upper()
             score = alpha_map.get(ticker, {}).get("alpha_score", 0)
-            is_anchor = cmd.get("is_anchor") or cmd.get("reason", "").startswith("ANCHOR")
+            is_anchor = ticker in anchor_tickers
 
             if score >= self.alpha_elite:
                 elite_count += 1
                 logger.info(f"🔥 ELITE {ticker} {score:.3f}")
                 final_queue.append(cmd)
-            elif is_anchor and score >= 0:
+            elif is_anchor and score > 0:
                 logger.info(f"⚓ ANCHOR PASS {ticker} alpha={score:.3f}")
                 final_queue.append(cmd)
             elif score >= threshold:
@@ -424,4 +438,4 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
-        
+                
