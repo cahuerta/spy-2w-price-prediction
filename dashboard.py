@@ -20,6 +20,7 @@ from datetime import datetime
 from collections import defaultdict, deque
 from functools import lru_cache
 from trading_orchestrator import TradingOrchestrator
+from real_performance import get_alpaca_real_metrics  # <--- Añade esto
 from fastapi import (
     APIRouter,
     Query,
@@ -358,3 +359,21 @@ async def universe():
         reverse=True
     )
     return {"rows": rows}
+# =========================================================
+# REAL PERFORMANCE (BROKER LAYER)
+# =========================================================
+@router.get("/real-execution")
+async def real_execution():
+    """
+    Consonancia con la Capa de Ejecución Real (Alpaca).
+    Calcula Win Rate y PnL de órdenes cerradas físicamente.
+    """
+    try:
+        metrics = await get_alpaca_real_metrics()
+        if metrics.get("status") == "error":
+            raise HTTPException(500, metrics.get("error"))
+        return metrics
+    except Exception as e:
+        logger.error(f"Error en endpoint real-execution: {e}")
+        raise HTTPException(500, str(e))
+        
