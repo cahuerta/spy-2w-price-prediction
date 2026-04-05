@@ -7,21 +7,23 @@ import importlib
 import gc
 from datetime import datetime
 
-DATA_DIR = "predictions_data"   # donde escriben H1-H10
-FINAL_DIR = "/data/predictions" # donde va el resultado final
+DATA_DIR  = "predictions_data"
+FINAL_DIR = "/data/predictions"
 
 # ======================================================
 # FIXES v7.3:
-#   [O1] extract_price_prediction — valor existe pero es None → float(None) crash
-#   [O2] extract_return_pct — mismo patrón que O1
-#   [O3] collect_results — normalized_ret None si extract_return_pct falla
-#   [O4] build_model_json — h10_json puede tener prediction con nulls
-#   [O5] run() — raise RuntimeError si < 5 modelos, pero model_runner
-#                lo captura como ERROR y NO graba nada (correcto)
-#   [O6] ÚNICO DUEÑO DE ESCRITURA — solo el orquestador graba en disco
-#        model_runner NO debe volver a guardar el resultado
-#   [O7] ELIMINAR SUBPROCESOS — predictores llamados in-process via importlib
-#        para evitar OOM en Render (700 arranques de intérprete Python eliminados)
+#   [O1] extract_price_prediction — null-safe
+#   [O2] extract_return_pct — null-safe
+#   [O3] collect_results — normalized_ret None-safe
+#   [O4] build_model_json — h10_json campos críticos validados
+#   [O5] run() — mínimo 5 modelos
+#   [O6] ÚNICO DUEÑO DE ESCRITURA — solo orquestador graba en disco
+#   [O7] IN-PROCESS via importlib — sin subprocesos, RAM estable
+#
+# FIXES v7.4:
+#   [O8] build_model_json recalcula 'recommendation' después de ajustar
+#        ret_ens_pct — antes quedaba desincronizado con el precio final.
+#        La recomendación ahora siempre refleja el retorno ajustado real.
 # ======================================================
 
 
@@ -30,10 +32,7 @@ FINAL_DIR = "/data/predictions" # donde va el resultado final
 # ======================================================
 
 def extract_price_prediction(data):
-    """
-    [O1] Verifica que el valor no sea None antes de float().
-    Retorna None si no hay precio válido.
-    """
+    """[O1] Null-safe. Retorna None si no hay precio válido."""
     val = data.get("price_pred")
     if val is not None:
         try:
@@ -54,10 +53,7 @@ def extract_price_prediction(data):
 
 
 def extract_return_pct(data):
-    """
-    [O2] Verifica que el valor no sea None antes de float().
-    Retorna 0.0 como fallback seguro.
-    """
+    """[O2] Null-safe. Retorna 0.0 como fallback seguro."""
     for k in ["return_pct", "ret_ens_pct"]:
         val = data.get(k)
         if val is not None:
@@ -85,15 +81,14 @@ def extract_return_pct(data):
 class MasterOrchestrator:
 
     def __init__(self, ticker):
-        self.ticker = ticker.upper()
-        self.results = []
+        self.ticker     = ticker.upper()
+        self.results    = []
         self.price_today = None
-        self.h10_json = None
+        self.h10_json   = None
 
-
-# ======================================================
-# RECOLECTAR RESULTADOS
-# ======================================================
+    # ======================================================
+    # RECOLECTAR RESULTADOS
+    # ======================================================
 
     def collect_results(self):
         curve = []
@@ -104,138 +99,134 @@ class MasterOrchestrator:
                 f"{self.ticker}_h{h}.json",
                 f"{self.ticker}_H{h}_{h}d.json",
                 f"{self.ticker}_H{h}_{h}d_v2.json",
-                f"{self.ticker}_H{h}_{h}d_v3.json"
+                f"{self.ticker}_H{h}_{h}d_v3.json",
             ]
 
             for fname in possible_files:
                 path = os.path.join(DATA_DIR, fname)
+                if not os.path.exists(path):
+                    continue
 
-                if os.path.exists(path):
-                    try:
-                        with open(path) as f:
-                            data = json.load(f)
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
 
-                        data["horizon"] = h
+                    data["horizon"] = h
 
-                        # [O1] extract_price_prediction ya es null-safe
-                        price = extract_price_prediction(data)
-                        if price is None:
-                            print(f"⚠️ H{h} sin price_pred válido — saltando")
+                    # [O1] null-safe
+                    price = extract_price_prediction(data)
+                    if price is None:
+                        print(f"⚠️ H{h} sin price_pred válido — saltando")
+                        continue
+
+                    if self.price_today is None:
+                        raw_price = (
+                            data.get("price_now")
+                            or data.get("price_today")
+                            or (data.get("prediction") or {}).get("price_now")
+                        )
+                        if raw_price is None:
+                            print(f"⚠️ H{h} sin price_today — saltando")
                             continue
+                        self.price_today = float(raw_price)
 
-                        if self.price_today is None:
-                            raw_price = (
-                                data.get("price_now")
-                                or data.get("price_today")
-                                or (data.get("prediction") or {}).get("price_now")
-                            )
-                            if raw_price is None:
-                                print(f"⚠️ H{h} sin price_today — saltando")
-                                continue
-                            self.price_today = float(raw_price)
+                    data["price_pred"]    = price
+                    # [O3] null-safe
+                    data["normalized_ret"] = extract_return_pct(data)
 
-                        data["price_pred"] = price
+                    curve.append(data)
 
-                        # [O3] extract_return_pct ya es null-safe, siempre float
-                        data["normalized_ret"] = extract_return_pct(data)
+                    if h == 10:
+                        self.h10_json = data
 
-                        curve.append(data)
+                    print(f"   📊 H{h}: ${price:.2f}")
+                    break
 
-                        if h == 10:
-                            self.h10_json = data
-
-                        print(f"   📊 H{h}: ${price:.2f}")
-                        break
-
-                    except Exception as e:
-                        print(f"⚠️ H{h} JSON error {e}")
+                except Exception as e:
+                    print(f"⚠️ H{h} JSON error {e}")
 
         self.results = sorted(curve, key=lambda x: x["horizon"])
         print(f"📈 {len(self.results)}/10 modelos recolectados")
         return self.results
 
-
-# ======================================================
-# CURVA (solo H1-H9)
-# ======================================================
+    # ======================================================
+    # CURVA (solo H1-H9)
+    # ======================================================
 
     def build_price_curve(self):
         filtered = [r for r in self.results if r["horizon"] < 10]
-
         if len(filtered) < 2:
             return None
 
         horizons = np.array([r["horizon"] for r in filtered])
         prices   = np.array([r["price_pred"] for r in filtered])
 
-        full_h = np.arange(1, 10)
+        full_h       = np.arange(1, 10)
         interpolated = np.interp(full_h, horizons, prices)
-
-        smoothed = pd.Series(interpolated).rolling(
-            3, center=True, min_periods=1
-        ).mean().values
+        smoothed     = pd.Series(interpolated).rolling(3, center=True, min_periods=1).mean().values
 
         return {
             "days":       list(range(1, 10)),
             "price_path": smoothed.tolist(),
-            "price_now":  self.price_today
+            "price_now":  self.price_today,
         }
 
-
-# ======================================================
-# ANALISIS FINAL
-# ======================================================
+    # ======================================================
+    # ANALISIS FINAL
+    # ======================================================
 
     def analyze_curve(self, curve):
         if curve is None:
             return 0
         curve_last = curve["price_path"][-1]
-        curve_ret  = ((curve_last - self.price_today) / self.price_today) * 100
-        return curve_ret
+        return ((curve_last - self.price_today) / self.price_today) * 100
 
-
-# ======================================================
-# JSON FINAL
-# ======================================================
+    # ======================================================
+    # JSON FINAL
+    # ======================================================
 
     def build_model_json(self, curve):
         if self.h10_json is None:
             raise RuntimeError("H10 missing")
 
-        # [O4] Validar que prediction exista y tenga campos críticos sin nulls
+        # [O4] Validar campos críticos
         pred = self.h10_json.get("prediction")
         if not pred or not isinstance(pred, dict):
-            raise RuntimeError(
-                f"[{self.ticker}] H10 prediction inválido o None"
-            )
+            raise RuntimeError(f"[{self.ticker}] H10 prediction inválido o None")
 
         required_fields = ["price_pred", "price_now", "ret_ens_pct", "theta_dynamic_pct"]
         null_fields = [f for f in required_fields if pred.get(f) is None]
         if null_fields:
-            raise RuntimeError(
-                f"[{self.ticker}] H10 campos críticos null: {null_fields}"
-            )
+            raise RuntimeError(f"[{self.ticker}] H10 campos críticos null: {null_fields}")
 
-        final_json = self.h10_json.copy()
-
-        h10_price    = extract_price_prediction(self.h10_json)  # [O1] null-safe
+        final_json   = self.h10_json.copy()
+        h10_price    = extract_price_prediction(self.h10_json)
         curve_adjust = self.analyze_curve(curve)
 
-        # consenso entre modelos
         consensus        = np.std([r["price_pred"] for r in self.results if r["horizon"] < 10])
         consensus_weight = 1 / (1 + consensus / self.price_today)
+        adjust_factor    = 0.15 * consensus_weight
 
-        # ajuste suave (H10 sigue mandando)
-        adjust_factor = 0.15 * consensus_weight
-        final_price   = h10_price * (1 + curve_adjust / 100 * adjust_factor)
+        final_price = h10_price * (1 + curve_adjust / 100 * adjust_factor)
 
-        final_json["prediction"]["price_pred"] = round(final_price, 2)
-        final_json["prediction"]["ret_ens_pct"] = round(
-            ((final_price - self.price_today) / self.price_today) * 100, 4
+        # Retorno ajustado
+        ret_final = round(((final_price - self.price_today) / self.price_today) * 100, 4)
+
+        final_json["prediction"]["price_pred"]  = round(final_price, 2)
+        final_json["prediction"]["ret_ens_pct"] = ret_final
+
+        # [O8] Recalcular recommendation con ret_ens_pct ajustado
+        # Antes quedaba la de H10 original, desincronizada con el precio final
+        theta_dyn = float(final_json["prediction"]["theta_dynamic_pct"])
+
+        final_json["prediction"]["recommendation"] = (
+            "COMPRA" if ret_final >= theta_dyn else
+            "VENDE"  if ret_final <= -theta_dyn else
+            "MANTÉN"
         )
 
-        final_json["price_curve"] = curve
-        final_json["ensemble_models"] = len(self.results)
+        final_json["price_curve"]      = curve
+        final_json["ensemble_models"]  = len(self.results)
 
         final_json["models_diagnostics"] = {
             f"H{r['horizon']}": {
@@ -248,12 +239,9 @@ class MasterOrchestrator:
 
         return final_json
 
-
-# ======================================================
-# RUN — V7.3 [O7] IN-PROCESS, SIN SUBPROCESOS
-# Antes: subprocess.run(predictor_hN.py) × 10 × 70 tickers = 700 procesos
-# Ahora: importlib.import_module() en el mismo proceso → RAM estable
-# ======================================================
+    # ======================================================
+    # RUN — V7.4 IN-PROCESS
+    # ======================================================
 
     def run(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -261,13 +249,7 @@ class MasterOrchestrator:
         for i in range(1, 11):
             try:
                 print(f"🚀 Ejecutando H{i}")
-
-                # [O7] Importar el módulo del predictor directamente
-                # Si ya fue importado antes (otro ticker), importlib lo reutiliza
-                # sin relanzar el intérprete — ahorro masivo de RAM
-                mod = importlib.import_module(f"predictors_engine.predictor_h{i}")
-
-                # Llamar la función run_predictor_hN(ticker)
+                mod  = importlib.import_module(f"predictors_engine.predictor_h{i}")
                 func = getattr(mod, f"run_predictor_h{i}")
                 result = func(self.ticker)
 
@@ -275,26 +257,21 @@ class MasterOrchestrator:
                     print(f"⚠️ H{i} retornó None — datos insuficientes, saltando")
                     continue
 
-                # Guardar en disco (igual que hacía el __main__ de cada predictor)
                 filename = f"{self.ticker}_H{i}.json"
                 path = os.path.join(DATA_DIR, filename)
                 with open(path, "w") as f:
                     json.dump(result, f, indent=2, default=str)
 
             except AttributeError:
-                # La función run_predictor_hN no existe en ese módulo
-                print(f"❌ H{i} FALLÓ → función run_predictor_h{i}() no encontrada en predictor_h{i}.py")
-
+                print(f"❌ H{i} FALLÓ → función run_predictor_h{i}() no encontrada")
             except Exception as e:
                 print(f"❌ H{i} FALLÓ: {e}")
-
             finally:
-                # [O7] Liberar memoria explícitamente entre horizontes
                 gc.collect()
 
         self.collect_results()
 
-        # [O5] Mínimo 5 modelos — si no, RuntimeError sube a model_runner
+        # [O5] Mínimo 5 modelos
         if len(self.results) < 5:
             raise RuntimeError(
                 f"Ensemble inválido → solo {len(self.results)} modelos válidos (mínimo 5)"
@@ -306,17 +283,16 @@ class MasterOrchestrator:
 
         curve = self.build_price_curve()
 
-        # [O4] build_model_json lanza RuntimeError si hay nulls → NO se graba nada
+        # [O4] RuntimeError si hay nulls → no graba nada
         final_json = self.build_model_json(curve)
 
         # [O6] ÚNICA ESCRITURA — orquestador es el dueño del disco
-        ticker_dir = os.path.join(FINAL_DIR, self.ticker)
+        ticker_dir  = os.path.join(FINAL_DIR, self.ticker)
         os.makedirs(ticker_dir, exist_ok=True)
 
         file_name   = datetime.utcnow().strftime("%Y-%m-%d") + ".json"
         output_file = os.path.join(ticker_dir, file_name)
 
-        # Escritura atómica con .tmp
         tmp_file = output_file + ".tmp"
         with open(tmp_file, "w") as f:
             json.dump(final_json, f, indent=2)
@@ -332,8 +308,7 @@ class MasterOrchestrator:
 
 if __name__ == "__main__":
     ticker = (sys.argv[1] if len(sys.argv) > 1 else "SPY").upper()
-
-    print(f"🎯 MasterOrchestrator v7.3 → {ticker}")
+    print(f"🎯 MasterOrchestrator v7.4 → {ticker}")
     print("=" * 60)
 
     orch   = MasterOrchestrator(ticker)
@@ -342,4 +317,3 @@ if __name__ == "__main__":
     print("\n🏆 RESULTADO FINAL:")
     print(json.dumps(result["prediction"], indent=2))
     print(f"\n🎯 RECOMENDACIÓN: {result['prediction']['recommendation']}")
-        
