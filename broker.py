@@ -1,13 +1,17 @@
 # =========================================================
-# broker.py — V3.1 PURE EXECUTOR (NO SIZING)
+# broker.py — V3.2 PURE EXECUTOR (NO SIZING)
 # =========================================================
 #
 # FIX v3.1:
 #   [B1] cancel_all_orders() — cancela todas las órdenes abiertas
-#        Resuelve held_for_orders al intentar cerrar posiciones
-#   [B2] cancel_orders_for_ticker() — cancela órdenes de un ticker específico
-#   [B3] get_positions() ahora incluye current_price para enriquecer
-#        posiciones en trading_orchestrator sin llamada extra
+#   [B2] cancel_orders_for_ticker() — cancela órdenes de un ticker
+#   [B3] get_positions() incluye current_price
+#
+# FIX v3.2:
+#   [B4] _place_market_order() ahora asigna client_order_id con
+#        prefijo "sys_" para identificar órdenes del sistema
+#        vs órdenes manuales en análisis posteriores.
+#        Formato: sys_{TICKER}_{timestamp_ms}
 # =========================================================
 
 import os
@@ -31,6 +35,10 @@ except ImportError:
 logger = logging.getLogger("broker")
 router = APIRouter(prefix="/trading", tags=["trading"])
 
+# Prefijo que identifica órdenes del sistema automático
+SYSTEM_ORDER_PREFIX = "sys_"
+
+
 # =========================================================
 # MODELS
 # =========================================================
@@ -41,20 +49,21 @@ class PureDecisionInput(BaseModel):
     reason: Optional[str] = None
     meta: Optional[Dict] = None
 
+
 # =========================================================
 # ENGINE
 # =========================================================
 class TradingEngine:
     def __init__(self):
-        self.key = os.getenv("ALPACA_API_KEY")
+        self.key    = os.getenv("ALPACA_API_KEY")
         self.secret = os.getenv("ALPACA_SECRET_KEY")
-        self.paper = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+        self.paper  = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
         if not self.key or not self.secret:
             raise ValueError("Faltan credenciales de Alpaca")
 
         self.client = TradingClient(self.key, self.secret, paper=self.paper)
-        logger.info(f"🔌 Broker Pure Executor conectado ({'PAPER' if self.paper else 'LIVE'})")
+        logger.info(f"🔌 Broker V3.2 conectado ({'PAPER' if self.paper else 'LIVE'})")
 
     def is_executable(self, ticker: str) -> bool:
         return ticker is not None and not ticker.upper().endswith(".SN")
@@ -87,10 +96,7 @@ class TradingEngine:
     # [B1] CANCEL ALL ORDERS
     # =========================================================
     async def cancel_all_orders(self):
-        """
-        Cancela todas las órdenes abiertas (DAY, GTC, etc).
-        Llamar antes de ejecutar cierres para liberar held_for_orders.
-        """
+        """Cancela todas las órdenes abiertas (DAY, GTC, etc)."""
         try:
             cancel_statuses = self.client.cancel_orders()
             cancelled = len(cancel_statuses) if cancel_statuses else 0
@@ -104,10 +110,7 @@ class TradingEngine:
     # [B2] CANCEL ORDERS FOR TICKER
     # =========================================================
     async def cancel_orders_for_ticker(self, ticker: str):
-        """
-        Cancela órdenes abiertas para un ticker específico.
-        Más quirúrgico que cancel_all_orders.
-        """
+        """Cancela órdenes abiertas para un ticker específico."""
         ticker = ticker.upper()
         try:
             request = GetOrdersRequest(
@@ -170,14 +173,24 @@ class TradingEngine:
             logger.error(f"❌ EXECUTION ERROR for {ticker}: {str(e)}")
             return {"status": "error", "message": str(e)}
 
+    # =========================================================
+    # [B4] PLACE MARKET ORDER — con client_order_id del sistema
+    # =========================================================
     async def _place_market_order(self, ticker: str, qty: int, side: OrderSide):
+        # Genera ID único con prefijo "sys_" para identificar órdenes automáticas
+        ts_ms     = int(datetime.utcnow().timestamp() * 1000)
+        client_id = f"{SYSTEM_ORDER_PREFIX}{ticker.lower()}_{ts_ms}"
+
         req = MarketOrderRequest(
             symbol=ticker,
             qty=qty,
             side=side,
-            time_in_force=TimeInForce.DAY
+            time_in_force=TimeInForce.DAY,
+            client_order_id=client_id,   # [B4] marca de origen sistema
         )
+
         order = self.client.submit_order(req)
+        logger.info(f"📤 Orden enviada {ticker} client_id={client_id}")
 
         for _ in range(5):
             await asyncio.sleep(1)
@@ -185,12 +198,17 @@ class TradingEngine:
             if order.status == OrderStatus.FILLED:
                 logger.info(f"✅ {side} {qty} {ticker} FILLED at ${order.filled_avg_price}")
                 return {
-                    "status": "executed",
-                    "order_id": str(order.id),
-                    "price": float(order.filled_avg_price) if order.filled_avg_price else None
+                    "status":           "executed",
+                    "order_id":         str(order.id),
+                    "client_order_id":  client_id,
+                    "price":            float(order.filled_avg_price) if order.filled_avg_price else None,
                 }
 
-        return {"status": "pending", "order_id": str(order.id)}
+        return {
+            "status":          "pending",
+            "order_id":        str(order.id),
+            "client_order_id": client_id,
+        }
 
 
 # =========================================================
@@ -204,15 +222,17 @@ def get_engine():
         _engine = TradingEngine()
     return _engine
 
+
 @router.post("/execute")
 async def execute(decision: PureDecisionInput, x_api_key: str = Header(None)):
     if x_api_key != os.getenv("BROKER_EXECUTION_KEY"):
         raise HTTPException(401)
     return await get_engine().execute_decision(decision.dict())
 
+
 @router.get("/status")
 async def trading_status():
-    engine = get_engine()
+    engine  = get_engine()
     account = engine.client.get_account()
     positions = engine.client.get_all_positions()
     return {
@@ -223,6 +243,7 @@ async def trading_status():
         "positions":       len(positions),
         "trading_blocked": account.trading_blocked,
     }
+
 
 @router.get("/positions")
 async def trading_positions():
@@ -245,25 +266,26 @@ async def trading_positions():
 
     return result
 
+
 # =========================================================
-# CANCEL ENDPOINTS (para uso manual desde dashboard)
+# CANCEL ENDPOINTS
 # =========================================================
 
 @router.delete("/orders")
 async def cancel_all(x_api_key: str = Header(None)):
-    """Cancela todas las órdenes abiertas — usar antes de ejecución manual."""
+    """Cancela todas las órdenes abiertas."""
     if x_api_key != os.getenv("BROKER_EXECUTION_KEY"):
         raise HTTPException(401)
-    engine = get_engine()
+    engine    = get_engine()
     cancelled = await engine.cancel_all_orders()
     return {"cancelled": cancelled}
+
 
 @router.delete("/orders/{ticker}")
 async def cancel_ticker_orders(ticker: str, x_api_key: str = Header(None)):
     """Cancela órdenes abiertas para un ticker específico."""
     if x_api_key != os.getenv("BROKER_EXECUTION_KEY"):
         raise HTTPException(401)
-    engine = get_engine()
+    engine    = get_engine()
     cancelled = await engine.cancel_orders_for_ticker(ticker)
     return {"ticker": ticker.upper(), "cancelled": cancelled}
-        
