@@ -1,18 +1,18 @@
 # =========================================================
-# performance_router.py — INSTITUTIONAL PERFORMANCE ENGINE
+# performance_router.py — V4
 # =========================================================
+# Dos bloques completamente separados:
 #
-# FIX v2:
-#   [F1] Sharpe y Max Drawdown → solo retornos de COMPRA
-#   [F2] Win Rate → todas las decisiones (COMPRA + VENDE + MANTÉN)
-#   [F3] buy_sharpe_ratio y buy_max_drawdown_pct explícitos
-#   [F4] evaluated_buy_predictions como contador de COMPRAs evaluadas
+# [BROKER]  → todo viene de Alpaca (equity real)
+#   - /dashboard/performance       → KPIs reales
+#   - /dashboard/equity-curve      → historial real (get_portfolio_history
+#                                    con fallback a snapshots en disco)
 #
-# FIX v3 (equity-curve):
-#   [EC1] Agrupación diaria — evita zigzag intraday por múltiples
-#         evaluaciones el mismo día (retorno diario = promedio del día)
-#   [EC2] ticker vacío → se lee desde path del archivo como fallback
-#   [EC3] n_trades ahora refleja días únicos, no evaluaciones individuales
+# [MODELO]  → todo viene de /data/evaluations/
+#   - /dashboard/model-quality     → hit rate direccional, error,
+#                                    desglose H1→H10
+#
+# NUNCA se mezclan las dos fuentes.
 # =========================================================
 
 import os
@@ -20,8 +20,8 @@ import json
 import numpy as np
 from collections import defaultdict
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, Any, List
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter
 
@@ -29,14 +29,16 @@ from broker import get_engine
 
 DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 META_FILE = DATA_PATH / "account_meta.json"
+EQUITY_SNAPSHOTS_FILE = DATA_PATH / "equity_snapshots.json"  # fallback diario
 
 router = APIRouter(prefix="/dashboard", tags=["performance"])
+
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def load_json(path: Path):
+def load_json(path: Path) -> Optional[Dict]:
     if not path.exists():
         return None
     try:
@@ -45,55 +47,218 @@ def load_json(path: Path):
         return None
 
 
+def save_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
 def list_evaluation_files() -> List[Path]:
     root = DATA_PATH / "evaluations"
     if not root.exists():
         return []
-
     files = []
     for ticker_dir in root.iterdir():
         if ticker_dir.is_dir():
             files.extend(ticker_dir.glob("*.json"))
-
     return sorted(files)
 
 
 # =========================================================
-# MODEL METRICS
+# SNAPSHOT DIARIO (fallback para equity curve)
+# Guarda equity de hoy en disco si aún no existe entrada para hoy
 # =========================================================
 
-def compute_model_metrics():
+def record_equity_snapshot(equity: float) -> None:
+    """Persiste un punto diario de equity para construir curva histórica."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    snapshots: Dict = load_json(EQUITY_SNAPSHOTS_FILE) or {}
+
+    # Solo graba una vez por día (no sobreescribe si ya existe)
+    if today not in snapshots:
+        snapshots[today] = round(equity, 2)
+        save_json(EQUITY_SNAPSHOTS_FILE, snapshots)
+
+
+# =========================================================
+# BLOQUE BROKER — /dashboard/performance
+# =========================================================
+
+@router.get("/performance")
+async def performance():
+    """KPIs reales desde Alpaca. Sin mezcla con evaluaciones."""
+
+    try:
+        engine = get_engine()
+        account = await engine.get_account()
+        equity = float(account.equity)
+    except Exception:
+        equity = None
+
+    # ── account_meta: guarda initial_equity la primera vez ──────
+    meta = load_json(META_FILE)
+
+    if not meta and equity is not None:
+        meta = {
+            "initial_equity": equity,
+            "start_date": datetime.now(timezone.utc).isoformat(),
+            "high_water_mark": equity,
+        }
+        save_json(META_FILE, meta)
+
+    total_return_pct = None
+    drawdown_pct = None
+    high_water_mark = None
+
+    if meta and equity is not None:
+        initial_equity = float(meta["initial_equity"])
+        high_water_mark = float(meta.get("high_water_mark", equity))
+
+        # Actualiza high water mark
+        if equity > high_water_mark:
+            high_water_mark = equity
+            meta["high_water_mark"] = equity
+            save_json(META_FILE, meta)
+
+        total_return_pct = round(
+            (equity - initial_equity) / initial_equity * 100, 2
+        )
+        drawdown_pct = round(
+            (equity - high_water_mark) / high_water_mark * 100, 2
+        )
+
+        # Registra snapshot diario para fallback de equity curve
+        record_equity_snapshot(equity)
+
+    return {
+        "equity":            equity,
+        "initial_equity":    float(meta["initial_equity"]) if meta else None,
+        "total_return_pct":  total_return_pct,
+        "drawdown_pct":      drawdown_pct,
+        "high_water_mark":   high_water_mark,
+        "since":             meta["start_date"] if meta else None,
+    }
+
+
+# =========================================================
+# BLOQUE BROKER — /dashboard/equity-curve
+# Fuente 1: Alpaca get_portfolio_history()
+# Fuente 2 (fallback): snapshots diarios guardados en disco
+# =========================================================
+
+@router.get("/equity-curve")
+async def equity_curve():
+    """
+    Curva de equity real desde Alpaca.
+    Fallback a snapshots en disco si Alpaca no está disponible.
+    """
+    curve = []
+    source = "alpaca"
+
+    # ── Intento 1: Alpaca portfolio history ─────────────────────
+    try:
+        engine = get_engine()
+        # get_portfolio_history devuelve timestamps + equity points
+        history = engine.client.get_portfolio_history(
+            period="1M",          # último mes
+            timeframe="1D",       # un punto por día
+            intraday_reporting="market_hours",
+        )
+
+        if history and history.equity:
+            for ts, eq in zip(history.timestamp, history.equity):
+                if eq is None or eq == 0:
+                    continue
+                date_str = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+                curve.append({
+                    "date":   date_str,
+                    "equity": round(float(eq), 2),
+                })
+            source = "alpaca"
+
+    except Exception as e:
+        # Alpaca paper puede no soportar portfolio history → fallback
+        source = "snapshots"
+
+    # ── Intento 2: snapshots en disco ───────────────────────────
+    if not curve:
+        snapshots: Dict = load_json(EQUITY_SNAPSHOTS_FILE) or {}
+        for date in sorted(snapshots.keys()):
+            curve.append({
+                "date":   date,
+                "equity": snapshots[date],
+            })
+        source = "snapshots"
+
+    # ── Calcular return_pct por punto ───────────────────────────
+    if curve:
+        base = curve[0]["equity"]
+        for point in curve:
+            point["return_pct"] = round(
+                (point["equity"] - base) / base * 100, 2
+            ) if base > 0 else 0.0
+
+    meta = load_json(META_FILE)
+    initial_equity = float(meta["initial_equity"]) if meta else None
+    current_equity = curve[-1]["equity"] if curve else None
+
+    return {
+        "curve":           curve,
+        "initial_equity":  initial_equity,
+        "current_equity":  current_equity,
+        "n_days":          len(curve),
+        "source":          source,   # "alpaca" o "snapshots"
+        "updated_at":      datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# =========================================================
+# BLOQUE MODELO — /dashboard/model-quality
+# Solo evalúa qué tan bien predice la DIRECCIÓN el modelo.
+# No mezcla con PnL real del broker.
+# =========================================================
+
+@router.get("/model-quality")
+async def model_quality():
+    """
+    Calidad predictiva del modelo, independiente del PnL real.
+
+    Métricas:
+    - hit_rate_direction_pct : % de predicciones que acertaron la dirección
+    - avg_error_pct          : error promedio de retorno predicho vs real
+    - by_horizon             : desglose H1→H10 (qué horizonte predice mejor)
+    - by_recommendation      : COMPRA / VENDE / MANTÉN por separado
+    - evaluated / pending    : cobertura del modelo
+    """
 
     files = list_evaluation_files()
 
+    empty = {
+        "hit_rate_direction_pct": None,
+        "avg_error_pct":          None,
+        "evaluated":              0,
+        "pending":                0,
+        "total":                  0,
+        "by_recommendation":      {},
+        "by_horizon":             {},
+    }
+
     if not files:
-        return {
-            "win_rate_pct": None,
-            "avg_prediction_error_pct": None,
-            "total_predictions": 0,
-            "evaluated_predictions": 0,
-            "evaluated_buy_predictions": 0,
-            "pending_predictions": 0,
-            "sharpe_ratio": None,
-            "max_drawdown_pct": None,
-            "models_performance": {},
-        }
+        return empty
 
-    total = 0
-    evaluated = 0
-    correct = 0
+    total       = 0
+    evaluated   = 0
+    hits_dir    = 0
+    errors      = []
 
-    errors = []
+    # Por recomendación
+    rec_stats: Dict[str, Dict] = defaultdict(lambda: {"total": 0, "hits": 0, "errors": []})
 
-    returns_all = []
-    returns_buy = []
-    evaluated_buy = 0
-
-    model_errors: Dict[str, List[float]] = {}
-    model_hits: Dict[str, List[int]] = {}
+    # Por horizonte H1→H10 (desde models_diagnostics)
+    horizon_stats: Dict[str, Dict] = defaultdict(lambda: {"hits": 0, "total": 0, "errors": []})
 
     for f in files:
-
         data = load_json(f)
         if not data:
             continue
@@ -105,241 +270,67 @@ def compute_model_metrics():
 
         evaluated += 1
 
-        if data.get("decision_correct") is True:
-            correct += 1
+        rec = (data.get("recommendation") or "HOLD").strip().upper()
+        real_ret  = float(data["real_return_pct"])
+        pred_ret  = float(data.get("predicted_return_pct", 0))
 
+        # ── Hit direccional (signo correcto) ────────────────────
+        hit = bool(np.sign(real_ret) == np.sign(pred_ret)) if pred_ret != 0 else False
+        if hit:
+            hits_dir += 1
+
+        # ── Error de retorno ────────────────────────────────────
         if data.get("error_return_pct") is not None:
-            errors.append(float(data["error_return_pct"]))
+            err = float(data["error_return_pct"])
+            errors.append(err)
+            rec_stats[rec]["errors"].append(err)
 
-        real_ret = float(data["real_return_pct"])
-        returns_all.append(real_ret)
+        rec_stats[rec]["total"] += 1
+        if hit:
+            rec_stats[rec]["hits"] += 1
 
-        rec = (data.get("recommendation") or "").strip().upper()
-        if rec == "COMPRA":
-            returns_buy.append(real_ret)
-            evaluated_buy += 1
-
-        models = data.get("models_diagnostics", {})
-        for model, mdata in models.items():
-            err = mdata.get("error_pct")
-            hit = mdata.get("hit_sign")
-            if err is not None:
-                model_errors.setdefault(model, []).append(float(err))
-            if hit is not None:
-                model_hits.setdefault(model, []).append(1 if hit else 0)
+        # ── Desglose por horizonte H1→H10 ───────────────────────
+        models_diag = data.get("models_diagnostics") or {}
+        for hkey, hdata in models_diag.items():
+            if not isinstance(hdata, dict):
+                continue
+            horizon_stats[hkey]["total"] += 1
+            if hdata.get("hit_sign"):
+                horizon_stats[hkey]["hits"] += 1
+            if hdata.get("error_pct") is not None:
+                horizon_stats[hkey]["errors"].append(float(hdata["error_pct"]))
 
     pending = total - evaluated
 
-    win_rate = round((correct / evaluated) * 100, 2) if evaluated > 0 else None
-    avg_error = round(np.mean(errors), 4) if errors else None
+    hit_rate_dir = round((hits_dir / evaluated) * 100, 2) if evaluated > 0 else None
+    avg_error    = round(float(np.mean(errors)), 2) if errors else None
 
-    sharpe = None
-    max_dd = None
+    # ── Formatear by_recommendation ─────────────────────────────
+    by_rec = {}
+    for rec, s in rec_stats.items():
+        by_rec[rec] = {
+            "total":            s["total"],
+            "hit_rate_pct":     round((s["hits"] / s["total"]) * 100, 1) if s["total"] else None,
+            "avg_error_pct":    round(float(np.mean(s["errors"])), 2) if s["errors"] else None,
+        }
 
-    if returns_buy:
-        buy_arr = np.array(returns_buy) / 100.0
-
-        mean_ret = np.mean(buy_arr)
-        std_ret = np.std(buy_arr)
-
-        if std_ret > 0:
-            sharpe = round((mean_ret / std_ret) * np.sqrt(252), 3)
-
-        equity_curve = np.cumprod(1 + buy_arr)
-        running_max = np.maximum.accumulate(equity_curve)
-        drawdowns = (equity_curve - running_max) / running_max
-        max_dd = round(float(np.min(drawdowns)) * 100, 2)
-
-    models_perf = {}
-    for model in model_errors:
-        errs = model_errors.get(model, [])
-        hits = model_hits.get(model, [])
-        if not errs:
-            continue
-        models_perf[model] = {
-            "avg_error_pct": round(float(np.mean(errs)), 4),
-            "win_rate_pct": round((sum(hits) / len(hits)) * 100, 2) if hits else None,
-            "samples": len(errs),
+    # ── Formatear by_horizon ────────────────────────────────────
+    by_horizon = {}
+    for hkey in sorted(horizon_stats.keys()):
+        s = horizon_stats[hkey]
+        by_horizon[hkey] = {
+            "total":         s["total"],
+            "hit_rate_pct":  round((s["hits"] / s["total"]) * 100, 1) if s["total"] else None,
+            "avg_error_pct": round(float(np.mean(s["errors"])), 2) if s["errors"] else None,
         }
 
     return {
-        "win_rate_pct": win_rate,
-        "avg_prediction_error_pct": avg_error,
-        "total_predictions": total,
-        "evaluated_predictions": evaluated,
-        "evaluated_buy_predictions": evaluated_buy,
-        "pending_predictions": pending,
-        "sharpe_ratio": sharpe,
-        "max_drawdown_pct": max_dd,
-        "models_performance": models_perf,
+        "hit_rate_direction_pct": hit_rate_dir,
+        "avg_error_pct":          avg_error,
+        "evaluated":              evaluated,
+        "pending":                pending,
+        "total":                  total,
+        "by_recommendation":      by_rec,
+        "by_horizon":             by_horizon,
+        "updated_at":             datetime.now(timezone.utc).isoformat(),
     }
-
-
-# =========================================================
-# PERFORMANCE ENDPOINT
-# =========================================================
-
-@router.get("/performance")
-async def performance():
-
-    try:
-        engine = get_engine()
-        account = await engine.get_account()
-        equity = float(account.equity)
-    except Exception:
-        equity = None
-
-    meta = load_json(META_FILE)
-
-    if not meta and equity:
-        meta = {
-            "initial_equity": equity,
-            "start_date": datetime.utcnow().isoformat(),
-            "high_water_mark": equity,
-        }
-        META_FILE.write_text(json.dumps(meta, indent=2))
-
-    if meta and equity:
-
-        initial_equity = float(meta["initial_equity"])
-        high_water_mark = float(meta.get("high_water_mark", equity))
-
-        if equity > high_water_mark:
-            high_water_mark = equity
-            meta["high_water_mark"] = equity
-            META_FILE.write_text(json.dumps(meta, indent=2))
-
-        total_return_pct = round(
-            (equity - initial_equity) / initial_equity * 100, 2,
-        )
-
-        drawdown_pct = round(
-            (equity - high_water_mark) / high_water_mark * 100, 2,
-        )
-
-    else:
-
-        total_return_pct = None
-        drawdown_pct = None
-        high_water_mark = None
-
-    model_metrics = compute_model_metrics()
-
-    return {
-        "equity": equity,
-        "total_return_pct": total_return_pct,
-        "drawdown_pct": drawdown_pct,
-        "high_water_mark": high_water_mark,
-        "since": meta["start_date"] if meta else None,
-        "win_rate_pct": model_metrics["win_rate_pct"],
-        "avg_prediction_error_pct": model_metrics["avg_prediction_error_pct"],
-        "total_predictions": model_metrics["total_predictions"],
-        "evaluated_predictions": model_metrics["evaluated_predictions"],
-        "evaluated_buy_predictions": model_metrics["evaluated_buy_predictions"],
-        "pending_predictions": model_metrics["pending_predictions"],
-        "sharpe_ratio": model_metrics["sharpe_ratio"],
-        "max_drawdown_pct": model_metrics["max_drawdown_pct"],
-        "models_performance": model_metrics["models_performance"],
-    }
-
-
-# =========================================================
-# EQUITY CURVE ENDPOINT
-# =========================================================
-
-@router.get("/equity-curve")
-async def equity_curve():
-    """
-    Retorna la curva de equity acumulada desde evaluaciones históricas.
-
-    [EC1] Agrupa por día — evita zigzag intraday por múltiples
-          evaluaciones el mismo día. Retorno diario = promedio del día.
-    [EC2] Fallback de ticker desde el path del archivo de evaluación.
-    [EC3] n_trades = días únicos con al menos una COMPRA evaluada.
-    """
-
-    files = list_evaluation_files()
-
-    if not files:
-        return {"curve": [], "initial_equity": None, "current_equity": None}
-
-    # ── Recolectar retornos de COMPRA agrupados por fecha ──────────
-    # [EC1] defaultdict para acumular múltiples retornos por día
-    daily_returns: dict = defaultdict(list)
-    daily_tickers: dict = defaultdict(list)
-
-    for f in files:
-        data = load_json(f)
-        if not data:
-            continue
-
-        if data.get("real_return_pct") is None:
-            continue
-
-        rec = (data.get("recommendation") or "").strip().upper()
-        if rec != "COMPRA":
-            continue
-
-        date_str = (
-            data.get("evaluation_date")
-            or data.get("close_date")
-            or data.get("date_base")
-        )
-        if not date_str:
-            continue
-
-        date_key = date_str[:10]
-
-        daily_returns[date_key].append(float(data["real_return_pct"]))
-
-        # [EC2] ticker vacío → fallback desde path del archivo
-        ticker = data.get("ticker") or ""
-        if not ticker:
-            # path: /data/evaluations/AAPL/2026-03-11.json → "AAPL"
-            try:
-                ticker = f.parent.name
-            except Exception:
-                ticker = ""
-
-        daily_tickers[date_key].append(ticker)
-
-    if not daily_returns:
-        return {"curve": [], "initial_equity": None, "current_equity": None}
-
-    # ── Capital inicial desde meta ─────────────────────────────────
-    meta = load_json(META_FILE)
-    initial_equity = float(meta["initial_equity"]) if meta else 100_000.0
-
-    # ── Construir curva diaria acumulada ───────────────────────────
-    # [EC1] Un punto por día, retorno = promedio de todas las COMPRAs del día
-    curve = []
-    equity = initial_equity
-
-    for date in sorted(daily_returns.keys()):
-        rets = daily_returns[date]
-        avg_ret = float(np.mean(rets))           # promedio del día
-        equity = equity * (1 + avg_ret / 100.0)
-
-        tickers_today = list(set(daily_tickers[date]))
-
-        curve.append({
-            "date": date,
-            "equity": round(equity, 2),
-            "return_pct": round(avg_ret, 4),     # retorno promedio del día
-            "n_trades": len(rets),               # cuántas COMPRAs ese día
-            "tickers": tickers_today,
-        })
-
-    current_equity = curve[-1]["equity"] if curve else initial_equity
-
-    return {
-        "curve": curve,
-        "initial_equity": round(initial_equity, 2),
-        "current_equity": round(current_equity, 2),
-        "n_days": len(curve),        # [EC3] días únicos con COMPRAs
-        "n_trades": sum(            # total de evaluaciones individuales
-            p["n_trades"] for p in curve
-        ),
-        "updated_at": datetime.utcnow().isoformat(),
-        }
-    
