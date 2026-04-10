@@ -27,7 +27,7 @@ class TradingOrchestrator:
         self.broker            = get_engine()
         self.daily_limit       = int(os.getenv("MAX_ORDERS_DAY", "15"))
         self._fallback_capital = float(os.getenv("FIXED_CAPITAL", "1000000"))
-        self.fixed_capital     = self._fallback_capital  # se sobreescribe en run()
+        self.fixed_capital     = self._fallback_capital
 
         self.alpha_growth      = float(os.getenv("ALPHA_GROWTH",    "0.65"))
         self.alpha_neutral     = float(os.getenv("ALPHA_NEUTRAL",   "0.75"))
@@ -39,11 +39,7 @@ class TradingOrchestrator:
         self.governor = None
         logger.info(f"🚀 v3.9 ALPHA-CONSUMER | fallback capital ${self._fallback_capital:,.0f}")
 
-    # =========================================================
-    # [F4] Capital real desde Alpaca — se llama múltiples veces
-    # =========================================================
     async def _get_real_capital(self) -> float:
-        """Lee equity real desde Alpaca. Fallback a env var si falla."""
         try:
             account = await self.broker.get_account()
             equity  = float(account.equity)
@@ -55,11 +51,6 @@ class TradingOrchestrator:
         return self._fallback_capital
 
     async def _refresh_governor(self) -> CapitalGovernor:
-        """
-        Lee capital real actualizado y devuelve un governor fresco.
-        Llamar ANTES de cada bloque de sizing para reflejar
-        el buying power real después de cierres o compras previas.
-        """
         self.fixed_capital = await self._get_real_capital()
         gov = CapitalGovernor(fixed_capital=self.fixed_capital)
         logger.info(f"🏛 Governor refrescado | capital=${self.fixed_capital:,.0f}")
@@ -89,7 +80,9 @@ class TradingOrchestrator:
                     avg = data.get("avg_entry_price")
                     if avg and float(avg) > 0:
                         broker_price_map[ticker.upper()] = float(avg)
-                        logger.warning(f"⚠️ {ticker} current_price=0 → avg_entry: {float(avg):.2f}")
+                        logger.warning(
+                            f"⚠️ {ticker} current_price=0 → avg_entry: {float(avg):.2f}"
+                        )
             logger.info(f"💹 Precios Alpaca obtenidos: {len(broker_price_map)} tickers")
         except Exception as e:
             logger.warning(f"⚠️ No se pudo obtener precios del broker: {e}")
@@ -106,7 +99,9 @@ class TradingOrchestrator:
                 price_map[ticker] = broker_price_map[ticker]
             elif float(pos.get("entry_price", 0) or 0) > 0:
                 pos["price_now"] = float(pos["entry_price"])
-                logger.warning(f"⚠️ {ticker} sin precio Alpaca → entry_price: {pos['price_now']:.2f}")
+                logger.warning(
+                    f"⚠️ {ticker} sin precio Alpaca → entry_price: {pos['price_now']:.2f}"
+                )
             else:
                 pos["price_now"] = 1.0
                 logger.error(f"❌ {ticker} SIN PRECIO → usando 1.0")
@@ -152,12 +147,13 @@ class TradingOrchestrator:
 
             price      = float(price)
             target_pct = float(o.get("target_pct", 0.05))
-
-            # [F4] Usa fixed_capital real actualizado
-            shares = int((self.fixed_capital * target_pct) // price)
+            shares     = int((self.fixed_capital * target_pct) // price)
 
             if shares <= 0:
-                logger.warning(f"⚠️ {ticker} shares=0 price={price:.2f} capital={self.fixed_capital:,.0f} → saltado")
+                logger.warning(
+                    f"⚠️ {ticker} shares=0 price={price:.2f} "
+                    f"capital={self.fixed_capital:,.0f} → saltado"
+                )
                 continue
 
             o              = dict(o)
@@ -189,7 +185,6 @@ class TradingOrchestrator:
                 logger.info(f"🗑 Órdenes canceladas para {ticker}")
             except Exception as e:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
-
     # =========================================================
     # RUN PRINCIPAL v3.9
     # =========================================================
@@ -200,9 +195,8 @@ class TradingOrchestrator:
         anchor_universe: List = None
     ) -> Dict:
 
-        # ── PASO 1: Capital real inicial ──────────────────────
-        self.fixed_capital = await self._get_real_capital()
-        self.governor      = CapitalGovernor(fixed_capital=self.fixed_capital)
+        # PASO 1: Capital real inicial
+        self.governor = await self._refresh_governor()
         logger.info(f"🚀 v3.9 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
@@ -226,7 +220,9 @@ class TradingOrchestrator:
                     positions = []
                 if positions:
                     save_positions(positions)
-                    logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
+                    logger.info(
+                        f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones"
+                    )
 
         positions         = self._enrich_positions_with_price(positions)
         broker_positions  = load_positions()
@@ -234,7 +230,9 @@ class TradingOrchestrator:
         portfolio_tickers = real_positions
         mode              = market_ctx.get("market_mode", "neutral")
 
-        logger.info(f"📊 Portfolio: {len(positions)} | Real en broker: {len(real_positions)} | Mode: {mode}")
+        logger.info(
+            f"📊 Portfolio: {len(positions)} | Real en broker: {len(real_positions)} | Mode: {mode}"
+        )
 
         alpha_data = self._load_last_alpha()
         alpha_map  = {
@@ -243,7 +241,9 @@ class TradingOrchestrator:
             if isinstance(d, dict)
         }
 
-        pm_decisions = await self._get_pm_decisions(mode, positions, signals or {}, anchor_universe)
+        pm_decisions = await self._get_pm_decisions(
+            mode, positions, signals or {}, anchor_universe
+        )
 
         closes = []
         opens  = []
@@ -257,7 +257,6 @@ class TradingOrchestrator:
                     logger.warning(f"⚠️ SKIP CLOSE {ticker} → no existe en broker")
                     continue
 
-                # [N1] No procesar HOLDs preventivos como cierres
                 if "hold" in reason.lower():
                     logger.info(f"🛡 SKIP CLOSE {ticker} — es HOLD preventivo: {reason}")
                     continue
@@ -274,12 +273,16 @@ class TradingOrchestrator:
             if alpha_score <= self.alpha_kill:
                 if ticker not in real_positions:
                     continue
-                closes.append({"action": "CLOSE", "ticker": ticker, "reason": f"ALPHA_KILL_{alpha_score:.3f}"})
+                closes.append({
+                    "action": "CLOSE",
+                    "ticker": ticker,
+                    "reason": f"ALPHA_KILL_{alpha_score:.3f}",
+                })
                 logger.warning(f"💀 KILL {ticker} | alpha={alpha_score:.3f}")
 
         closes = list({c["ticker"]: c for c in closes}.values())
 
-        # ── PASO 2: Ejecutar CIERRES ──────────────────────────
+        # PASO 2: Ejecutar CIERRES
         close_successes = []
         if closes:
             await self._cancel_pending_orders([c["ticker"] for c in closes])
@@ -287,16 +290,16 @@ class TradingOrchestrator:
 
             for order in closes[:self.daily_limit]:
                 try:
-                    await asyncio.wait_for(self.broker.execute_decision(order), timeout=30)
+                    await asyncio.wait_for(
+                        self.broker.execute_decision(order), timeout=30
+                    )
                     close_successes.append(order["ticker"])
                     logger.info(f"⚰️ CLOSED {order['ticker']}")
                     await asyncio.sleep(0.8)
                 except Exception as e:
                     logger.error(f"❌ CLOSE ERROR {order.get('ticker')}: {e}")
 
-        # ── PASO 3: Refrescar capital DESPUÉS de cierres ──────
-        # El buying power cambia tras cada cierre — el governor debe
-        # conocer el valor real antes de calcular aperturas
+        # PASO 3: Refrescar capital DESPUÉS de cierres
         self.governor = await self._refresh_governor()
 
         for decision in pm_decisions:
@@ -321,20 +324,25 @@ class TradingOrchestrator:
 
         anchor_opens = [
             o for o in unique_opens
-            if o.get("is_anchor") or o.get("reason", "").startswith("ANCHOR")
-               or o.get("ticker", "").upper() in anchor_tickers
+            if o.get("is_anchor")
+            or o.get("reason", "").startswith("ANCHOR")
+            or o.get("ticker", "").upper() in anchor_tickers
         ]
         normal_opens       = [o for o in unique_opens if o not in anchor_opens]
         close_tickers_list = [c["ticker"] for c in closes]
 
-        # Sizing con capital post-cierres real
         sized_anchors = self.governor.adjust_sizing_after_closes(
             positions, close_tickers_list, anchor_opens
         ) if anchor_opens else []
-        sized_normals = self.governor.adjust_sizing(positions, normal_opens) if normal_opens else []
-        sized_opens   = sized_anchors + sized_normals
+        sized_normals = self.governor.adjust_sizing(
+            positions, normal_opens
+        ) if normal_opens else []
+        sized_opens = sized_anchors + sized_normals
 
-        logger.info(f"📐 Sizing | anchors={len(sized_anchors)} normals={len(sized_normals)} total={len(sized_opens)}")
+        logger.info(
+            f"📐 Sizing | anchors={len(sized_anchors)} "
+            f"normals={len(sized_normals)} total={len(sized_opens)}"
+        )
 
         final_queue = []
         elite_count = 0
@@ -356,22 +364,21 @@ class TradingOrchestrator:
             else:
                 logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f}")
 
-        # ── PASO 4: Ejecutar APERTURAS ────────────────────────
+        # PASO 4: Ejecutar APERTURAS
         results          = []
         executed_opens   = 0
         remaining_orders = self.daily_limit - len(close_successes)
 
         for order in final_queue[:max(0, remaining_orders)]:
             try:
-                await asyncio.wait_for(self.broker.execute_decision(order), timeout=30)
+                await asyncio.wait_for(
+                    self.broker.execute_decision(order), timeout=30
+                )
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
                 await asyncio.sleep(0.8)
 
-                # ── [F4] Refrescar governor después de CADA compra ──
-                # El buying power real cambia con cada orden ejecutada.
-                # Sin este refresh el governor calcularía sizing sobre
-                # un capital que ya no existe, causando insufficient buying power.
+                # Refrescar governor DESPUÉS de cada compra ejecutada
                 self.governor = await self._refresh_governor()
 
             except Exception as e:
@@ -382,7 +389,7 @@ class TradingOrchestrator:
                     "error":  str(e),
                 })
 
-        # ── PASO 5: Limpiar store si todos los cierres OK ─────
+        # PASO 5: Limpiar store si cierres OK
         if close_successes:
             all_closes_ok = len(close_successes) == len(closes)
             try:
@@ -452,7 +459,10 @@ class TradingOrchestrator:
             data = json.loads(ALPHA_FILE.read_text())
         except Exception as e:
             raise RuntimeError(f"❌ alpha_last.json corrupto: {e}")
-        logger.info(f"🧠 Alpha loaded | ts={data.get('timestamp')} | universe={data.get('universe_size')}")
+        logger.info(
+            f"🧠 Alpha loaded | ts={data.get('timestamp')} | "
+            f"universe={data.get('universe_size')}"
+        )
         return data
 
     def _alpha_threshold(self, mode: str) -> float:
@@ -480,6 +490,16 @@ class TradingOrchestrator:
                 pm  = PMDefensive()
                 raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
                 if isinstance(raw, list):
-                    decisions.extend([r if isinstance(r, dict) else r.to_dict() for r in raw])
+                    decisions.extend(
+                        [r if isinstance(r, dict) else r.to_dict() for r in raw]
+                    )
                 elif isinstance(raw, dict):
-                    decisions.extend(raw.get("
+                    decisions.extend(raw.get("decisions", []))
+            else:
+                pm  = PMNeutral()
+                raw = pm.evaluate_portfolio(positions)
+                decisions.extend(raw.get("decisions", []))
+        except Exception as e:
+            logger.error(f"PM error: {e}")
+        return decisions
+        
