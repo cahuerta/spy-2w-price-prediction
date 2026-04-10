@@ -8,19 +8,30 @@
 #
 # FIXES:
 #   [F1] run_all_models() ahora se awaita correctamente
+#        → alpha ya no lee JSONs del día anterior
 #   [F2] Alpha engine movido DESPUÉS del Market Orchestrator
+#        → tiene market_ctx completo al calcular s_market
 #   [F3] import os duplicado removido
 #   [F4] Numeración de pasos corregida en logs
 #
 # FIX v2.0 — SMART SKIP:
-#   [F5] Pasos 1-4 se saltean si ya existe output del día.
+#   [F5] Pasos 1-4 (Screener, Decider, Models, Evaluator) se
+#        saltean automáticamente si ya existe output del día.
+#        El pipeline puede llamarse N veces al día — solo la
+#        primera vez corre la matemática pesada. Las siguientes
+#        van directo al trading (pasos 5-9), que SIEMPRE corre.
+#
+#        Archivos que se chequean:
+#          - Screener:  screener_candidates.json  (mtime hoy UTC)
+#          - Decider:   tickers.json              (mtime hoy UTC)
+#          - Models:    predictions/**/<HOY>.json (cualquiera)
+#          - Evaluator: evaluations/<HOY>/        (cualquier json)
+#                    o  evaluations/*<HOY>*.json
 #
 # FIX v2.1 — ADAPTIVE REGIME:
-#   [F6] regime_threshold_learner.run_learning_cycle() se ejecuta
-#        ANTES del paso 5 (market quant), para que los umbrales
-#        actualizados se usen en el ciclo actual.
-#   [F7] Import cambiado: market_quant_context (V3.3 adaptativo)
-#        en vez de market_state_evaluator
+#   [F6] regime_threshold_learner.run_learning_cycle() agregado
+#        entre paso 4 y paso 5. Aprende umbrales ANTES de calcular
+#        el régimen actual. No es crítico — si falla, continúa.
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -42,11 +53,11 @@ from model_runner import run_all_models
 from evaluator import evaluate_all
 from alpha_engine_v4 import compute_and_persist_alpha
 
-from market_quant_context import run_market_state          # [F7] V3.3 adaptativo
+from market_state_evaluator import run_market_state          # nombre original
 from market_qualitative_evaluator import evaluate_qualitative_market
 from market_orchestrator import MarketOrchestrator
 from trading_orchestrator import TradingOrchestrator
-from regime_threshold_learner import run_learning_cycle    # [F6] aprendizaje adaptativo
+from regime_threshold_learner import run_learning_cycle      # [F6] nuevo
 
 # =========================
 # ROUTER
@@ -56,7 +67,7 @@ logger = logging.getLogger("pipeline")
 
 
 # =========================================================
-# SMART SKIP
+# [F5] SMART SKIP — detectores de output del día
 # =========================================================
 
 def _today_utc() -> str:
@@ -64,6 +75,7 @@ def _today_utc() -> str:
 
 
 def _file_is_from_today(path: Path) -> bool:
+    """True si el archivo existe y fue modificado hoy (UTC)."""
     if not path.exists():
         return False
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
@@ -79,6 +91,7 @@ def _decider_done_today(data_path: Path) -> bool:
 
 
 def _models_done_today(data_path: Path) -> bool:
+    """True si hay al menos un JSON de predicción con fecha de hoy."""
     today     = _today_utc()
     pred_path = data_path / "predictions"
     if not pred_path.exists():
@@ -87,6 +100,7 @@ def _models_done_today(data_path: Path) -> bool:
 
 
 def _evaluator_done_today(data_path: Path) -> bool:
+    """True si hay al menos un JSON de evaluación con fecha de hoy."""
     today     = _today_utc()
     eval_path = data_path / "evaluations"
     if not eval_path.exists():
@@ -116,18 +130,17 @@ async def _run_pipeline_logic(request: Request):
         if _screener_done_today(DATA_PATH):
             screener_file = DATA_PATH / "screener_candidates.json"
             screener_out  = json.loads(screener_file.read_text())
-            logger.info(
-                f"⚡ [1/11] Screener SKIP — output de hoy existe "
-                f"| candidates={screener_out.get('n_candidates')}"
-            )
+            logger.info(f"⚡ [1/10] Screener SKIP — output de hoy existe | candidates={screener_out.get('n_candidates')}")
         else:
-            logger.info("🔍 [1/11] Screener...")
-            screener_out  = await run_screener_async()
+            logger.info("🔍 [1/10] Screener...")
+            screener_out = await run_screener_async()
+
             screener_file = DATA_PATH / "screener_candidates.json"
             screener_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = screener_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(screener_out, indent=2))
             tmp.replace(screener_file)
+
             logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
 
         # -------------------------------------------------
@@ -136,10 +149,10 @@ async def _run_pipeline_logic(request: Request):
         if _decider_done_today(DATA_PATH):
             tickers_data = json.loads((DATA_PATH / "tickers.json").read_text())
             total = len(tickers_data) if isinstance(tickers_data, list) else tickers_data.get("total", "?")
-            logger.info(f"⚡ [2/11] Decider SKIP — tickers.json de hoy existe | total={total}")
+            logger.info(f"⚡ [2/10] Decider SKIP — tickers.json de hoy existe | total={total}")
             decider_out = {"total": total, "added": []}
         else:
-            logger.info("🧠 [2/11] Decider...")
+            logger.info("🧠 [2/10] Decider...")
             decider_out = run_decider()
             logger.info(
                 f"✅ Decider OK | added={len(decider_out.get('added', []))} "
@@ -151,9 +164,9 @@ async def _run_pipeline_logic(request: Request):
         # -------------------------------------------------
         if _models_done_today(DATA_PATH):
             pred_count = sum(1 for _ in (DATA_PATH / "predictions").glob(f"**/{today}.json"))
-            logger.info(f"⚡ [3/11] Models SKIP — {pred_count} predicciones de hoy ya existen")
+            logger.info(f"⚡ [3/10] Models SKIP — {pred_count} predicciones de hoy ya existen")
         else:
-            logger.info("📈 [3/11] Model runner...")
+            logger.info("📈 [3/10] Model runner...")
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, run_all_models)
             logger.info("✅ Model runner OK")
@@ -162,47 +175,40 @@ async def _run_pipeline_logic(request: Request):
         # 4️⃣ EVALUATOR
         # -------------------------------------------------
         if _evaluator_done_today(DATA_PATH):
-            logger.info("⚡ [4/11] Evaluator SKIP — evaluaciones de hoy ya existen")
+            logger.info("⚡ [4/10] Evaluator SKIP — evaluaciones de hoy ya existen")
         else:
-            logger.info("📊 [4/11] Evaluator...")
+            logger.info("📊 [4/10] Evaluator...")
             evaluate_all()
             logger.info("✅ Evaluator executed")
 
         # -------------------------------------------------
-        # 5️⃣ REGIME LEARNER — [F6] NUEVO
-        # Aprende de los últimos 5 días ANTES de calcular
-        # el régimen actual, para usar umbrales actualizados
+        # [F6] 4.5 REGIME LEARNER — nuevo, no crítico
+        # Ajusta umbrales ANTES de calcular régimen actual.
+        # Si falla, el pipeline continúa normalmente.
         # -------------------------------------------------
-        logger.info("🧠 [5/11] Regime threshold learner...")
+        logger.info("🧠 [4.5/10] Regime threshold learner...")
         try:
-            loop = asyncio.get_event_loop()
+            loop         = asyncio.get_event_loop()
             learn_result = await loop.run_in_executor(None, run_learning_cycle)
-            outcome  = learn_result.get("outcome", "n/a")
-            regime_l = learn_result.get("regime",  "n/a")
-            spy_ret  = learn_result.get("spy_return_pct", 0)
             logger.info(
-                f"✅ Learner OK | regime={regime_l} outcome={outcome} "
-                f"spy_ret={spy_ret}%"
+                f"✅ Learner OK | regime={learn_result.get('regime', 'n/a')} "
+                f"outcome={learn_result.get('outcome', 'n/a')} "
+                f"spy_ret={learn_result.get('spy_return_pct', 0)}%"
             )
         except Exception as e:
-            # Learner nunca debe romper el pipeline
             logger.warning(f"⚠️ Learner falló (no crítico): {e}")
 
         # -------------------------------------------------
-        # 6️⃣ MARKET QUANT — siempre corre, usa umbrales actualizados
+        # 5️⃣ MARKET QUANT — siempre corre
         # -------------------------------------------------
-        logger.info("📉 [6/11] Market quantitative context (V3.3 adaptive)...")
+        logger.info("📉 [5/10] Market quantitative context...")
         quant_ctx = run_market_state()
-        logger.info(
-            f"✅ Market quant OK | regime={quant_ctx.regime} "
-            f"| dd={quant_ctx.drawdown_rolling:.3f} "
-            f"| vol={quant_ctx.volatility:.3f}"
-        )
+        logger.info(f"✅ Market quant OK | regime={quant_ctx.regime}")
 
         # -------------------------------------------------
-        # 7️⃣ MARKET QUALITATIVE — siempre corre
+        # 6️⃣ MARKET QUALITATIVE — siempre corre
         # -------------------------------------------------
-        logger.info("🧠 [7/11] Market qualitative context...")
+        logger.info("🧠 [6/10] Market qualitative context...")
         qual_ctx = evaluate_qualitative_market()
         logger.info(
             f"✅ Market qual OK | impact={qual_ctx.impact_score:.3f} "
@@ -210,9 +216,9 @@ async def _run_pipeline_logic(request: Request):
         )
 
         # -------------------------------------------------
-        # 8️⃣ MARKET ORCHESTRATOR — siempre corre
+        # 7️⃣ MARKET ORCHESTRATOR — siempre corre
         # -------------------------------------------------
-        logger.info("🧭 [8/11] Market orchestration...")
+        logger.info("🧭 [7/10] Market orchestration...")
         market_orch = MarketOrchestrator()
         market_ctx  = market_orch.evaluate(
             quant_ctx.to_dict(),
@@ -224,9 +230,9 @@ async def _run_pipeline_logic(request: Request):
         )
 
         # -------------------------------------------------
-        # 9️⃣ ALPHA ENGINE — siempre corre
+        # 8️⃣ ALPHA ENGINE — siempre corre (relee predicciones del disco)
         # -------------------------------------------------
-        logger.info("🔬 [9/11] Alpha engine...")
+        logger.info("🧠 [8/10] Alpha engine...")
         tickers_file = DATA_PATH / "tickers.json"
         tickers      = json.loads(tickers_file.read_text())
         alpha_out    = compute_and_persist_alpha(tickers)
@@ -236,23 +242,22 @@ async def _run_pipeline_logic(request: Request):
         )
 
         # -------------------------------------------------
-        # 🔟 TRADING ORCHESTRATOR — siempre corre
+        # 9️⃣ TRADING ORCHESTRATOR — siempre corre
         # -------------------------------------------------
-        logger.info("🤖 [10/11] Trading orchestrator...")
+        logger.info("🤖 [9/10] Trading orchestrator...")
         trading_orch = TradingOrchestrator()
         trade_out    = await trading_orch.run(
             market_ctx=market_ctx.to_dict()
         )
         logger.info(
             f"✅ Trading OK | mode={trade_out.get('mode')} "
-            f"| decisions={len(trade_out.get('decisions', []))} "
-            f"| capital=${trade_out.get('real_capital', 0):,.0f}"
+            f"| decisions={len(trade_out.get('decisions', []))}"
         )
 
         # -------------------------------------------------
-        # 1️⃣1️⃣ COMMIT A DISCO
+        # 🔟 COMMIT A DISCO
         # -------------------------------------------------
-        logger.info("💾 [11/11] Committing pipeline results...")
+        logger.info("💾 [10/10] Committing pipeline results...")
 
         PIPELINE_KEY = os.getenv("PIPELINE_KEY")
         BASE_URL     = str(request.base_url).rstrip("/")
@@ -261,15 +266,10 @@ async def _run_pipeline_logic(request: Request):
             "screener":   screener_out,
             "market_ctx": market_ctx.to_dict(),
             "audit": {
-                "timestamp":    datetime.utcnow().isoformat(),
-                "market_mode":  market_ctx.market_mode,
-                "confidence":   market_ctx.confidence,
-                "decisions":    len(trade_out.get("decisions", [])),
-                "real_capital": trade_out.get("real_capital"),
-                "regime_thresholds": {
-                    "dd_max":  quant_ctx.thresholds_used.get("defensive", {}).get("dd_max"),
-                    "vol_min": quant_ctx.thresholds_used.get("defensive", {}).get("vol_min"),
-                },
+                "timestamp":   datetime.utcnow().isoformat(),
+                "market_mode": market_ctx.market_mode,
+                "confidence":  market_ctx.confidence,
+                "decisions":   len(trade_out.get("decisions", [])),
             },
         }
 
@@ -301,7 +301,7 @@ async def _run_pipeline_logic(request: Request):
 
 
 # =========================================================
-# PIPELINE ENDPOINT
+# PIPELINE ENDPOINT (RESPUESTA INMEDIATA)
 # =========================================================
 @router.post("/internal/pipeline/run")
 async def run_pipeline(request: Request):
@@ -314,5 +314,5 @@ async def run_pipeline(request: Request):
     return {
         "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
-        }
-        
+    }
+    
