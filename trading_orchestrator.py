@@ -2,7 +2,7 @@ import logging
 import asyncio
 import os
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from pathlib import Path
 from broker import get_engine
@@ -16,17 +16,18 @@ from pm_defensive import PMDefensive
 logger = logging.getLogger("trading_orchestrator")
 logging.basicConfig(level=logging.INFO)
 
-DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
-ALPHA_FILE = DATA_PATH / "alpha_last.json"
+DATA_PATH   = Path(os.getenv("DATA_PATH", "/data"))
+ALPHA_FILE  = DATA_PATH / "alpha_last.json"
 ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
 
 
 class TradingOrchestrator:
 
     def __init__(self):
-        self.broker = get_engine()
-        self.fixed_capital = float(os.getenv("FIXED_CAPITAL", "1000000"))
-        self.daily_limit = int(os.getenv("MAX_ORDERS_DAY", "15"))
+        self.broker            = get_engine()
+        self.daily_limit       = int(os.getenv("MAX_ORDERS_DAY", "15"))
+        self._fallback_capital = float(os.getenv("FIXED_CAPITAL", "1000000"))
+        self.fixed_capital     = self._fallback_capital  # se sobreescribe en run()
 
         self.alpha_growth      = float(os.getenv("ALPHA_GROWTH",    "0.65"))
         self.alpha_neutral     = float(os.getenv("ALPHA_NEUTRAL",   "0.75"))
@@ -35,12 +36,38 @@ class TradingOrchestrator:
         self.alpha_hold_shield = float(os.getenv("ALPHA_SHIELD",    "0.75"))
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
-        self.governor = CapitalGovernor(self.fixed_capital)
-        logger.info(f"🚀 v3.8 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        self.governor = None
+        logger.info(f"🚀 v3.9 ALPHA-CONSUMER | fallback capital ${self._fallback_capital:,.0f}")
+
+    # =========================================================
+    # [F4] Capital real desde Alpaca — se llama múltiples veces
+    # =========================================================
+    async def _get_real_capital(self) -> float:
+        """Lee equity real desde Alpaca. Fallback a env var si falla."""
+        try:
+            account = await self.broker.get_account()
+            equity  = float(account.equity)
+            if equity > 0:
+                logger.info(f"💰 Capital real Alpaca: ${equity:,.0f}")
+                return equity
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo leer equity: {e} → fallback ${self._fallback_capital:,.0f}")
+        return self._fallback_capital
+
+    async def _refresh_governor(self) -> CapitalGovernor:
+        """
+        Lee capital real actualizado y devuelve un governor fresco.
+        Llamar ANTES de cada bloque de sizing para reflejar
+        el buying power real después de cierres o compras previas.
+        """
+        self.fixed_capital = await self._get_real_capital()
+        gov = CapitalGovernor(fixed_capital=self.fixed_capital)
+        logger.info(f"🏛 Governor refrescado | capital=${self.fixed_capital:,.0f}")
+        return gov
 
     def _load_anchor_tickers(self) -> set:
         try:
-            data = json.loads(ANCHOR_FILE.read_text())
+            data    = json.loads(ANCHOR_FILE.read_text())
             tickers = {a["ticker"].upper() for a in data if "ticker" in a}
             logger.info(f"⚓ Anchor universe cargado: {len(tickers)} tickers")
             return tickers
@@ -54,9 +81,7 @@ class TradingOrchestrator:
             broker_data = self.broker.get_positions()
             if not broker_data:
                 logger.warning("⚠️ Broker devolvió 0 posiciones → leyendo desde disco")
-                disk_positions = load_positions()
-                logger.info(f"📂 Disco positions: {len(disk_positions)}")
-            for ticker, data in broker_data.items():
+            for ticker, data in (broker_data or {}).items():
                 cp = data.get("current_price") or data.get("price_now")
                 if cp and float(cp) > 0:
                     broker_price_map[ticker.upper()] = float(cp)
@@ -64,32 +89,27 @@ class TradingOrchestrator:
                     avg = data.get("avg_entry_price")
                     if avg and float(avg) > 0:
                         broker_price_map[ticker.upper()] = float(avg)
-                        logger.warning(
-                            f"⚠️ {ticker} current_price=0 — usando avg_entry_price: {float(avg):.2f}"
-                        )
+                        logger.warning(f"⚠️ {ticker} current_price=0 → avg_entry: {float(avg):.2f}")
             logger.info(f"💹 Precios Alpaca obtenidos: {len(broker_price_map)} tickers")
         except Exception as e:
             logger.warning(f"⚠️ No se pudo obtener precios del broker: {e}")
 
-        enriched = []
+        enriched  = []
         price_map = {}
 
         for pos in positions:
             ticker = str(pos.get("ticker", "")).upper()
-            pos = dict(pos)
+            pos    = dict(pos)
 
             if ticker in broker_price_map:
                 pos["price_now"] = broker_price_map[ticker]
                 price_map[ticker] = broker_price_map[ticker]
-                logger.debug(f"💹 {ticker} precio Alpaca: {broker_price_map[ticker]:.2f}")
-
             elif float(pos.get("entry_price", 0) or 0) > 0:
                 pos["price_now"] = float(pos["entry_price"])
-                logger.warning(f"⚠️ {ticker} sin precio Alpaca — usando entry_price: {pos['price_now']:.2f}")
-
+                logger.warning(f"⚠️ {ticker} sin precio Alpaca → entry_price: {pos['price_now']:.2f}")
             else:
                 pos["price_now"] = 1.0
-                logger.error(f"❌ {ticker} SIN PRECIO DISPONIBLE — usando 1.0, cierre puede fallar")
+                logger.error(f"❌ {ticker} SIN PRECIO → usando 1.0")
 
             enriched.append(pos)
 
@@ -127,20 +147,22 @@ class TradingOrchestrator:
                 price = o.get("entry_price") or o.get("price_now")
 
             if not price or float(price) <= 0:
-                logger.warning(f"⚠️ {ticker} sin precio para sizing — saltado")
+                logger.warning(f"⚠️ {ticker} sin precio → saltado")
                 continue
 
-            price = float(price)
+            price      = float(price)
             target_pct = float(o.get("target_pct", 0.05))
+
+            # [F4] Usa fixed_capital real actualizado
             shares = int((self.fixed_capital * target_pct) // price)
 
             if shares <= 0:
-                logger.warning(f"⚠️ {ticker} shares=0 con price={price:.2f} — saltado")
+                logger.warning(f"⚠️ {ticker} shares=0 price={price:.2f} capital={self.fixed_capital:,.0f} → saltado")
                 continue
 
-            o = dict(o)
+            o              = dict(o)
             o["entry_price"] = price
-            o["shares"] = shares
+            o["shares"]      = shares
             enriched.append(o)
             logger.info(
                 f"💡 {ticker} enriquecido: {shares}s @ ${price:.2f} "
@@ -155,7 +177,6 @@ class TradingOrchestrator:
             if hasattr(self.broker, "cancel_all_orders"):
                 try:
                     await self.broker.cancel_all_orders()
-                    logger.info("🗑 Órdenes pendientes canceladas (cancel_all)")
                 except Exception as e:
                     logger.warning(f"⚠️ cancel_all_orders falló: {e}")
             return
@@ -169,12 +190,20 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
+    # =========================================================
+    # RUN PRINCIPAL v3.9
+    # =========================================================
     async def run(
         self,
         market_ctx: Dict[str, Any],
         signals: Dict = None,
         anchor_universe: List = None
     ) -> Dict:
+
+        # ── PASO 1: Capital real inicial ──────────────────────
+        self.fixed_capital = await self._get_real_capital()
+        self.governor      = CapitalGovernor(fixed_capital=self.fixed_capital)
+        logger.info(f"🚀 v3.9 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
@@ -199,17 +228,16 @@ class TradingOrchestrator:
                     save_positions(positions)
                     logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
 
-        positions = self._enrich_positions_with_price(positions)
-
-        broker_positions = load_positions()
-        real_positions = {p["ticker"].upper() for p in broker_positions}
+        positions         = self._enrich_positions_with_price(positions)
+        broker_positions  = load_positions()
+        real_positions    = {p["ticker"].upper() for p in broker_positions}
         portfolio_tickers = real_positions
-        mode = market_ctx.get("market_mode", "neutral")
+        mode              = market_ctx.get("market_mode", "neutral")
 
         logger.info(f"📊 Portfolio: {len(positions)} | Real en broker: {len(real_positions)} | Mode: {mode}")
 
         alpha_data = self._load_last_alpha()
-        alpha_map = {
+        alpha_map  = {
             t.upper(): d
             for t, d in alpha_data.get("results", {}).items()
             if isinstance(d, dict)
@@ -218,46 +246,58 @@ class TradingOrchestrator:
         pm_decisions = await self._get_pm_decisions(mode, positions, signals or {}, anchor_universe)
 
         closes = []
-        opens = []
+        opens  = []
 
         for decision in pm_decisions:
             if decision.get("action") == "CLOSE":
                 ticker = decision.get("ticker", "").upper()
+                reason = decision.get("reason", "")
 
                 if ticker not in real_positions:
                     logger.warning(f"⚠️ SKIP CLOSE {ticker} → no existe en broker")
                     continue
 
-                alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
+                # [N1] No procesar HOLDs preventivos como cierres
+                if "hold" in reason.lower():
+                    logger.info(f"🛡 SKIP CLOSE {ticker} — es HOLD preventivo: {reason}")
+                    continue
 
+                alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
                 if alpha_score >= self.alpha_hold_shield:
                     logger.info(f"🛡 SHIELD BLOCK {ticker} | alpha={alpha_score:.3f}")
                     continue
 
-                closes.append({
-                    "action": "CLOSE",
-                    "ticker": ticker,
-                    "reason": decision.get("reason", "PM_CLOSE")
-                })
+                closes.append({"action": "CLOSE", "ticker": ticker, "reason": reason})
 
         for ticker in portfolio_tickers:
             alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
             if alpha_score <= self.alpha_kill:
                 if ticker not in real_positions:
-                    logger.warning(f"⚠️ SKIP KILL {ticker} → no existe en broker")
                     continue
-                closes.append({
-                    "action": "CLOSE",
-                    "ticker": ticker,
-                    "reason": f"ALPHA_KILL_{alpha_score:.3f}"
-                })
+                closes.append({"action": "CLOSE", "ticker": ticker, "reason": f"ALPHA_KILL_{alpha_score:.3f}"})
                 logger.warning(f"💀 KILL {ticker} | alpha={alpha_score:.3f}")
 
         closes = list({c["ticker"]: c for c in closes}.values())
 
+        # ── PASO 2: Ejecutar CIERRES ──────────────────────────
+        close_successes = []
         if closes:
             await self._cancel_pending_orders([c["ticker"] for c in closes])
             await asyncio.sleep(0.5)
+
+            for order in closes[:self.daily_limit]:
+                try:
+                    await asyncio.wait_for(self.broker.execute_decision(order), timeout=30)
+                    close_successes.append(order["ticker"])
+                    logger.info(f"⚰️ CLOSED {order['ticker']}")
+                    await asyncio.sleep(0.8)
+                except Exception as e:
+                    logger.error(f"❌ CLOSE ERROR {order.get('ticker')}: {e}")
+
+        # ── PASO 3: Refrescar capital DESPUÉS de cierres ──────
+        # El buying power cambia tras cada cierre — el governor debe
+        # conocer el valor real antes de calcular aperturas
+        self.governor = await self._refresh_governor()
 
         for decision in pm_decisions:
             if decision.get("action") in ["OPEN", "ROTATE"]:
@@ -269,14 +309,14 @@ class TradingOrchestrator:
             score = data.get("alpha_score", 0)
             if ticker not in portfolio_tickers and score >= threshold:
                 opens.append({
-                    "action": "OPEN",
-                    "ticker": ticker,
+                    "action":     "OPEN",
+                    "ticker":     ticker,
                     "target_pct": 0.05,
-                    "reason": f"ALPHA_INJECT_{score:.3f}",
-                    "alpha": score
+                    "reason":     f"ALPHA_INJECT_{score:.3f}",
+                    "alpha":      score,
                 })
 
-        opens_dict = {o["ticker"].upper(): o for o in opens}
+        opens_dict   = {o["ticker"].upper(): o for o in opens}
         unique_opens = self._enrich_opens_with_price_and_shares(list(opens_dict.values()))
 
         anchor_opens = [
@@ -284,23 +324,24 @@ class TradingOrchestrator:
             if o.get("is_anchor") or o.get("reason", "").startswith("ANCHOR")
                or o.get("ticker", "").upper() in anchor_tickers
         ]
-        normal_opens = [o for o in unique_opens if o not in anchor_opens]
+        normal_opens       = [o for o in unique_opens if o not in anchor_opens]
         close_tickers_list = [c["ticker"] for c in closes]
 
+        # Sizing con capital post-cierres real
         sized_anchors = self.governor.adjust_sizing_after_closes(
             positions, close_tickers_list, anchor_opens
         ) if anchor_opens else []
         sized_normals = self.governor.adjust_sizing(positions, normal_opens) if normal_opens else []
-        sized_opens = sized_anchors + sized_normals
+        sized_opens   = sized_anchors + sized_normals
 
         logger.info(f"📐 Sizing | anchors={len(sized_anchors)} normals={len(sized_normals)} total={len(sized_opens)}")
 
-        final_queue = closes[:]
+        final_queue = []
         elite_count = 0
 
         for cmd in sized_opens:
-            ticker = cmd["ticker"].upper()
-            score = alpha_map.get(ticker, {}).get("alpha_score", 0)
+            ticker    = cmd["ticker"].upper()
+            score     = alpha_map.get(ticker, {}).get("alpha_score", 0)
             is_anchor = ticker in anchor_tickers
 
             if score >= self.alpha_elite:
@@ -315,26 +356,33 @@ class TradingOrchestrator:
             else:
                 logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f}")
 
-        results = []
-        executed = 0
-        close_successes = []
+        # ── PASO 4: Ejecutar APERTURAS ────────────────────────
+        results          = []
+        executed_opens   = 0
+        remaining_orders = self.daily_limit - len(close_successes)
 
-        for order in final_queue[:self.daily_limit]:
+        for order in final_queue[:max(0, remaining_orders)]:
             try:
                 await asyncio.wait_for(self.broker.execute_decision(order), timeout=30)
                 results.append({"ticker": order["ticker"], "status": "success"})
-                executed += 1
-                if order["action"] == "CLOSE":
-                    close_successes.append(order["ticker"])
+                executed_opens += 1
                 await asyncio.sleep(0.8)
+
+                # ── [F4] Refrescar governor después de CADA compra ──
+                # El buying power real cambia con cada orden ejecutada.
+                # Sin este refresh el governor calcularía sizing sobre
+                # un capital que ya no existe, causando insufficient buying power.
+                self.governor = await self._refresh_governor()
+
             except Exception as e:
                 logger.error(f"❌ EXECUTION ERROR for {order.get('ticker')}: {e}")
                 results.append({
                     "ticker": order.get("ticker"),
                     "status": "error",
-                    "error": str(e)
+                    "error":  str(e),
                 })
 
+        # ── PASO 5: Limpiar store si todos los cierres OK ─────
         if close_successes:
             all_closes_ok = len(close_successes) == len(closes)
             try:
@@ -349,41 +397,49 @@ class TradingOrchestrator:
                 logger.info("🧹 Todos los cierres OK + broker vacío → clear_positions()")
                 clear_positions()
             else:
-                logger.info("📂 Cierres parciales o broker aún tiene posiciones → manteniendo store")
+                logger.info("📂 Cierres parciales → manteniendo store")
 
-        logger.info(f"✅ EXECUTED {executed}/{len(final_queue)} | Elite executed: {elite_count}")
+        total_executed = len(close_successes) + executed_opens
+        logger.info(
+            f"✅ EXECUTED {total_executed} | "
+            f"Cierres={len(close_successes)} Aperturas={executed_opens} | "
+            f"Elite={elite_count} | Capital final=${self.fixed_capital:,.0f}"
+        )
 
         return {
-            "status": "success",
-            "mode": mode,
-            "executed": executed,
-            "elite_executed": elite_count,
-            "queue_size": len(final_queue),
+            "status":          "success",
+            "mode":            mode,
+            "executed":        total_executed,
+            "closes_executed": len(close_successes),
+            "opens_executed":  executed_opens,
+            "elite_executed":  elite_count,
+            "queue_size":      len(final_queue),
+            "real_capital":    round(self.fixed_capital, 2),
             "alpha_timestamp": alpha_data.get("timestamp"),
-            "results": results,
-            "decisions": pm_decisions,
+            "results":         results,
+            "decisions":       pm_decisions,
         }
 
     async def preview_executability(self, market_ctx: Dict) -> Dict:
-        positions = self._enrich_positions_with_price(load_positions())
+        positions  = self._enrich_positions_with_price(load_positions())
         alpha_data = self._load_last_alpha()
-        alpha_map = {
+        alpha_map  = {
             t.upper(): d
             for t, d in alpha_data.get("results", {}).items()
             if isinstance(d, dict)
         }
-        mode = market_ctx.get("market_mode", "neutral")
+        mode      = market_ctx.get("market_mode", "neutral")
         threshold = self._alpha_threshold(mode)
 
         rows = []
         for ticker, data in alpha_map.items():
             score = data.get("alpha_score", 0)
             rows.append({
-                "ticker": ticker,
-                "alpha": score,
+                "ticker":     ticker,
+                "alpha":      score,
                 "executable": score >= threshold,
-                "mode": mode,
-                "threshold": threshold,
+                "mode":       mode,
+                "threshold":  threshold,
             })
 
         rows.sort(key=lambda x: x["alpha"] or 0, reverse=True)
@@ -391,20 +447,18 @@ class TradingOrchestrator:
 
     def _load_last_alpha(self) -> Dict:
         if not ALPHA_FILE.exists():
-            raise RuntimeError("❌ alpha_last.json no encontrado. Ejecuta alpha_engine primero.")
+            raise RuntimeError("❌ alpha_last.json no encontrado.")
         try:
             data = json.loads(ALPHA_FILE.read_text())
         except Exception as e:
             raise RuntimeError(f"❌ alpha_last.json corrupto: {e}")
-        logger.info(
-            f"🧠 Alpha loaded | ts={data.get('timestamp')} | universe={data.get('universe_size')}"
-        )
+        logger.info(f"🧠 Alpha loaded | ts={data.get('timestamp')} | universe={data.get('universe_size')}")
         return data
 
     def _alpha_threshold(self, mode: str) -> float:
         return {
-            "growth": self.alpha_growth,
-            "defensive": self.alpha_defensive
+            "growth":    self.alpha_growth,
+            "defensive": self.alpha_defensive,
         }.get(mode, self.alpha_neutral)
 
     async def _get_pm_decisions(
@@ -412,7 +466,7 @@ class TradingOrchestrator:
         mode: str,
         positions: List[Dict],
         signals: Dict,
-        anchor: List
+        anchor: List,
     ) -> List[Dict]:
         decisions = []
         try:
@@ -423,19 +477,9 @@ class TradingOrchestrator:
                     if isinstance(d, dict):
                         decisions.append(d)
             elif mode == "defensive":
-                pm = PMDefensive()
+                pm  = PMDefensive()
                 raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
                 if isinstance(raw, list):
-                    decisions.extend([
-                        r if isinstance(r, dict) else r.to_dict() for r in raw
-                    ])
+                    decisions.extend([r if isinstance(r, dict) else r.to_dict() for r in raw])
                 elif isinstance(raw, dict):
-                    decisions.extend(raw.get("decisions", []))
-            else:
-                pm = PMNeutral()
-                raw = pm.evaluate_portfolio(positions)
-                decisions.extend(raw.get("decisions", []))
-        except Exception as e:
-            logger.error(f"PM error: {e}")
-        return decisions
-                
+                    decisions.extend(raw.get("
