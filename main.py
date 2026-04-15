@@ -35,6 +35,8 @@ from broker import router as trading_router
 from alpha_router import router as alpha_router
 from performance_router import router as performance_router
 from analysis_router import router as analysis_router
+from execution_analyzer import router as execution_router
+
 
 # =========================================================
 # CONFIG
@@ -161,6 +163,8 @@ app.include_router(trading_router)
 app.include_router(alpha_router)
 app.include_router(performance_router)
 app.include_router(analysis_router)
+app.include_router(execution_router)
+
 
 # =========================================================
 # PIPELINE COMMIT
