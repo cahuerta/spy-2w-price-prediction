@@ -11,6 +11,10 @@
 #        Antes: dd <= -0.25 → nunca se activaba DEFENSIVE
 #   [A3] Guarda snapshot diario en market_history/ para que
 #        regime_threshold_learner.py pueda evaluar aciertos
+#
+# FIX v3.3.1:
+#   [A4] spy_price: yfinance puede retornar DataFrame en vez de Series
+#        para un solo ticker. Usar squeeze() + scalar() para forzar float.
 # =========================================================
 
 import os
@@ -36,23 +40,23 @@ DD_LOOKBACK    = 63
 TREND_LOOKBACK = 50
 CORR_LOOKBACK  = 30
 
-DATA_PATH            = Path(os.getenv("DATA_PATH", "/data"))
-MARKET_HISTORY_DIR   = DATA_PATH / "market_history"
-THRESHOLDS_FILE      = DATA_PATH / "regime_thresholds.json"
+DATA_PATH          = Path(os.getenv("DATA_PATH", "/data"))
+MARKET_HISTORY_DIR = DATA_PATH / "market_history"
+THRESHOLDS_FILE    = DATA_PATH / "regime_thresholds.json"
 
 # =========================================================
 # [A2] UMBRALES POR DEFECTO — REALISTAS
 # =========================================================
 DEFAULT_THRESHOLDS = {
     "defensive": {
-        "dd_max":   -0.08,   # drawdown ≤ -8% → defensive
-        "vol_min":   0.25,   # volatilidad ≥ 25% → defensive
-        "corr_min":  0.75,   # correlación ≥ 75% → defensive
+        "dd_max":  -0.08,
+        "vol_min":  0.25,
+        "corr_min": 0.75,
     },
     "growth": {
-        "trend_min": 0.05,   # tendencia > 5% → candidato growth
-        "vol_max":   0.15,   # volatilidad ≤ 15% → growth posible
-        "corr_max":  0.55,   # correlación < 55% → growth posible
+        "trend_min": 0.05,
+        "vol_max":   0.15,
+        "corr_max":  0.55,
     },
     "meta": {
         "version":        1,
@@ -65,17 +69,16 @@ DEFAULT_THRESHOLDS = {
     }
 }
 
-# Límites para evitar umbrales absurdos
 THRESHOLD_LIMITS = {
     "defensive": {
-        "dd_max":   (-0.03, -0.20),   # entre -3% y -20%
-        "vol_min":  (0.15,   0.50),   # entre 15% y 50%
-        "corr_min": (0.55,   0.95),   # entre 55% y 95%
+        "dd_max":   (-0.03, -0.20),
+        "vol_min":  (0.15,   0.50),
+        "corr_min": (0.55,   0.95),
     },
     "growth": {
-        "trend_min": (0.01,  0.15),   # entre 1% y 15%
-        "vol_max":   (0.08,  0.25),   # entre 8% y 25%
-        "corr_max":  (0.35,  0.70),   # entre 35% y 70%
+        "trend_min": (0.01,  0.15),
+        "vol_max":   (0.08,  0.25),
+        "corr_max":  (0.35,  0.70),
     },
 }
 
@@ -85,17 +88,13 @@ THRESHOLD_LIMITS = {
 # =========================================================
 
 def load_thresholds() -> Dict:
-    """Carga umbrales desde disco. Si no existe, crea con defaults."""
     if THRESHOLDS_FILE.exists():
         try:
             data = json.loads(THRESHOLDS_FILE.read_text())
-            # Validar que tenga todas las claves necesarias
             if "defensive" in data and "growth" in data:
                 return data
         except Exception:
             pass
-
-    # Crear archivo con defaults
     save_thresholds(DEFAULT_THRESHOLDS)
     return DEFAULT_THRESHOLDS.copy()
 
@@ -141,7 +140,7 @@ class QuantMarketContext:
     downside_risk: Literal["low", "medium", "high", "unknown"]
     n_observations: int
     corr_source: Literal["measured", "historical", "knn", "unavailable"]
-    thresholds_used: Dict   # [A1] para trazabilidad
+    thresholds_used: Dict
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -193,7 +192,7 @@ def load_market_history() -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for f in MARKET_HISTORY_DIR.iterdir():
-        if not f.suffix == ".json":
+        if f.suffix != ".json":
             continue
         try:
             rows.append(json.loads(f.read_text()))
@@ -203,17 +202,12 @@ def load_market_history() -> pd.DataFrame:
 
 
 def save_market_snapshot(ctx: QuantMarketContext, spy_price: float) -> None:
-    """
-    [A3] Guarda snapshot diario para que el learner evalúe aciertos.
-    Incluye precio SPY para calcular retorno futuro.
-    """
+    """[A3] Snapshot diario para aprendizaje del learner."""
     MARKET_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.utcnow().date().isoformat()
     path  = MARKET_HISTORY_DIR / f"{today}.json"
-
     if path.exists():
-        return  # ya guardado hoy
-
+        return
     snapshot = {
         "date":                    today,
         "regime":                  ctx.regime,
@@ -266,30 +260,16 @@ def classify_downside(dd: float) -> Literal["low", "medium", "high", "unknown"]:
 
 
 def classify_regime(
-    vol: float,
-    dd: float,
-    corr: float,
-    trend: float,
-    thresholds: Dict,
+    vol: float, dd: float, corr: float, trend: float, thresholds: Dict,
 ) -> Literal["growth", "neutral", "defensive"]:
-    """
-    [A1] Usa umbrales adaptativos desde thresholds.json
-    En vez de valores hardcodeados imposibles.
-    """
     if any(np.isnan(x) for x in [vol, dd, corr, trend]):
         return "neutral"
-
     td = thresholds["defensive"]
     tg = thresholds["growth"]
-
-    # DEFENSIVE — cualquier condición suficiente
     if dd <= td["dd_max"] or vol >= td["vol_min"] or corr >= td["corr_min"]:
         return "defensive"
-
-    # GROWTH — todas las condiciones deben cumplirse
     if trend > tg["trend_min"] and vol <= tg["vol_max"] and corr < tg["corr_max"]:
         return "growth"
-
     return "neutral"
 
 
@@ -307,7 +287,9 @@ def load_market_prices() -> tuple:
     if main.empty or cross.empty:
         raise RuntimeError("Datos de mercado no disponibles")
 
-    prices_main  = main["Close"].dropna()
+    # [A4] squeeze() fuerza Series aunque yfinance retorne DataFrame
+    prices_main = main["Close"].squeeze().dropna()
+
     prices_cross = (
         cross["Close"] if isinstance(cross.columns, pd.MultiIndex)
         else cross.filter(like="Close")
@@ -323,10 +305,12 @@ def load_market_prices() -> tuple:
 def run_market_state() -> QuantMarketContext:
     prices_main, prices_cross = load_market_prices()
     history    = load_market_history()
-    thresholds = load_thresholds()  # [A1]
+    thresholds = load_thresholds()
 
-    returns  = prices_main.pct_change().dropna()
-    spy_price = float(prices_main.iloc[-1])
+    returns = prices_main.pct_change().dropna()
+
+    # [A4] _scalar() garantiza float aunque iloc[-1] sea Serie o array
+    spy_price = _scalar(prices_main.iloc[-1])
 
     vol_raw   = realized_volatility(returns)
     dd_raw    = rolling_drawdown(prices_main)
@@ -365,13 +349,10 @@ def run_market_state() -> QuantMarketContext:
         },
     )
 
-    # [A3] Guardar snapshot para aprendizaje posterior
     save_market_snapshot(ctx, spy_price)
-
     return ctx
 
 
 if __name__ == "__main__":
     ctx = run_market_state()
     print(json.dumps(ctx.to_dict(), indent=2))
-        
