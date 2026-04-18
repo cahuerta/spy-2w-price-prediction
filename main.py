@@ -36,6 +36,7 @@ from alpha_router import router as alpha_router
 from performance_router import router as performance_router
 from analysis_router import router as analysis_router
 from execution_analyzer import router as execution_router
+from scheduler import start_scheduler
 
 
 # =========================================================
@@ -191,6 +192,9 @@ async def pipeline_commit(payload: Dict[str, Any], request: Request):
 
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
+@app.on_event("startup")
+async def startup():
+    start_scheduler()
 # =========================================================
 # TRADING
 # =========================================================
