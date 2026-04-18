@@ -1,5 +1,5 @@
 # =========================================================
-# main.py — TRADING SUITE ENTERPRISE v2.9.0 PRODUCCIÓN
+# main.py — TRADING SUITE ENTERPRISE v2.9.1 PRODUCCIÓN
 # =========================================================
 # ✔ Runtime de trading (NO batch)
 # ✔ NO decide mercado
@@ -9,6 +9,7 @@
 # ✔ GRABA a disco (fuente única)
 # ✔ Ejecuta SOLO TradingOrchestrator
 # ✔ 🔥 MERGE DE TICKERS EN STARTUP (NUNCA BORRA)
+# ✔ 🕐 SCHEDULER INTERNO (reemplaza cron externo)
 # =========================================================
 
 import os
@@ -43,20 +44,19 @@ from scheduler import start_scheduler
 # CONFIG
 # =========================================================
 class Config:
-    DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
-    PORT = int(os.getenv("PORT", "8000"))
+    DATA_PATH    = Path(os.getenv("DATA_PATH", "/data"))
+    PORT         = int(os.getenv("PORT", "8000"))
     PIPELINE_KEY = os.getenv("PIPELINE_KEY")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+    LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
 
 config = Config()
 
-DATA_PATH = config.DATA_PATH
-
-TICKERS_FILE = DATA_PATH / "tickers.json"
-REPO_TICKERS_FILE = Path(__file__).resolve().parent / "tickers.json"
-MARKET_CTX_FILE = DATA_PATH / "market_context.json"
-SCREENER_FILE = DATA_PATH / "screener_candidates.json"
-PIPELINE_AUDIT_FILE = DATA_PATH / "last_pipeline.json"
+DATA_PATH            = config.DATA_PATH
+TICKERS_FILE         = DATA_PATH / "tickers.json"
+REPO_TICKERS_FILE    = Path(__file__).resolve().parent / "tickers.json"
+MARKET_CTX_FILE      = DATA_PATH / "market_context.json"
+SCREENER_FILE        = DATA_PATH / "screener_candidates.json"
+PIPELINE_AUDIT_FILE  = DATA_PATH / "last_pipeline.json"
 
 # =========================================================
 # LOGGING
@@ -85,16 +85,10 @@ def load_json(path: Path, default):
 # 🔥 MERGE DE TICKERS (STARTUP)
 # =========================================================
 def merge_tickers_on_startup():
-    """
-    Une tickers base + tickers dinámicos.
-    NUNCA borra. SOLO agrega.
-    """
     logger.info("🔧 Merging tickers on startup")
 
-    # --- tickers existentes en disco (fuente real) ---
     disk_tickers: List[str] = load_json(TICKERS_FILE, [])
 
-    # --- tickers base desde el repo ---
     if REPO_TICKERS_FILE.exists():
         try:
             repo_raw = json.loads(REPO_TICKERS_FILE.read_text())
@@ -134,14 +128,15 @@ def load_market_context() -> MarketOrchestrationContext:
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite v2.9.0 START")
+    logger.info("🚀 Trading Suite v2.9.1 START")
     merge_tickers_on_startup()
+    start_scheduler()
     yield
-    logger.info("🛑 Trading Suite v2.9.0 STOP")
+    logger.info("🛑 Trading Suite v2.9.1 STOP")
 
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.9.0",
+    version="2.9.1",
     lifespan=lifespan,
 )
 
@@ -166,7 +161,6 @@ app.include_router(performance_router)
 app.include_router(analysis_router)
 app.include_router(execution_router)
 
-
 # =========================================================
 # PIPELINE COMMIT
 # =========================================================
@@ -180,21 +174,15 @@ async def pipeline_commit(payload: Dict[str, Any], request: Request):
     try:
         if "screener" in payload:
             save_json(SCREENER_FILE, payload["screener"])
-
         if "market_ctx" in payload:
             save_json(MARKET_CTX_FILE, payload["market_ctx"])
-
         save_json(PIPELINE_AUDIT_FILE, payload)
-
     except Exception as e:
         logger.error("❌ Commit failed")
         raise HTTPException(500, str(e))
 
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
-@app.on_event("startup")
-async def startup():
-    start_scheduler()
 # =========================================================
 # TRADING
 # =========================================================
@@ -203,38 +191,41 @@ async def trading_run(request: Request):
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
-    market_ctx = load_market_context()
+    market_ctx   = load_market_context()
     orchestrator = TradingOrchestrator()
-    result = await orchestrator.run(market_ctx.to_dict())
+    result       = await orchestrator.run(market_ctx.to_dict())
 
     return {
-        "status": "ok",
+        "status":      "ok",
         "market_mode": market_ctx.market_mode,
-        "result": result,
-        "timestamp": datetime.utcnow().isoformat(),
+        "result":      result,
+        "timestamp":   datetime.utcnow().isoformat(),
     }
-# =========================================================
-# INTERNAL INSPECTION (para frontend / debug)
-# =========================================================
 
+# =========================================================
+# INTERNAL INSPECTION
+# =========================================================
 @app.get("/internal/pipeline-last")
 async def internal_pipeline_last(request: Request):
-    # Protegido con PIPELINE_KEY
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
+    return load_json(PIPELINE_AUDIT_FILE, {})
 
-    # last_pipeline.json
+
+@app.get("/internal/pipeline/last")
+async def get_last_pipeline():
+    if not PIPELINE_AUDIT_FILE.exists():
+        return {"status": "no_pipeline_executed"}
     return load_json(PIPELINE_AUDIT_FILE, {})
 
 
 @app.get("/internal/trades-today")
 async def internal_trades_today(request: Request):
-    # Protegido con PIPELINE_KEY
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    fp = DATA_PATH / "trades" / f"trades_{today}.jsonl"
+    fp    = DATA_PATH / "trades" / f"trades_{today}.jsonl"
 
     if not fp.exists():
         return []
@@ -247,19 +238,17 @@ async def internal_trades_today(request: Request):
         try:
             out.append(json.loads(line))
         except Exception:
-            # si hay una línea corrupta, la ignoramos
             continue
     return out
 
 
 @app.get("/internal/positions")
 async def internal_positions(request: Request):
-    # Protegido con PIPELINE_KEY
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
-
     from portfolio_store import load_positions
     return load_positions()
+
 # =========================================================
 # HEALTH
 # =========================================================
@@ -270,16 +259,11 @@ async def health():
 @app.get("/")
 def root():
     return {
-        "status": "ok",
+        "status":  "ok",
         "service": "spy-2w-price-prediction",
-        "env": "production"
+        "env":     "production"
     }
-@app.get("/internal/pipeline/last")
-async def get_last_pipeline():
-    if not PIPELINE_AUDIT_FILE.exists():
-        return {"status": "no_pipeline_executed"}
 
-    return load_json(PIPELINE_AUDIT_FILE, {})
 # =========================================================
 # SHUTDOWN
 # =========================================================
@@ -300,3 +284,4 @@ if __name__ == "__main__":
         port=config.PORT,
         log_level="error",
     )
+    
