@@ -1,10 +1,10 @@
 # =========================================================
-# pipeline_router.py — PIPELINE ROUTER v2.2
+# pipeline_router.py — PIPELINE ROUTER v2.3
 # =========================================================
-# v2.2:
-#   [F7] Intraday tracker integrado como paso 10.5
-#        Corre DESPUÉS del commit — siempre tiene predicciones
-#        frescas. No es crítico: si falla el pipeline continúa.
+# v2.2: [F7] Intraday tracker como paso 10.5
+# v2.3: [F8] Intraday evaluator como paso 4.6
+#        Evalúa decisiones del tracker de ayer y ajusta
+#        umbrales automáticamente. No es crítico.
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -142,6 +142,27 @@ async def _run_pipeline_logic(request: Request):
         except Exception as e:
             logger.warning(f"⚠️ Learner falló (no crítico): {e}")
 
+        # ── 4.6 INTRADAY EVALUATOR ────────────────────────
+        # [F8] Evalúa decisiones del tracker de ayer.
+        # Ajusta min_score automáticamente en intraday_learning.json.
+        # No es crítico — si falla el pipeline continúa.
+        logger.info("📊 [4.6/10] Intraday evaluator...")
+        try:
+            from intraday_evaluator import run_intraday_evaluator
+            loop     = asyncio.get_event_loop()
+            eval_out = await loop.run_in_executor(None, run_intraday_evaluator)
+            if eval_out.get("skipped"):
+                logger.info(f"⚡ Intraday evaluator SKIP | {eval_out.get('reason')}")
+            else:
+                logger.info(
+                    f"✅ Intraday evaluator OK | "
+                    f"entry_hr={eval_out.get('entry_hit_rate', 0):.1%} | "
+                    f"pos_hr={eval_out.get('position_hit_rate', 0):.1%} | "
+                    f"min_score={eval_out.get('min_score_actual')}"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ Intraday evaluator falló (no crítico): {e}")
+
         # ── 5. MARKET QUANT ───────────────────────────────
         logger.info("📉 [5/10] Market quantitative...")
         quant_ctx = run_market_state()
@@ -201,7 +222,7 @@ async def _run_pipeline_logic(request: Request):
         logger.info("✅ Pipeline committed")
 
         # ── 10.5 INTRADAY TRACKER ─────────────────────────
-        # [F7] Corre DESPUÉS del commit — predicciones ya están en disco.
+        # [F7] Corre DESPUÉS del commit — predicciones ya en disco.
         # No es crítico: si falla el pipeline ya terminó correctamente.
         logger.info("📡 [10.5/10] Intraday tracker...")
         try:
@@ -244,5 +265,5 @@ async def run_pipeline(request: Request):
     return {
         "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
-    }
-    
+            }
+        
