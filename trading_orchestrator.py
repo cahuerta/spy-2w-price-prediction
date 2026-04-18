@@ -211,7 +211,6 @@ class TradingOrchestrator:
         anchor_universe: List = None
     ) -> Dict:
 
-        # PASO 1: Capital real inicial
         self.governor = await self._refresh_governor()
         logger.info(f"🚀 v4.0 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
@@ -236,9 +235,7 @@ class TradingOrchestrator:
                     positions = []
                 if positions:
                     save_positions(positions)
-                    logger.info(
-                        f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones"
-                    )
+                    logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
 
         positions         = self._enrich_positions_with_price(positions)
         broker_positions  = load_positions()
@@ -246,9 +243,7 @@ class TradingOrchestrator:
         portfolio_tickers = real_positions
         mode              = market_ctx.get("market_mode", "neutral")
 
-        logger.info(
-            f"📊 Portfolio: {len(positions)} | Real en broker: {len(real_positions)} | Mode: {mode}"
-        )
+        logger.info(f"📊 Portfolio: {len(positions)} | Real: {len(real_positions)} | Mode: {mode}")
 
         alpha_data = self._load_last_alpha()
         alpha_map  = {
@@ -257,7 +252,6 @@ class TradingOrchestrator:
             if isinstance(d, dict)
         }
 
-        # Leer señales intraday — no bloquea si no hay datos
         intraday_signals = self._load_intraday_signals()
 
         pm_decisions = await self._get_pm_decisions(
@@ -277,7 +271,7 @@ class TradingOrchestrator:
                     continue
 
                 if "hold" in reason.lower():
-                    logger.info(f"🛡 SKIP CLOSE {ticker} — es HOLD preventivo: {reason}")
+                    logger.info(f"🛡 SKIP CLOSE {ticker} — HOLD preventivo: {reason}")
                     continue
 
                 alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
@@ -314,7 +308,6 @@ class TradingOrchestrator:
                     )
                     close_successes.append(order["ticker"])
                     logger.info(f"⚰️ CLOSED {order['ticker']}")
-                    # Limpiar entry_date al cerrar
                     try:
                         from positions_meta import remove_entry
                         remove_entry(order["ticker"])
@@ -354,35 +347,31 @@ class TradingOrchestrator:
                     or o.get("reason", "").startswith("ANCHOR")
                     or ticker in anchor_tickers
                 )
-
                 if is_anchor:
                     filtered_opens.append(o)
                     continue
-
                 signal = intraday_signals.get(ticker)
                 if signal is None:
                     filtered_opens.append(o)
                     continue
-
                 if signal.get("entrar_ahora", False):
                     logger.info(
                         f"📡 INTRADAY PASS {ticker} | "
                         f"score={signal.get('entry_score')} "
                         f"ratio={signal.get('tracking_ratio')}"
                     )
-                    filtered_opens.append(o)
                 else:
                     logger.info(
                         f"⏳ INTRADAY ESPERA {ticker} | "
                         f"score={signal.get('entry_score')} | "
-                        f"{signal.get('razon', '')} | "
-                        f"señal COMPRA vigente para próxima ventana"
+                        f"{signal.get('razon', '')}"
                     )
-                    filtered_opens.append(o)  # ← siempre pasa, solo logea el timing
-
+                filtered_opens.append(o)  # siempre pasa, solo logea timing
             opens = filtered_opens
         # ────────────────────────────────────────────────────────
-                opens_dict   = {o["ticker"].upper(): o for o in opens}
+                # CONTINÚA desde parte 1 — dentro del método run()
+
+        opens_dict   = {o["ticker"].upper(): o for o in opens}
         unique_opens = self._enrich_opens_with_price_and_shares(list(opens_dict.values()))
 
         anchor_opens = [
@@ -440,7 +429,6 @@ class TradingOrchestrator:
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
 
-                # Registrar entry_date para tracking vs curva intraday
                 if result.get("status") in ("executed", "pending"):
                     try:
                         from positions_meta import set_entry_date
@@ -574,4 +562,4 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
-    
+        
