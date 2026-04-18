@@ -244,5 +244,5 @@ async def run_pipeline(request: Request):
     return {
         "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
-        }
-        
+    }
+    
