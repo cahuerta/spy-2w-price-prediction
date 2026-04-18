@@ -1,25 +1,11 @@
 # =========================================================
-# intraday_evaluator.py — INTRADAY EVALUATOR v1.0
+# intraday_tracker.py — INTRADAY TRACKER v2.1
 # =========================================================
-# Corre una vez al día dentro del pipeline (paso 4.6).
-# Lee snapshots del día anterior y evalúa si las decisiones
-# del tracker fueron correctas.
-#
-# Aprende dos cosas:
-#
-# 1. ENTRY TIMING — ¿fue buena hora para entrar?
-#    Compara precio al momento de "entrar_ahora: true/false"
-#    vs precio de cierre del día.
-#    → Si dijo esperar y el precio bajó → acertó
-#    → Si dijo entrar y el precio subió → acertó
-#
-# 2. POSITION TRACKING — ¿fue correcto el curve_status?
-#    Compara curve_status asignado vs movimiento real posterior.
-#    → Si dijo "ahead" y el precio siguió subiendo → acertó
-#    → Si dijo "diverging" y siguió bajando → acertó
-#
-# Guarda aprendizaje en /data/intraday_learning.json
-# El tracker lee ese archivo para ajustar sus umbrales.
+# v2.1:
+#   Usa upper_band/lower_band del MasterOrchestrator v7.6
+#   para clasificar posiciones con precisión real en vez
+#   de umbrales fijos hardcodeados.
+#   También usa lower_band[0] para evaluar timing de entrada.
 # =========================================================
 
 import os
@@ -34,21 +20,27 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-logger = logging.getLogger("intraday_evaluator")
+logger = logging.getLogger("intraday_tracker")
 logging.basicConfig(level=logging.INFO)
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-DATA_PATH      = Path(os.getenv("DATA_PATH", "/data"))
-INTRADAY_DIR   = DATA_PATH / "intraday"
-LEARNING_FILE  = DATA_PATH / "intraday_learning.json"
-ALPACA_KEY     = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET  = os.getenv("ALPACA_SECRET_KEY")
+DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
+PRED_DIR      = DATA_PATH / "predictions"
+INTRADAY_DIR  = DATA_PATH / "intraday"
+ALPHA_FILE    = DATA_PATH / "alpha_last.json"
+ALPACA_KEY    = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 
-# Mínimo de evaluaciones antes de ajustar umbrales
-MIN_SAMPLES_ADJUST = int(os.getenv("INTRADAY_MIN_SAMPLES", "10"))
+MIN_ALPHA_COMPRA = float(os.getenv("INTRADAY_MIN_ALPHA", "0.65"))
+
+# Fallback si no hay bandas del orchestrator
+ENTRY_THRESHOLD     = float(os.getenv("INTRADAY_ENTRY_THRESHOLD", "1.005"))
+AHEAD_THRESHOLD     = float(os.getenv("INTRADAY_AHEAD",     "1.015"))
+LAGGING_THRESHOLD   = float(os.getenv("INTRADAY_LAGGING",   "0.985"))
+DIVERGING_THRESHOLD = float(os.getenv("INTRADAY_DIVERGING", "0.970"))
 
 _alpaca_client: Optional[StockHistoricalDataClient] = None
 
@@ -64,7 +56,7 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
     return _alpaca_client
 
 
-def _load_json(path: Path) -> Any:
+def _load_json(path: Path) -> Dict:
     if not path.exists():
         return {}
     try:
@@ -82,454 +74,464 @@ def _save_json(path: Path, data: Any) -> None:
 
 
 # =========================================================
-# PRECIO HISTÓRICO
+# PRECIO ACTUAL + MOMENTUM
 # =========================================================
 
-def _get_closing_price(ticker: str, fecha: date) -> Optional[float]:
-    """Precio de cierre de un día específico."""
-    try:
-        client  = _get_alpaca_client()
-        request = StockBarsRequest(
-            symbol_or_symbols=ticker,
-            timeframe=TimeFrame.Day,
-            start=fecha,
-            end=fecha + timedelta(days=1),
-        )
-        bars = client.get_stock_bars(request).df
-        if bars is None or bars.empty:
-            return None
-        bars = bars.reset_index()
-        if "close" not in bars.columns:
-            return None
-        return float(bars["close"].iloc[-1])
-    except Exception as e:
-        logger.warning(f"⚠️ closing price {ticker} {fecha}: {e}")
-        return None
-
-
-def _get_price_at_hour(ticker: str, fecha: date, hora_str: str) -> Optional[float]:
-    """
-    Precio aproximado en una hora específica del día.
-    hora_str formato: "HH:MM" UTC
-    """
+def _get_intraday_bars(ticker: str, lookback_minutes: int = 90) -> Optional[List[float]]:
     try:
         client = _get_alpaca_client()
-        hora   = int(hora_str.split(":")[0])
-        minuto = int(hora_str.split(":")[1])
-
-        dt_start = datetime(fecha.year, fecha.month, fecha.day,
-                           hora, minuto, tzinfo=timezone.utc)
-        dt_end   = dt_start + timedelta(minutes=10)
+        now    = datetime.now(timezone.utc)
+        start  = now - timedelta(minutes=lookback_minutes)
 
         request = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=TimeFrame.Minute,
-            start=dt_start,
-            end=dt_end,
+            start=start,
+            end=now,
         )
         bars = client.get_stock_bars(request).df
         if bars is None or bars.empty:
             return None
+
         bars = bars.reset_index()
         if "close" not in bars.columns:
             return None
-        return float(bars["close"].iloc[-1])
+
+        closes = bars["close"].tolist()
+        return closes if len(closes) >= 2 else None
+
     except Exception as e:
-        logger.warning(f"⚠️ price at hour {ticker} {fecha} {hora_str}: {e}")
+        logger.warning(f"⚠️ intraday bars {ticker}: {e}")
         return None
 
 
+def _get_current_price(ticker: str) -> Optional[float]:
+    bars = _get_intraday_bars(ticker, lookback_minutes=10)
+    if bars:
+        return float(bars[-1])
+    return None
+
+
+def _momentum_score(closes: List[float]) -> float:
+    if not closes or len(closes) < 3:
+        return 0.0
+    last   = closes[-1]
+    prev   = float(np.mean(closes[-4:-1]))
+    if prev <= 0:
+        return 0.0
+    change = (last - prev) / prev
+    return float(np.clip(change * 100, -1.0, 1.0))
+
+
 # =========================================================
-# EVALUAR DECISIONES DE ENTRY TIMING
+# CURVA ESPERADA — ahora lee bandas si existen
 # =========================================================
 
-def _evaluate_entry_decisions(
-    snapshot: Dict,
-    fecha: date,
-) -> List[Dict]:
-    """
-    Para cada señal del día, evalúa si la decisión fue correcta.
+def _get_price_curve(ticker: str) -> Optional[Dict]:
+    ticker_dir = PRED_DIR / ticker.upper()
+    if not ticker_dir.exists():
+        return None
+    candidates = sorted(ticker_dir.glob("*.json"))
+    if not candidates:
+        return None
+    pred  = _load_json(candidates[-1])
+    curve = pred.get("price_curve")
+    if not curve or not curve.get("price_path"):
+        return None
+    return curve
 
-    Lógica:
-    - Para cada hora con señal, obtener precio en ese momento
-    - Comparar vs precio de cierre del día
-    - "entrar_ahora: true" → correcto si precio subió hacia cierre
-    - "entrar_ahora: false" → correcto si precio bajó hacia cierre
-      (es decir, era mejor esperar)
-    """
-    evaluaciones = []
-    precio_cierre_cache: Dict[str, float] = {}
 
-    for hora_str, data in snapshot.items():
+def _get_band_for_day(curve: Dict, dia: int, band: str) -> Optional[float]:
+    """
+    Retorna upper_band o lower_band para el día N.
+    Fallback a price_path si las bandas no existen (predicciones antiguas).
+    band: "upper_band" | "lower_band"
+    """
+    idx  = max(0, min(dia - 1, 8))  # clamp 0-8
+    data = curve.get(band, [])
+    if data and idx < len(data):
+        return float(data[idx])
+    # Fallback: usar price_path
+    path = curve.get("price_path", [])
+    return float(path[idx]) if path and idx < len(path) else None
+
+
+def _get_expected_price_for_day(ticker: str, dia: int) -> Optional[float]:
+    curve = _get_price_curve(ticker)
+    if not curve:
+        return None
+    path = curve.get("price_path", [])
+    idx  = max(0, min(dia - 1, len(path) - 1))
+    return float(path[idx]) if path else None
+
+
+def _get_expected_price_day1(ticker: str) -> Optional[float]:
+    return _get_expected_price_for_day(ticker, 1)
+
+
+# =========================================================
+# CANDIDATOS COMPRA
+# =========================================================
+
+def _get_compra_candidates() -> List[str]:
+    alpha_data = _load_json(ALPHA_FILE)
+    results    = alpha_data.get("results", {})
+    candidates = []
+
+    for ticker, data in results.items():
         if not isinstance(data, dict):
             continue
-
-        for senal in data.get("senales", []):
-            ticker       = senal.get("ticker")
-            entrar_ahora = senal.get("entrar_ahora", False)
-            entry_score  = senal.get("entry_score", 0)
-            precio_señal = senal.get("precio_actual")
-
-            if not ticker or not precio_señal:
-                continue
-
-            # Precio de cierre (cacheado por ticker)
-            if ticker not in precio_cierre_cache:
-                cierre = _get_closing_price(ticker, fecha)
-                if cierre:
-                    precio_cierre_cache[ticker] = cierre
-                else:
-                    continue
-
-            precio_cierre = precio_cierre_cache[ticker]
-            ret_desde_señal = (precio_cierre / precio_señal - 1) * 100
-
-            # ¿Fue correcta la decisión?
-            if entrar_ahora:
-                # Dijo entrar → correcto si precio subió
-                fue_correcto = ret_desde_señal > 0
-            else:
-                # Dijo esperar → correcto si precio bajó
-                # (hubiera sido mejor esperar)
-                fue_correcto = ret_desde_señal < 0
-
-            evaluaciones.append({
-                "ticker":          ticker,
-                "hora":            hora_str,
-                "fecha":           fecha.isoformat(),
-                "entrar_ahora":    entrar_ahora,
-                "entry_score":     entry_score,
-                "precio_señal":    round(precio_señal, 4),
-                "precio_cierre":   round(precio_cierre, 4),
-                "ret_pct":         round(ret_desde_señal, 4),
-                "fue_correcto":    fue_correcto,
-                "uso_bandas":      senal.get("uso_bandas", False),
-            })
-
-    return evaluaciones
-
-
-# =========================================================
-# EVALUAR DECISIONES DE POSITION TRACKING
-# =========================================================
-
-def _evaluate_position_decisions(
-    snapshot: Dict,
-    fecha: date,
-) -> List[Dict]:
-    """
-    Para cada posición monitoreada, evalúa si el curve_status
-    fue correcto comparando con el movimiento posterior.
-
-    ahead     → correcto si siguió subiendo al cierre
-    on_track  → correcto si no divergió significativamente
-    lagging   → correcto si siguió bajando o no recuperó
-    diverging → correcto si siguió bajando
-    """
-    evaluaciones = []
-    precio_cierre_cache: Dict[str, float] = {}
-
-    for hora_str, data in snapshot.items():
-        if not isinstance(data, dict):
+        score = float(data.get("alpha_score", 0))
+        if score < MIN_ALPHA_COMPRA:
             continue
+        ticker_dir = PRED_DIR / ticker.upper()
+        if not ticker_dir.exists():
+            continue
+        pred_files = sorted(ticker_dir.glob("*.json"))
+        if not pred_files:
+            continue
+        pred = _load_json(pred_files[-1])
+        rec  = pred.get("prediction", {}).get("recommendation", "")
+        if rec == "COMPRA":
+            candidates.append(ticker.upper())
 
-        for pos in data.get("monitor_posiciones", []):
-            ticker       = pos.get("ticker")
-            curve_status = pos.get("curve_status")
-            precio_pos   = pos.get("precio_actual")
-            dia_actual   = pos.get("dia_actual")
+    return candidates
 
-            if not ticker or not curve_status or not precio_pos:
+
+# =========================================================
+# POSICIONES ABIERTAS
+# =========================================================
+
+def _get_open_positions_with_date() -> List[Dict]:
+    try:
+        from positions_meta import get_all
+        meta  = get_all()
+        today = datetime.now(timezone.utc).date()
+        result = []
+        for ticker, data in meta.items():
+            entry_date_str = data.get("entry_date")
+            if not entry_date_str:
                 continue
-
-            if ticker not in precio_cierre_cache:
-                cierre = _get_closing_price(ticker, fecha)
-                if cierre:
-                    precio_cierre_cache[ticker] = cierre
-                else:
-                    continue
-
-            precio_cierre   = precio_cierre_cache[ticker]
-            ret_desde_señal = (precio_cierre / precio_pos - 1) * 100
-
-            # ¿El status fue correcto?
-            if curve_status == "ahead":
-                fue_correcto = ret_desde_señal > 0
-            elif curve_status == "on_track":
-                fue_correcto = abs(ret_desde_señal) < 1.5
-            elif curve_status == "lagging":
-                fue_correcto = ret_desde_señal <= 0
-            elif curve_status == "diverging":
-                fue_correcto = ret_desde_señal < -0.5
-            else:
-                fue_correcto = None
-
-            evaluaciones.append({
-                "ticker":        ticker,
-                "hora":          hora_str,
-                "fecha":         fecha.isoformat(),
-                "dia_posicion":  dia_actual,
-                "curve_status":  curve_status,
-                "precio_señal":  round(precio_pos, 4),
-                "precio_cierre": round(precio_cierre, 4),
-                "ret_pct":       round(ret_desde_señal, 4),
-                "fue_correcto":  fue_correcto,
-                "uso_bandas":    pos.get("uso_bandas", False),
-            })
-
-    return evaluaciones
+            try:
+                entry_date = date.fromisoformat(entry_date_str)
+                dia_actual = (today - entry_date).days + 1
+                dia_actual = max(1, min(dia_actual, 9))
+                result.append({
+                    "ticker":     ticker.upper(),
+                    "entry_date": entry_date_str,
+                    "dia_actual": dia_actual,
+                })
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        logger.warning(f"⚠️ positions_meta no disponible: {e}")
+        return []
 
 
 # =========================================================
-# ACTUALIZAR APRENDIZAJE
+# EVALUAR TIMING DE ENTRADA
 # =========================================================
 
-def _update_learning(
-    entry_evals: List[Dict],
-    position_evals: List[Dict],
-) -> Dict:
-    """
-    Lee el archivo de aprendizaje actual y lo actualiza
-    con las nuevas evaluaciones.
+def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
+    precio_actual = _get_current_price(ticker)
+    if not precio_actual:
+        return None
 
-    Estructura de aprendizaje:
-    {
-      "entry_timing": {
-        "total": 150,
-        "correct": 89,
-        "hit_rate": 0.593,
-        "by_score_bucket": {
-          "0.5-0.6": {"total": 30, "correct": 14},
-          "0.6-0.7": {"total": 60, "correct": 38},
-          "0.7-0.8": {"total": 40, "correct": 28},
-          "0.8-1.0": {"total": 20, "correct": 17},
-        },
-        "by_hour": {
-          "11": {"total": 20, "correct": 12},
-          ...
-        },
-        "adjusted_thresholds": {
-          "min_score":        0.55,   # ajustado desde evaluaciones
-          "min_score_updated": "2026-04-18",
-        }
-      },
-      "position_tracking": {
-        "total": 80,
-        "correct": 61,
-        "hit_rate": 0.763,
-        "by_status": {
-          "ahead":     {"total": 15, "correct": 11},
-          "on_track":  {"total": 40, "correct": 32},
-          "lagging":   {"total": 18, "correct": 13},
-          "diverging": {"total": 7,  "correct": 5},
-        }
-      },
-      "last_updated": "2026-04-18"
+    curve           = _get_price_curve(ticker)
+    precio_esperado = _get_expected_price_day1(ticker)
+
+    if not precio_esperado or precio_esperado <= 0:
+        return None
+
+    tracking_ratio = precio_actual / precio_esperado
+    bars           = _get_intraday_bars(ticker, lookback_minutes=90)
+    momentum       = _momentum_score(bars) if bars else 0.0
+
+    # Usar lower_band[0] si existe — entrada buena cuando precio < lower_band
+    lower_band_dia1 = _get_band_for_day(curve, 1, "lower_band") if curve else None
+    upper_band_dia1 = _get_band_for_day(curve, 1, "upper_band") if curve else None
+
+    if lower_band_dia1 and upper_band_dia1:
+        # Precio dentro de la banda o por debajo → buena entrada
+        band_width  = upper_band_dia1 - lower_band_dia1
+        precio_norm = (precio_actual - lower_band_dia1) / band_width if band_width > 0 else 0.5
+        precio_score = float(np.clip(1.0 - precio_norm, 0.0, 1.0))
+        precio_ok    = precio_actual <= upper_band_dia1  # no caro vs banda superior
+        usar_bandas  = True
+    else:
+        # Fallback: lógica original sin bandas
+        precio_score = float(np.clip(0.5 + (1.0 - tracking_ratio) * 50, 0.0, 1.0))
+        precio_ok    = tracking_ratio <= ENTRY_THRESHOLD
+        usar_bandas  = False
+
+    momentum_score = float(np.clip((momentum + 1.0) / 2.0, 0.0, 1.0))
+    entry_score    = round(0.60 * precio_score + 0.40 * momentum_score, 3)
+
+    momentum_ok  = momentum > 0
+    score_ok     = entry_score >= 0.55
+    entrar_ahora = precio_ok and momentum_ok and score_ok
+
+    razones = []
+    if not precio_ok:
+        razones.append(f"precio sobre banda superior ({tracking_ratio:.3f})" if usar_bandas
+                       else f"precio caro vs curva ({tracking_ratio:.3f})")
+    if not momentum_ok:
+        razones.append(f"momentum negativo ({momentum:.2f})")
+    if not score_ok:
+        razones.append(f"score insuficiente ({entry_score:.2f})")
+    if entrar_ahora:
+        razones.append(
+            f"precio ok ({tracking_ratio:.3f}) + momentum {momentum:.2f} + score {entry_score:.2f}"
+        )
+
+    result = {
+        "ticker":               ticker,
+        "tipo":                 "entry_candidate",
+        "precio_actual":        round(precio_actual, 4),
+        "precio_esperado_dia1": round(precio_esperado, 4),
+        "tracking_ratio":       round(tracking_ratio, 4),
+        "momentum":             round(momentum, 4),
+        "entry_score":          entry_score,
+        "entrar_ahora":         entrar_ahora,
+        "razon":                " | ".join(razones),
+        "uso_bandas":           usar_bandas,
     }
+
+    if usar_bandas:
+        result["lower_band_dia1"] = round(lower_band_dia1, 4)
+        result["upper_band_dia1"] = round(upper_band_dia1, 4)
+
+    # Agregar análisis de trayectoria si existe
+    if curve and curve.get("analysis"):
+        result["curve_analysis"] = curve["analysis"]
+
+    return result
+
+
+# =========================================================
+# EVALUAR POSICIÓN ABIERTA VS CURVA
+# =========================================================
+
+def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Optional[Dict]:
     """
-    learning = _load_json(LEARNING_FILE)
-    if not learning:
-        learning = {
-            "entry_timing": {
-                "total": 0, "correct": 0, "hit_rate": None,
-                "by_score_bucket": {
-                    "0.5-0.6": {"total": 0, "correct": 0},
-                    "0.6-0.7": {"total": 0, "correct": 0},
-                    "0.7-0.8": {"total": 0, "correct": 0},
-                    "0.8-1.0": {"total": 0, "correct": 0},
-                },
-                "by_hour":            {},
-                "adjusted_thresholds": {
-                    "min_score":         0.55,
-                    "min_score_updated": None,
-                },
-            },
-            "position_tracking": {
-                "total": 0, "correct": 0, "hit_rate": None,
-                "by_status": {
-                    "ahead":     {"total": 0, "correct": 0},
-                    "on_track":  {"total": 0, "correct": 0},
-                    "lagging":   {"total": 0, "correct": 0},
-                    "diverging": {"total": 0, "correct": 0},
-                },
-            },
-            "last_updated": None,
-        }
+    Compara precio actual vs bandas reales del día N.
 
-    # ── Actualizar entry timing ───────────────────────────
-    et = learning["entry_timing"]
-    for ev in entry_evals:
-        et["total"]   += 1
-        et["correct"] += 1 if ev["fue_correcto"] else 0
+    curve_status con bandas reales:
+      ahead     → precio > upper_band[dia]
+      on_track  → precio entre lower_band y upper_band
+      lagging   → precio < lower_band[dia]
+      diverging → precio < lower_band[dia] por más de 1 std adicional
 
-        # Por bucket de score
-        score = ev["entry_score"]
-        if score < 0.6:
-            bucket = "0.5-0.6"
-        elif score < 0.7:
-            bucket = "0.6-0.7"
-        elif score < 0.8:
-            bucket = "0.7-0.8"
+    Fallback a umbrales fijos si no hay bandas.
+    """
+    precio_actual   = _get_current_price(ticker)
+    precio_esperado = _get_expected_price_for_day(ticker, dia_actual)
+
+    if not precio_actual or not precio_esperado or precio_esperado <= 0:
+        return None
+
+    tracking_ratio = precio_actual / precio_esperado
+    bars           = _get_intraday_bars(ticker, lookback_minutes=90)
+    momentum       = _momentum_score(bars) if bars else 0.0
+    curve          = _get_price_curve(ticker)
+
+    # Intentar usar bandas reales del orchestrator
+    upper = _get_band_for_day(curve, dia_actual, "upper_band") if curve else None
+    lower = _get_band_for_day(curve, dia_actual, "lower_band") if curve else None
+
+    if upper and lower and lower > 0:
+        usar_bandas = True
+        std_band    = (upper - lower) / 3.0  # banda ≈ 1.5 std → 1 std = (upper-lower)/3
+
+        if precio_actual > upper:
+            curve_status = "ahead"
+        elif precio_actual >= lower:
+            curve_status = "on_track"
+        elif precio_actual >= lower - std_band:
+            curve_status = "lagging"
         else:
-            bucket = "0.8-1.0"
-        et["by_score_bucket"][bucket]["total"]   += 1
-        et["by_score_bucket"][bucket]["correct"] += 1 if ev["fue_correcto"] else 0
+            curve_status = "diverging"
+    else:
+        usar_bandas = False
+        if tracking_ratio >= AHEAD_THRESHOLD:
+            curve_status = "ahead"
+        elif tracking_ratio >= LAGGING_THRESHOLD:
+            curve_status = "on_track"
+        elif tracking_ratio >= DIVERGING_THRESHOLD:
+            curve_status = "lagging"
+        else:
+            curve_status = "diverging"
 
-        # Por hora
-        hora = ev["hora"].split(":")[0]
-        if hora not in et["by_hour"]:
-            et["by_hour"][hora] = {"total": 0, "correct": 0}
-        et["by_hour"][hora]["total"]   += 1
-        et["by_hour"][hora]["correct"] += 1 if ev["fue_correcto"] else 0
+    # Retorno real vs precio original de entrada
+    ret_vs_entrada     = None
+    ret_esperado_total = None
 
-    if et["total"] > 0:
-        et["hit_rate"] = round(et["correct"] / et["total"], 4)
+    if curve:
+        price_now_orig = float(curve.get("price_now", 0))
+        path           = curve.get("price_path", [])
+        if price_now_orig > 0:
+            ret_vs_entrada = round((precio_actual / price_now_orig - 1) * 100, 2)
+            if path:
+                ret_esperado_total = round((path[-1] / price_now_orig - 1) * 100, 2)
 
-    # ── Ajuste automático de min_score ───────────────────
-    # Si tenemos suficientes muestras, encontrar el bucket
-    # con mejor hit_rate y ajustar el umbral
-    if et["total"] >= MIN_SAMPLES_ADJUST:
-        best_bucket     = None
-        best_hit_rate   = 0.0
-        for bucket, stats in et["by_score_bucket"].items():
-            if stats["total"] >= 5:
-                hr = stats["correct"] / stats["total"]
-                if hr > best_hit_rate:
-                    best_hit_rate = hr
-                    best_bucket   = bucket
+    logger.info(
+        f"📊 {ticker} día {dia_actual} | "
+        f"actual={precio_actual:.2f} esperado={precio_esperado:.2f} "
+        f"ratio={tracking_ratio:.3f} → {curve_status}"
+        + (f" [bandas reales]" if usar_bandas else " [fallback]")
+    )
 
-        if best_bucket:
-            # Ajustar min_score al inicio del mejor bucket
-            bucket_start = float(best_bucket.split("-")[0])
-            current      = et["adjusted_thresholds"]["min_score"]
-            # Movimiento suave: no cambiar más de 0.05 a la vez
-            new_threshold = max(0.45, min(0.80,
-                current + np.clip(bucket_start - current, -0.05, 0.05)
-            ))
-            if abs(new_threshold - current) > 0.01:
-                et["adjusted_thresholds"]["min_score"]         = round(float(new_threshold), 3)
-                et["adjusted_thresholds"]["min_score_updated"] = datetime.now(timezone.utc).date().isoformat()
-                logger.info(
-                    f"🎯 Umbral min_score ajustado: {current:.3f} → {new_threshold:.3f} "
-                    f"(bucket {best_bucket} hit_rate={best_hit_rate:.1%})"
-                )
+    result = {
+        "ticker":                 ticker,
+        "tipo":                   "open_position",
+        "dia_actual":             dia_actual,
+        "entry_date":             entry_date,
+        "precio_actual":          round(precio_actual, 4),
+        "precio_esperado_hoy":    round(precio_esperado, 4),
+        "tracking_ratio":         round(tracking_ratio, 4),
+        "momentum":               round(momentum, 4),
+        "curve_status":           curve_status,
+        "ret_vs_entrada_pct":     ret_vs_entrada,
+        "ret_esperado_total_pct": ret_esperado_total,
+        "uso_bandas":             usar_bandas,
+    }
 
-    # ── Actualizar position tracking ─────────────────────
-    pt = learning["position_tracking"]
-    for ev in position_evals:
-        pt["total"]   += 1
-        pt["correct"] += 1 if ev["fue_correcto"] else 0
+    if usar_bandas:
+        result["upper_band_hoy"] = round(upper, 4)
+        result["lower_band_hoy"] = round(lower, 4)
 
-        status = ev["curve_status"]
-        if status in pt["by_status"]:
-            pt["by_status"][status]["total"]   += 1
-            pt["by_status"][status]["correct"] += 1 if ev["fue_correcto"] else 0
+    # Incluir best_exit_day del análisis si existe
+    if curve and curve.get("analysis"):
+        best_exit = curve["analysis"].get("best_exit_day")
+        if best_exit:
+            result["best_exit_day"]    = best_exit
+            result["dias_para_salida"] = max(0, best_exit - dia_actual)
 
-    if pt["total"] > 0:
-        pt["hit_rate"] = round(pt["correct"] / pt["total"], 4)
-
-    learning["last_updated"] = datetime.now(timezone.utc).date().isoformat()
-    _save_json(LEARNING_FILE, learning)
-
-    return learning
+    return result
 
 
 # =========================================================
 # RUN PRINCIPAL
 # =========================================================
 
-def run_intraday_evaluator() -> Dict:
-    """
-    Evalúa el snapshot del día anterior y actualiza el aprendizaje.
-    Llamado desde pipeline_router como paso 4.6.
-    """
-    hoy   = datetime.now(timezone.utc).date()
-    ayer  = hoy - timedelta(days=1)
+def run_intraday_tracker() -> Dict:
+    ahora     = datetime.now(timezone.utc)
+    fecha_str = ahora.date().isoformat()
+    hora_str  = ahora.strftime("%H:%M")
 
-    # Saltar fines de semana
-    if ayer.weekday() >= 5:
-        logger.info(f"⏭ Intraday evaluator SKIP — ayer fue fin de semana ({ayer})")
-        return {"skipped": True, "reason": "weekend"}
+    logger.info(f"📡 Intraday tracker v2.1 | {fecha_str} {hora_str} UTC")
 
-    snapshot_path = INTRADAY_DIR / f"{ayer.isoformat()}.json"
-    if not snapshot_path.exists():
-        logger.info(f"⏭ Intraday evaluator SKIP — no hay snapshot para {ayer}")
-        return {"skipped": True, "reason": "no_snapshot"}
+    # ── 1. CANDIDATOS COMPRA ─────────────────────────────────
+    candidatos = _get_compra_candidates()
+    senales    = []
+    entrar_now = []
 
-    snapshot = _load_json(snapshot_path)
+    if candidatos:
+        logger.info(f"🔍 Candidatos COMPRA: {candidatos}")
+        for ticker in candidatos:
+            try:
+                resultado = _evaluate_entry_timing(ticker)
+                if resultado:
+                    senales.append(resultado)
+                    if resultado["entrar_ahora"]:
+                        entrar_now.append(ticker)
+                        logger.info(f"✅ ENTRADA OK {ticker} | score={resultado['entry_score']}")
+                    else:
+                        logger.info(f"⏳ ESPERAR {ticker} | {resultado['razon']}")
+            except Exception as e:
+                logger.error(f"❌ Error entry {ticker}: {e}")
+    else:
+        logger.info("ℹ️  Sin candidatos COMPRA")
+
+    # ── 2. POSICIONES ABIERTAS ───────────────────────────────
+    posiciones_abiertas = _get_open_positions_with_date()
+    monitor_posiciones  = []
+
+    if posiciones_abiertas:
+        logger.info(f"📊 Monitoreando {len(posiciones_abiertas)} posiciones")
+        for pos in posiciones_abiertas:
+            try:
+                resultado = _evaluate_open_position(
+                    pos["ticker"], pos["dia_actual"], pos["entry_date"]
+                )
+                if resultado:
+                    monitor_posiciones.append(resultado)
+            except Exception as e:
+                logger.error(f"❌ Error monitor {pos['ticker']}: {e}")
+    else:
+        logger.info("ℹ️  Sin posiciones abiertas")
+
+    # ── 3. GUARDAR SNAPSHOT ──────────────────────────────────
+    snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
+    snapshot      = _load_json(snapshot_path)
+
+    snapshot[hora_str] = {
+        "timestamp":          ahora.isoformat(),
+        "senales":            senales,
+        "entrar_ahora":       entrar_now,
+        "monitor_posiciones": monitor_posiciones,
+    }
+
+    _save_json(snapshot_path, snapshot)
+
+    logger.info(
+        f"💾 Snapshot | compra={len(senales)} entrar={len(entrar_now)} "
+        f"posiciones={len(monitor_posiciones)}"
+    )
+
+    return {
+        "hora":               hora_str,
+        "candidatos":         len(senales),
+        "entrar_ahora":       entrar_now,
+        "senales":            senales,
+        "monitor_posiciones": monitor_posiciones,
+    }
+
+
+# =========================================================
+# API PARA ORCHESTRATOR Y DASHBOARD
+# =========================================================
+
+def get_entry_signals_today() -> Dict[str, Dict]:
+    fecha_str     = datetime.now(timezone.utc).date().isoformat()
+    snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
+    snapshot      = _load_json(snapshot_path)
+
     if not snapshot:
-        logger.info(f"⏭ Intraday evaluator SKIP — snapshot vacío para {ayer}")
-        return {"skipped": True, "reason": "empty_snapshot"}
+        return {}
 
-    logger.info(f"📊 Evaluando snapshot intraday de {ayer} | {len(snapshot)} horas")
+    best_by_ticker: Dict[str, Dict] = {}
+    for hora, data in snapshot.items():
+        for senal in data.get("senales", []):
+            ticker = senal.get("ticker")
+            if not ticker:
+                continue
+            score = senal.get("entry_score", 0)
+            if ticker not in best_by_ticker or score > best_by_ticker[ticker]["entry_score"]:
+                best_by_ticker[ticker] = {**senal, "mejor_hora": hora}
 
-    # Evaluar decisiones
-    entry_evals    = _evaluate_entry_decisions(snapshot, ayer)
-    position_evals = _evaluate_position_decisions(snapshot, ayer)
-
-    logger.info(
-        f"📋 Evaluaciones | entry={len(entry_evals)} "
-        f"positions={len(position_evals)}"
-    )
-
-    # Actualizar aprendizaje
-    learning = _update_learning(entry_evals, position_evals)
-
-    et = learning["entry_timing"]
-    pt = learning["position_tracking"]
-
-    logger.info(
-        f"✅ Aprendizaje actualizado | "
-        f"entry hit_rate={et.get('hit_rate', 0):.1%} ({et['total']} evals) | "
-        f"position hit_rate={pt.get('hit_rate', 0):.1%} ({pt['total']} evals) | "
-        f"min_score={et['adjusted_thresholds']['min_score']}"
-    )
-
-    return {
-        "fecha_evaluada":   ayer.isoformat(),
-        "entry_evals":      len(entry_evals),
-        "position_evals":   len(position_evals),
-        "entry_hit_rate":   et.get("hit_rate"),
-        "position_hit_rate":pt.get("hit_rate"),
-        "min_score_actual": et["adjusted_thresholds"]["min_score"],
-        "total_historico":  et["total"],
-    }
+    return best_by_ticker
 
 
-# =========================================================
-# LEER UMBRALES APRENDIDOS — usado por intraday_tracker
-# =========================================================
-
-def get_learned_thresholds() -> Dict:
+def get_position_status_today() -> Dict[str, Dict]:
     """
-    Retorna los umbrales ajustados por el evaluador.
-    El tracker llama esto al iniciar para usar valores calibrados.
+    Último status de cada posición abierta monitoreada hoy.
+    Llamable desde dashboard para mostrar estado vs curva.
     """
-    learning = _load_json(LEARNING_FILE)
-    if not learning:
-        return {
-            "min_score":   0.55,
-            "calibrated":  False,
-            "total_evals": 0,
-        }
+    fecha_str     = datetime.now(timezone.utc).date().isoformat()
+    snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
+    snapshot      = _load_json(snapshot_path)
 
-    et = learning.get("entry_timing", {})
-    return {
-        "min_score":   et.get("adjusted_thresholds", {}).get("min_score", 0.55),
-        "calibrated":  et.get("total", 0) >= MIN_SAMPLES_ADJUST,
-        "total_evals": et.get("total", 0),
-        "hit_rate":    et.get("hit_rate"),
-        "best_hours":  _get_best_hours(et.get("by_hour", {})),
-    }
+    if not snapshot:
+        return {}
 
+    latest: Dict[str, Dict] = {}
+    for hora in sorted(snapshot.keys()):
+        for pos in snapshot[hora].get("monitor_posiciones", []):
+            ticker = pos.get("ticker")
+            if ticker:
+                latest[ticker] = {**pos, "ultima_hora": hora}
 
-def _get_best_hours(by_hour: Dict) -> List[str]:
-    """Retorna las horas con mejor hit rate (mínimo 5 evaluaciones)."""
-    ranked = []
-    for hora, stats in by_hour.items():
-        if stats["total"] >= 5:
-            hr = stats["correct"] / stats["total"]
-            ranked.append((hora, hr))
-    ranked.sort(key=lambda x: x[1], reverse=True)
-    return [h for h, _ in ranked[:3]]  # top 3 horas
-        
+    return latest
+    
