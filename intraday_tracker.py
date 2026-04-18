@@ -1,23 +1,26 @@
 # =========================================================
-# intraday_tracker.py — INTRADAY ENTRY OPTIMIZER v1.0
+# intraday_tracker.py — INTRADAY TRACKER v2.0
 # =========================================================
 # Corre cada 30 minutos durante horario de mercado.
-# Propósito: mejorar el timing de COMPRA comparando
-# precio actual vs price_curve esperada del pipeline.
 #
-# Guarda señales en /data/intraday/{fecha}.json
-# El TradingOrchestrator las lee en el run de las 16:30.
+# Dos funciones principales:
 #
-# Lógica de entrada:
-#   - precio_actual <= precio_curva_dia1 * 0.995  → debajo de lo esperado (buena entrada)
-#   - momentum_30m > 0                             → precio subiendo
-#   - ambas condiciones → entry_score alto
+# 1. ENTRY OPTIMIZER (candidatos COMPRA)
+#    Compara precio actual vs price_curve[día 1]
+#    → entry_score → entrar_ahora true/false
+#
+# 2. POSITION MONITOR (posiciones abiertas)
+#    Compara precio actual vs price_curve[día_actual]
+#    → curve_status: ahead | on_track | lagging | diverging
+#    → Informa al dashboard, no cierra posiciones
+#
+# Guarda en /data/intraday/{fecha}.json
 # =========================================================
 
 import os
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -40,10 +43,13 @@ ALPHA_FILE    = DATA_PATH / "alpha_last.json"
 ALPACA_KEY    = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 
-# Umbral de entrada — precio actual debe estar <= X% sobre curva esperada
-ENTRY_THRESHOLD  = float(os.getenv("INTRADAY_ENTRY_THRESHOLD", "1.005"))
-# Mínimo alpha score para considerar una señal COMPRA
-MIN_ALPHA_COMPRA = float(os.getenv("INTRADAY_MIN_ALPHA", "0.65"))
+ENTRY_THRESHOLD   = float(os.getenv("INTRADAY_ENTRY_THRESHOLD", "1.005"))
+MIN_ALPHA_COMPRA  = float(os.getenv("INTRADAY_MIN_ALPHA",        "0.65"))
+
+# Bandas de tolerancia para status de curva
+AHEAD_THRESHOLD     = float(os.getenv("INTRADAY_AHEAD",     "1.015"))  # +1.5% sobre curva
+LAGGING_THRESHOLD   = float(os.getenv("INTRADAY_LAGGING",   "0.985"))  # -1.5% bajo curva
+DIVERGING_THRESHOLD = float(os.getenv("INTRADAY_DIVERGING", "0.970"))  # -3.0% bajo curva
 
 _alpaca_client: Optional[StockHistoricalDataClient] = None
 
@@ -81,10 +87,6 @@ def _save_json(path: Path, data: Any) -> None:
 # =========================================================
 
 def _get_intraday_bars(ticker: str, lookback_minutes: int = 90) -> Optional[List[float]]:
-    """
-    Obtiene barras de 30 minutos de las últimas lookback_minutes.
-    Retorna lista de closes [más antiguo → más reciente].
-    """
     try:
         client = _get_alpaca_client()
         now    = datetime.now(timezone.utc)
@@ -120,66 +122,67 @@ def _get_current_price(ticker: str) -> Optional[float]:
 
 
 def _momentum_score(closes: List[float]) -> float:
-    """
-    Score de momentum entre -1 y 1.
-    Compara última barra vs promedio de las anteriores.
-    """
     if not closes or len(closes) < 3:
         return 0.0
-    last    = closes[-1]
-    prev    = float(np.mean(closes[-4:-1]))  # promedio últimas 3 barras
+    last   = closes[-1]
+    prev   = float(np.mean(closes[-4:-1]))
     if prev <= 0:
         return 0.0
-    change  = (last - prev) / prev
-    return float(np.clip(change * 100, -1.0, 1.0))  # normalizado -1 a 1
+    change = (last - prev) / prev
+    return float(np.clip(change * 100, -1.0, 1.0))
 
 
 # =========================================================
 # CURVA ESPERADA
 # =========================================================
 
-def _get_expected_price_day1(ticker: str) -> Optional[float]:
-    """
-    Lee la predicción más reciente y retorna el precio esperado
-    para el día 1 (price_curve.price_path[0]).
-    """
-    ticker_dir = PRED_DIR / ticker
+def _get_price_curve(ticker: str) -> Optional[Dict]:
+    ticker_dir = PRED_DIR / ticker.upper()
     if not ticker_dir.exists():
         return None
-
     candidates = sorted(ticker_dir.glob("*.json"))
     if not candidates:
         return None
+    pred  = _load_json(candidates[-1])
+    curve = pred.get("price_curve")
+    if not curve or not curve.get("price_path"):
+        return None
+    return curve
 
-    pred = _load_json(candidates[-1])
-    curve = pred.get("price_curve", {}).get("price_path", [])
+
+def _get_expected_price_day1(ticker: str) -> Optional[float]:
+    curve = _get_price_curve(ticker)
     if not curve:
         return None
+    path = curve.get("price_path", [])
+    return float(path[0]) if path else None
 
-    return float(curve[0])
+
+def _get_expected_price_for_day(ticker: str, dia: int) -> Optional[float]:
+    """Precio esperado para el día N de la posición (1-based, clamp 1-9)."""
+    curve = _get_price_curve(ticker)
+    if not curve:
+        return None
+    path = curve.get("price_path", [])
+    idx  = max(0, min(dia - 1, len(path) - 1))
+    return float(path[idx]) if path else None
 
 
 # =========================================================
-# SEÑALES COMPRA PENDIENTES
+# CANDIDATOS COMPRA
 # =========================================================
 
 def _get_compra_candidates() -> List[str]:
-    """
-    Lee alpha_last.json y retorna tickers con recomendación COMPRA
-    que superen el mínimo de alpha score.
-    """
     alpha_data = _load_json(ALPHA_FILE)
     results    = alpha_data.get("results", {})
     candidates = []
 
     for ticker, data in results.items():
-        if not isinstance(data, data.__class__) or not isinstance(data, dict):
+        if not isinstance(data, dict):
             continue
         score = float(data.get("alpha_score", 0))
         if score < MIN_ALPHA_COMPRA:
             continue
-
-        # Leer recomendación desde predicción más reciente
         ticker_dir = PRED_DIR / ticker.upper()
         if not ticker_dir.exists():
             continue
@@ -195,64 +198,59 @@ def _get_compra_candidates() -> List[str]:
 
 
 # =========================================================
-# EVALUAR TIMING PARA UN TICKER
+# POSICIONES ABIERTAS
+# =========================================================
+
+def _get_open_positions_with_date() -> List[Dict]:
+    try:
+        from positions_meta import get_all
+        meta  = get_all()
+        today = datetime.now(timezone.utc).date()
+        result = []
+        for ticker, data in meta.items():
+            entry_date_str = data.get("entry_date")
+            if not entry_date_str:
+                continue
+            try:
+                entry_date = date.fromisoformat(entry_date_str)
+                dia_actual = (today - entry_date).days + 1
+                dia_actual = max(1, min(dia_actual, 9))
+                result.append({
+                    "ticker":     ticker.upper(),
+                    "entry_date": entry_date_str,
+                    "dia_actual": dia_actual,
+                })
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        logger.warning(f"⚠️ positions_meta no disponible: {e}")
+        return []
+
+
+# =========================================================
+# EVALUAR TIMING DE ENTRADA
 # =========================================================
 
 def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
-    """
-    Evalúa si el momento actual es bueno para entrar en un ticker.
-
-    Retorna dict con:
-      - ticker
-      - precio_actual
-      - precio_esperado_dia1
-      - tracking_ratio: actual / esperado (< 1 = barato vs predicción)
-      - momentum: -1 a 1
-      - entry_score: 0 a 1
-      - entrar_ahora: bool
-      - razon: string explicativo
-    """
     precio_actual   = _get_current_price(ticker)
     precio_esperado = _get_expected_price_day1(ticker)
 
-    if not precio_actual or not precio_esperado:
+    if not precio_actual or not precio_esperado or precio_esperado <= 0:
         return None
 
-    if precio_esperado <= 0:
-        return None
-
-    # Ratio: < 1 significa que está más barato que lo predicho → buena entrada
     tracking_ratio = precio_actual / precio_esperado
-
-    # Momentum intradía
-    bars     = _get_intraday_bars(ticker, lookback_minutes=90)
-    momentum = _momentum_score(bars) if bars else 0.0
-
-    # ── SCORING DE ENTRADA ─────────────────────────────────────
-    # Componente precio: mejor cuanto más barato vs curva
-    # tracking_ratio=0.99 → precio_score=0.8 (muy bueno)
-    # tracking_ratio=1.00 → precio_score=0.5 (neutro)
-    # tracking_ratio=1.01 → precio_score=0.2 (caro, esperar)
-    precio_score = float(np.clip(0.5 + (1.0 - tracking_ratio) * 50, 0.0, 1.0))
-
-    # Componente momentum: normalizado 0-1
+    bars           = _get_intraday_bars(ticker, lookback_minutes=90)
+    momentum       = _momentum_score(bars) if bars else 0.0
+    precio_score   = float(np.clip(0.5 + (1.0 - tracking_ratio) * 50, 0.0, 1.0))
     momentum_score = float(np.clip((momentum + 1.0) / 2.0, 0.0, 1.0))
+    entry_score    = round(0.60 * precio_score + 0.40 * momentum_score, 3)
 
-    # Entry score combinado: precio pesa más (60%) que momentum (40%)
-    entry_score = round(0.60 * precio_score + 0.40 * momentum_score, 3)
-
-    # ── DECISIÓN ───────────────────────────────────────────────
-    # Entrar si:
-    #   1. precio <= esperado * umbral (no está caro)
-    #   2. momentum positivo (está subiendo)
-    #   3. entry_score >= 0.55
-    precio_ok   = tracking_ratio <= ENTRY_THRESHOLD
-    momentum_ok = momentum > 0
-    score_ok    = entry_score >= 0.55
-
+    precio_ok    = tracking_ratio <= ENTRY_THRESHOLD
+    momentum_ok  = momentum > 0
+    score_ok     = entry_score >= 0.55
     entrar_ahora = precio_ok and momentum_ok and score_ok
 
-    # Razón legible
     razones = []
     if not precio_ok:
         razones.append(f"precio caro vs curva ({tracking_ratio:.3f})")
@@ -267,6 +265,7 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
 
     return {
         "ticker":               ticker,
+        "tipo":                 "entry_candidate",
         "precio_actual":        round(precio_actual, 4),
         "precio_esperado_dia1": round(precio_esperado, 4),
         "tracking_ratio":       round(tracking_ratio, 4),
@@ -278,85 +277,156 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
 
 
 # =========================================================
-# RUN PRINCIPAL — llamado desde scheduler cada 30 min
+# EVALUAR POSICIÓN ABIERTA VS CURVA
+# =========================================================
+
+def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Optional[Dict]:
+    """
+    Compara precio actual vs precio esperado para el día N de la curva.
+
+    curve_status:
+      ahead     → ratio >= 1.015  (va mejor de lo esperado)
+      on_track  → ratio entre 0.985 y 1.015 (normal)
+      lagging   → ratio entre 0.970 y 0.985 (por debajo)
+      diverging → ratio < 0.970  (alerta)
+    """
+    precio_actual   = _get_current_price(ticker)
+    precio_esperado = _get_expected_price_for_day(ticker, dia_actual)
+
+    if not precio_actual or not precio_esperado or precio_esperado <= 0:
+        return None
+
+    tracking_ratio = precio_actual / precio_esperado
+    bars           = _get_intraday_bars(ticker, lookback_minutes=90)
+    momentum       = _momentum_score(bars) if bars else 0.0
+
+    if tracking_ratio >= AHEAD_THRESHOLD:
+        curve_status = "ahead"
+    elif tracking_ratio >= LAGGING_THRESHOLD:
+        curve_status = "on_track"
+    elif tracking_ratio >= DIVERGING_THRESHOLD:
+        curve_status = "lagging"
+    else:
+        curve_status = "diverging"
+
+    # Retorno real vs precio original de entrada
+    curve              = _get_price_curve(ticker)
+    ret_vs_entrada     = None
+    ret_esperado_total = None
+
+    if curve:
+        price_now_orig = float(curve.get("price_now", 0))
+        path           = curve.get("price_path", [])
+        if price_now_orig > 0:
+            ret_vs_entrada = round((precio_actual / price_now_orig - 1) * 100, 2)
+            if path:
+                ret_esperado_total = round((path[-1] / price_now_orig - 1) * 100, 2)
+
+    logger.info(
+        f"📊 {ticker} día {dia_actual} | "
+        f"actual={precio_actual:.2f} esperado={precio_esperado:.2f} "
+        f"ratio={tracking_ratio:.3f} → {curve_status}"
+    )
+
+    return {
+        "ticker":                 ticker,
+        "tipo":                   "open_position",
+        "dia_actual":             dia_actual,
+        "entry_date":             entry_date,
+        "precio_actual":          round(precio_actual, 4),
+        "precio_esperado_hoy":    round(precio_esperado, 4),
+        "tracking_ratio":         round(tracking_ratio, 4),
+        "momentum":               round(momentum, 4),
+        "curve_status":           curve_status,
+        "ret_vs_entrada_pct":     ret_vs_entrada,
+        "ret_esperado_total_pct": ret_esperado_total,
+    }
+
+
+# =========================================================
+# RUN PRINCIPAL
 # =========================================================
 
 def run_intraday_tracker() -> Dict:
-    """
-    Evalúa todos los candidatos COMPRA y guarda señales.
-    Retorna resumen de la ejecución.
-    """
-    ahora      = datetime.now(timezone.utc)
-    fecha_str  = ahora.date().isoformat()
-    hora_str   = ahora.strftime("%H:%M")
+    ahora     = datetime.now(timezone.utc)
+    fecha_str = ahora.date().isoformat()
+    hora_str  = ahora.strftime("%H:%M")
 
-    logger.info(f"📡 Intraday tracker | {fecha_str} {hora_str} UTC")
+    logger.info(f"📡 Intraday tracker v2.0 | {fecha_str} {hora_str} UTC")
 
+    # ── 1. CANDIDATOS COMPRA ─────────────────────────────────
     candidatos = _get_compra_candidates()
-    if not candidatos:
-        logger.info("ℹ️  Sin candidatos COMPRA activos")
-        return {"hora": hora_str, "candidatos": 0, "senales": []}
-
-    logger.info(f"🔍 Evaluando {len(candidatos)} candidatos: {candidatos}")
-
     senales    = []
     entrar_now = []
 
-    for ticker in candidatos:
-        try:
-            resultado = _evaluate_entry_timing(ticker)
-            if resultado:
-                senales.append(resultado)
-                if resultado["entrar_ahora"]:
-                    entrar_now.append(ticker)
-                    logger.info(
-                        f"✅ ENTRADA OK {ticker} | "
-                        f"ratio={resultado['tracking_ratio']} "
-                        f"momentum={resultado['momentum']} "
-                        f"score={resultado['entry_score']}"
-                    )
-                else:
-                    logger.info(
-                        f"⏳ ESPERAR {ticker} | {resultado['razon']}"
-                    )
-        except Exception as e:
-            logger.error(f"❌ Error evaluando {ticker}: {e}")
+    if candidatos:
+        logger.info(f"🔍 Candidatos COMPRA: {candidatos}")
+        for ticker in candidatos:
+            try:
+                resultado = _evaluate_entry_timing(ticker)
+                if resultado:
+                    senales.append(resultado)
+                    if resultado["entrar_ahora"]:
+                        entrar_now.append(ticker)
+                        logger.info(f"✅ ENTRADA OK {ticker} | score={resultado['entry_score']}")
+                    else:
+                        logger.info(f"⏳ ESPERAR {ticker} | {resultado['razon']}")
+            except Exception as e:
+                logger.error(f"❌ Error entry {ticker}: {e}")
+    else:
+        logger.info("ℹ️  Sin candidatos COMPRA")
 
-    # Cargar snapshot del día y agregar esta hora
+    # ── 2. POSICIONES ABIERTAS ───────────────────────────────
+    posiciones_abiertas = _get_open_positions_with_date()
+    monitor_posiciones  = []
+
+    if posiciones_abiertas:
+        logger.info(f"📊 Monitoreando {len(posiciones_abiertas)} posiciones")
+        for pos in posiciones_abiertas:
+            try:
+                resultado = _evaluate_open_position(
+                    pos["ticker"], pos["dia_actual"], pos["entry_date"]
+                )
+                if resultado:
+                    monitor_posiciones.append(resultado)
+            except Exception as e:
+                logger.error(f"❌ Error monitor {pos['ticker']}: {e}")
+    else:
+        logger.info("ℹ️  Sin posiciones abiertas")
+
+    # ── 3. GUARDAR SNAPSHOT ──────────────────────────────────
     snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
     snapshot      = _load_json(snapshot_path)
 
     snapshot[hora_str] = {
-        "timestamp": ahora.isoformat(),
-        "senales":   senales,
-        "entrar_ahora": entrar_now,
+        "timestamp":          ahora.isoformat(),
+        "senales":            senales,
+        "entrar_ahora":       entrar_now,
+        "monitor_posiciones": monitor_posiciones,
     }
 
     _save_json(snapshot_path, snapshot)
 
     logger.info(
-        f"💾 Snapshot guardado | candidatos={len(senales)} entrar={len(entrar_now)}"
+        f"💾 Snapshot | compra={len(senales)} entrar={len(entrar_now)} "
+        f"posiciones={len(monitor_posiciones)}"
     )
 
     return {
-        "hora":         hora_str,
-        "candidatos":   len(senales),
-        "entrar_ahora": entrar_now,
-        "senales":      senales,
+        "hora":               hora_str,
+        "candidatos":         len(senales),
+        "entrar_ahora":       entrar_now,
+        "senales":            senales,
+        "monitor_posiciones": monitor_posiciones,
     }
 
 
 # =========================================================
-# LEER SEÑAL PARA TRADING ORCHESTRATOR
+# API PARA ORCHESTRATOR Y DASHBOARD
 # =========================================================
 
 def get_entry_signals_today() -> Dict[str, Dict]:
-    """
-    Llamado por TradingOrchestrator en el run de las 16:30.
-    Retorna el mejor momento del día para cada ticker.
-
-    Formato: { "AAPL": { "entry_score": 0.82, "entrar": True, ... } }
-    """
+    """Mejor momento del día por ticker candidato COMPRA."""
     fecha_str     = datetime.now(timezone.utc).date().isoformat()
     snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
     snapshot      = _load_json(snapshot_path)
@@ -364,9 +434,7 @@ def get_entry_signals_today() -> Dict[str, Dict]:
     if not snapshot:
         return {}
 
-    # Por ticker: tomar el snapshot con mayor entry_score del día
     best_by_ticker: Dict[str, Dict] = {}
-
     for hora, data in snapshot.items():
         for senal in data.get("senales", []):
             ticker = senal.get("ticker")
@@ -377,3 +445,26 @@ def get_entry_signals_today() -> Dict[str, Dict]:
                 best_by_ticker[ticker] = {**senal, "mejor_hora": hora}
 
     return best_by_ticker
+
+
+def get_position_status_today() -> Dict[str, Dict]:
+    """
+    Último status de cada posición abierta monitoreada hoy.
+    Llamable desde dashboard para mostrar estado vs curva.
+    """
+    fecha_str     = datetime.now(timezone.utc).date().isoformat()
+    snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
+    snapshot      = _load_json(snapshot_path)
+
+    if not snapshot:
+        return {}
+
+    latest: Dict[str, Dict] = {}
+    for hora in sorted(snapshot.keys()):
+        for pos in snapshot[hora].get("monitor_posiciones", []):
+            ticker = pos.get("ticker")
+            if ticker:
+                latest[ticker] = {**pos, "ultima_hora": hora}
+
+    return latest
+    
