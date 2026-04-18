@@ -37,7 +37,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v3.9 ALPHA-CONSUMER | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.0 ALPHA-CONSUMER | fallback capital ${self._fallback_capital:,.0f}")
 
     async def _get_real_capital(self) -> float:
         try:
@@ -65,6 +65,21 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning(f"⚠️ No se pudo cargar anchor_universe.json: {e}")
             return set()
+
+    def _load_intraday_signals(self) -> Dict[str, Dict]:
+        try:
+            from intraday_tracker import get_entry_signals_today
+            signals = get_entry_signals_today()
+            if signals:
+                listos = [t for t, s in signals.items() if s.get("entrar_ahora")]
+                logger.info(
+                    f"📡 Intraday signals | {len(signals)} evaluados | "
+                    f"listos para entrar: {listos}"
+                )
+            return signals
+        except Exception as e:
+            logger.warning(f"⚠️ Intraday signals no disponibles: {e}")
+            return {}
 
     def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
         broker_price_map = {}
@@ -185,8 +200,9 @@ class TradingOrchestrator:
                 logger.info(f"🗑 Órdenes canceladas para {ticker}")
             except Exception as e:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
+
     # =========================================================
-    # RUN PRINCIPAL v3.9
+    # RUN PRINCIPAL v4.0
     # =========================================================
     async def run(
         self,
@@ -197,7 +213,7 @@ class TradingOrchestrator:
 
         # PASO 1: Capital real inicial
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v3.9 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.0 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
@@ -240,6 +256,9 @@ class TradingOrchestrator:
             for t, d in alpha_data.get("results", {}).items()
             if isinstance(d, dict)
         }
+
+        # Leer señales intraday — no bloquea si no hay datos
+        intraday_signals = self._load_intraday_signals()
 
         pm_decisions = await self._get_pm_decisions(
             mode, positions, signals or {}, anchor_universe
@@ -295,6 +314,12 @@ class TradingOrchestrator:
                     )
                     close_successes.append(order["ticker"])
                     logger.info(f"⚰️ CLOSED {order['ticker']}")
+                    # Limpiar entry_date al cerrar
+                    try:
+                        from positions_meta import remove_entry
+                        remove_entry(order["ticker"])
+                    except Exception:
+                        pass
                     await asyncio.sleep(0.8)
                 except Exception as e:
                     logger.error(f"❌ CLOSE ERROR {order.get('ticker')}: {e}")
@@ -319,7 +344,45 @@ class TradingOrchestrator:
                     "alpha":      score,
                 })
 
-        opens_dict   = {o["ticker"].upper(): o for o in opens}
+        # ── FILTRO INTRADAY ──────────────────────────────────────
+        if intraday_signals:
+            filtered_opens = []
+            for o in opens:
+                ticker    = o.get("ticker", "").upper()
+                is_anchor = (
+                    o.get("is_anchor")
+                    or o.get("reason", "").startswith("ANCHOR")
+                    or ticker in anchor_tickers
+                )
+
+                if is_anchor:
+                    filtered_opens.append(o)
+                    continue
+
+                signal = intraday_signals.get(ticker)
+                if signal is None:
+                    filtered_opens.append(o)
+                    continue
+
+                if signal.get("entrar_ahora", False):
+                    logger.info(
+                        f"📡 INTRADAY PASS {ticker} | "
+                        f"score={signal.get('entry_score')} "
+                        f"ratio={signal.get('tracking_ratio')}"
+                    )
+                    filtered_opens.append(o)
+                else:
+                    logger.info(
+                        f"⏳ INTRADAY ESPERA {ticker} | "
+                        f"score={signal.get('entry_score')} | "
+                        f"{signal.get('razon', '')} | "
+                        f"señal COMPRA vigente para próxima ventana"
+                    )
+                    filtered_opens.append(o)  # ← siempre pasa, solo logea el timing
+
+            opens = filtered_opens
+        # ────────────────────────────────────────────────────────
+                opens_dict   = {o["ticker"].upper(): o for o in opens}
         unique_opens = self._enrich_opens_with_price_and_shares(list(opens_dict.values()))
 
         anchor_opens = [
@@ -371,14 +434,22 @@ class TradingOrchestrator:
 
         for order in final_queue[:max(0, remaining_orders)]:
             try:
-                await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     self.broker.execute_decision(order), timeout=30
                 )
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
-                await asyncio.sleep(0.8)
 
-                # Refrescar governor DESPUÉS de cada compra ejecutada
+                # Registrar entry_date para tracking vs curva intraday
+                if result.get("status") in ("executed", "pending"):
+                    try:
+                        from positions_meta import set_entry_date
+                        set_entry_date(order["ticker"])
+                        logger.info(f"📅 entry_date registrado: {order['ticker']}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ entry_date no registrado {order['ticker']}: {e}")
+
+                await asyncio.sleep(0.8)
                 self.governor = await self._refresh_governor()
 
             except Exception as e:
@@ -414,17 +485,18 @@ class TradingOrchestrator:
         )
 
         return {
-            "status":          "success",
-            "mode":            mode,
-            "executed":        total_executed,
-            "closes_executed": len(close_successes),
-            "opens_executed":  executed_opens,
-            "elite_executed":  elite_count,
-            "queue_size":      len(final_queue),
-            "real_capital":    round(self.fixed_capital, 2),
-            "alpha_timestamp": alpha_data.get("timestamp"),
-            "results":         results,
-            "decisions":       pm_decisions,
+            "status":             "success",
+            "mode":               mode,
+            "executed":           total_executed,
+            "closes_executed":    len(close_successes),
+            "opens_executed":     executed_opens,
+            "elite_executed":     elite_count,
+            "queue_size":         len(final_queue),
+            "real_capital":       round(self.fixed_capital, 2),
+            "alpha_timestamp":    alpha_data.get("timestamp"),
+            "intraday_evaluated": len(intraday_signals),
+            "results":            results,
+            "decisions":          pm_decisions,
         }
 
     async def preview_executability(self, market_ctx: Dict) -> Dict:
@@ -502,4 +574,4 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
-        
+    
