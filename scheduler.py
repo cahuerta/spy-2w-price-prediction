@@ -5,6 +5,7 @@
 # Responsabilidades:
 #   - Disparar pipeline 30 min después de apertura NY (11:00 Chile)
 #   - Disparar pipeline 30 min antes de cierre NY (16:30 Chile)
+#   - Intraday tracker cada 30 min durante horario de mercado
 #   - Solo lunes a viernes (días hábiles)
 #   - Loggear estado cada hora (alive check)
 #
@@ -52,16 +53,42 @@ def _trigger_pipeline(motivo: str):
         print(f"❌ Pipeline trigger failed [{motivo}]: {e}")
 
 
+def _run_intraday_tracker():
+    try:
+        from intraday_tracker import run_intraday_tracker
+        result  = run_intraday_tracker()
+        entrar  = result.get("entrar_ahora", [])
+        n       = result.get("candidatos", 0)
+        if entrar:
+            print(f"📡 Tracker | ENTRAR AHORA: {entrar}")
+        else:
+            print(f"📡 Tracker | {n} candidatos | ninguno listo aún")
+    except Exception as e:
+        print(f"❌ Intraday tracker error: {e}")
+
+
 def _es_dia_habil(ahora: datetime) -> bool:
     return ahora.weekday() < 5  # 0=lunes … 4=viernes
+
+
+def _en_horario_mercado(ahora: datetime) -> bool:
+    """True entre 11:00 y 16:30 hora Chile."""
+    if ahora.hour > HORA_APERTURA and ahora.hour < HORA_CIERRE:
+        return True
+    if ahora.hour == HORA_APERTURA:
+        return True
+    if ahora.hour == HORA_CIERRE and ahora.minute < MIN_CIERRE:
+        return True
+    return False
 
 
 def _loop():
     print("🕐 Quant Scheduler iniciado")
 
-    ultimo_apertura: date | None = None
-    ultimo_cierre:   date | None = None
-    ultimo_log_h:    int  | None = None
+    ultimo_apertura:  date | None = None
+    ultimo_cierre:    date | None = None
+    ultimo_log_h:     int  | None = None
+    ultimo_tracker:   int  | None = None  # clave hora*100 + slot(0|30)
 
     while True:
         ahora = datetime.now(CHILE_TZ)
@@ -69,20 +96,29 @@ def _loop():
 
         if _es_dia_habil(ahora):
 
-            # — Ejecución apertura: 11:00 Chile
+            # — Pipeline apertura: 11:00 Chile
             if (ahora.hour == HORA_APERTURA
                     and ahora.minute < 5
                     and ultimo_apertura != hoy):
                 _trigger_pipeline("apertura")
                 ultimo_apertura = hoy
 
-            # — Ejecución cierre: 16:30 Chile
+            # — Pipeline cierre: 16:30 Chile
             if (ahora.hour == HORA_CIERRE
                     and ahora.minute >= MIN_CIERRE
                     and ahora.minute < MIN_CIERRE + 5
                     and ultimo_cierre != hoy):
                 _trigger_pipeline("cierre")
                 ultimo_cierre = hoy
+
+            # — Intraday tracker cada 30 min durante mercado abierto
+            if _en_horario_mercado(ahora):
+                slot        = 0 if ahora.minute < 30 else 30
+                tracker_key = ahora.hour * 100 + slot
+
+                if ultimo_tracker != tracker_key:
+                    _run_intraday_tracker()
+                    ultimo_tracker = tracker_key
 
         # — Alive log cada hora
         if ahora.minute < 5 and ultimo_log_h != ahora.hour:
@@ -100,4 +136,3 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
-    
