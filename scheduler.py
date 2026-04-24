@@ -9,6 +9,7 @@
 #   - Alive log cada hora
 #   - Darwin Engine: resolver trades diario post-market (17:00 Chile)
 #   - Darwin Engine: ciclo evolutivo viernes post-market (18:00 Chile)
+#   - Darwin Engine: evolución predictores H1-H10 viernes post-market
 #
 # Horario mercado US en hora Chile (verano UTC-3):
 #   Apertura  09:30 ET = 10:30 Chile → primera ejecución 11:00
@@ -73,7 +74,7 @@ def _trigger_darwin_resolve(motivo: str):
         from darwin_engine.trade_tracker import resolve_pending_trades
         resolved = resolve_pending_trades()
         print(f"✅ Darwin trades resueltos: {len(resolved)}")
-        for t in resolved[:5]:  # log primeros 5
+        for t in resolved[:5]:
             print(
                 f"   {t.get('ticker')} | "
                 f"PnL real={t.get('pnl_real_pct', 0):+.2f}% | "
@@ -86,25 +87,39 @@ def _trigger_darwin_resolve(motivo: str):
 
 def _trigger_darwin_evolution(motivo: str):
     """
-    Ciclo evolutivo completo:
-      1. Evalúa fitness de todos los genomas
-      2. Promueve campeón si hay uno mejor
-      3. Genera nueva generación (mutación + crossover)
-      4. Escribe campeón al repo vía GitHub API
-    Corre viernes post-market.
+    Ciclo evolutivo completo viernes post-market:
+      1. Executor arena: evalúa fitness, promueve campeón, genera nueva gen
+      2. Predictor arena: evoluciona H1-H10 según hit rates reales
     """
     print(f"🧬 Darwin evolution cycle [{motivo}]")
+
+    # ── Executor genome ───────────────────────────────
     try:
         from darwin_engine.arena import run_evolution_cycle
         result = run_evolution_cycle()
         print(
-            f"✅ Darwin ciclo completado | "
+            f"✅ Executor ciclo | "
             f"campeón={result.get('champion_after')} | "
             f"promovido={result.get('was_promoted')} | "
             f"nueva_gen={len(result.get('new_generation', []))}"
         )
     except Exception as e:
-        print(f"❌ Darwin evolution error: {e}")
+        print(f"❌ Executor arena error: {e}")
+
+    # ── Predictor genomes H1-H10 ──────────────────────
+    try:
+        from darwin_engine.predictor_arena import run_predictor_evolution
+        pred_result = run_predictor_evolution()
+        print(
+            f"✅ Predictor ciclo | "
+            f"H evaluados={pred_result.get('h_evaluated')} | "
+            f"promovidos={pred_result.get('promotions')}"
+        )
+        # Log ranking H1-H10
+        for r in pred_result.get("ranking", []):
+            print(f"   H{r['horizon']}: {r['hit_rate']:.2%}")
+    except Exception as e:
+        print(f"❌ Predictor arena error: {e}")
 
 
 # ══════════════════════════════════════════════════════
@@ -132,10 +147,10 @@ def _en_horario_mercado(ahora: datetime) -> bool:
 def _loop():
     print("🕐 Quant Scheduler iniciado")
 
-    ultimo_trigger:         int | None = None
-    ultimo_log_h:           int | None = None
-    darwin_resolve_hoy:     str | None = None   # fecha del último resolve
-    darwin_evolution_hoy:   str | None = None   # fecha del último ciclo evolutivo
+    ultimo_trigger:       int | None = None
+    ultimo_log_h:         int | None = None
+    darwin_resolve_hoy:   str | None = None
+    darwin_evolution_hoy: str | None = None
 
     while True:
         ahora     = datetime.now(CHILE_TZ)
@@ -151,8 +166,6 @@ def _loop():
                 ultimo_trigger = trigger_key
 
         # ── Darwin: resolver trades (diario 17:05 Chile) ──
-        # Se ejecuta después del cierre del mercado
-        # 5 minutos después para asegurar que el pipeline terminó
         if (
             _es_dia_habil(ahora)
             and ahora.hour == 17
@@ -163,7 +176,6 @@ def _loop():
             darwin_resolve_hoy = fecha_hoy
 
         # ── Darwin: ciclo evolutivo (viernes 18:00 Chile) ─
-        # weekday() == 4 → viernes
         if (
             ahora.weekday() == 4
             and ahora.hour == 18
@@ -196,3 +208,4 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
+    
