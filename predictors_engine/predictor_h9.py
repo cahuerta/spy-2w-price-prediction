@@ -5,10 +5,6 @@ import json
 import sys
 from datetime import datetime
 
-# ======================================================
-# CONFIGURACIÓN DE ENTORNO
-# ======================================================
-
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT_DIR)
 
@@ -20,16 +16,24 @@ from sklearn.decomposition import PCA
 import warnings
 warnings.filterwarnings("ignore")
 
+# ── DARWIN ────────────────────────────────────────────
+try:
+    from darwin_engine.predictor_genome import load_active_genome
+    DARWIN_PREDICTOR = True
+except ImportError:
+    DARWIN_PREDICTOR = False
+# ─────────────────────────────────────────────────────
+
 # ======================================================
 # CONFIGURACIÓN H9
 # ======================================================
-
 DATA_OUTPUT_DIR = "predictions_data"
 os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
 
 HORIZON = 9
 ALPHA_H9 = 1.5
 MAX_PCA_COMPONENTS = 12
+CLIP_RET = 0.18
 
 try:
     from data_provider import get_price_history
@@ -37,92 +41,100 @@ except ImportError:
     print("❌ ERROR: data_provider.py no encontrado")
     sys.exit(1)
 
-
 # ======================================================
 # FEATURE ENGINEERING H9
 # ======================================================
-
 def make_features_h9(df: pd.DataFrame):
-
     out = df.copy()
 
-    # BASE
-    out["ret1"] = np.log(out["Close"]).diff()
-    out["range"] = np.log(out["High"] / out["Low"]).clip(0,0.40)
+    out["ret1"]  = np.log(out["Close"]).diff()
+    out["range"] = np.log(out["High"] / out["Low"]).clip(0, 0.40)
 
-    # LAGS
-    for k in [1,3,5,10,20,30]:
+    for k in [1, 3, 5, 10, 20, 30]:
         out[f"ret_lag_{k}"] = out["ret1"].shift(k)
 
-    # ======================================================
-    # MONEY FLOW INDEX (SIN LEAKAGE)
-    # ======================================================
+    # MFI sin leakage
+    tp     = (out["High"] + out["Low"] + out["Close"]) / 3
+    rmf    = tp * out["Volume"]
+    tp_s   = tp.shift(1)
+    rmf_s  = rmf.shift(1)
 
-    tp = (out["High"] + out["Low"] + out["Close"]) / 3
-    rmf = tp * out["Volume"]
+    pos_flow = rmf_s.where(tp_s > tp_s.shift(1), 0)
+    neg_flow = rmf_s.where(tp_s < tp_s.shift(1), 0)
+    pos_sum  = pos_flow.rolling(14).sum()
+    neg_sum  = neg_flow.rolling(14).sum()
+    m_ratio  = pos_sum / (neg_sum + 1e-9)
+    out["mfi_14"] = (100 - (100 / (1 + m_ratio))).clip(5, 95)
 
-    tp_shift = tp.shift(1)
-    rmf_shift = rmf.shift(1)
+    # Bollinger distance
+    close_past  = out["Close"].shift(1)
+    sma20       = close_past.rolling(20).mean()
+    std20       = close_past.rolling(20).std().clip(1e-6)
+    out["bb_dist"] = ((close_past - sma20) / (2 * std20)).clip(-3, 3)
 
-    pos_flow = rmf_shift.where(tp_shift > tp_shift.shift(1),0)
-    neg_flow = rmf_shift.where(tp_shift < tp_shift.shift(1),0)
+    out["capital_flow"] = ((out["mfi_14"] - 50) / 50).clip(-1, 1)
 
-    pos_sum = pos_flow.rolling(14).sum()
-    neg_sum = neg_flow.rolling(14).sum()
+    # Features adicionales para evolución
+    past_ret     = out["ret1"].shift(1)
+    out["rv_30"] = past_ret.rolling(30).std().clip(1e-6) * np.sqrt(252)
+    out["rv_60"] = past_ret.rolling(60).std().clip(1e-6) * np.sqrt(252)
+    out["vol_chg"] = np.log(out["Volume"].replace(0, np.nan)).diff()
 
-    m_ratio = pos_sum / (neg_sum + 1e-9)
+    delta = out["Close"].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rs    = gain / loss.replace(0, 1.0)
+    out["rsi_14"] = 100 - (100 / (1 + rs))
 
-    out["mfi_14"] = (100 - (100/(1+m_ratio))).clip(5,95)
-
-    # ======================================================
-    # BOLLINGER DISTANCE
-    # ======================================================
-
-    close_past = out["Close"].shift(1)
-
-    sma20 = close_past.rolling(20).mean()
-    std20 = close_past.rolling(20).std().clip(1e-6)
-
-    out["bb_dist"] = ((close_past - sma20) / (2*std20)).clip(-3,3)
-
-    # ======================================================
-    # CAPITAL FLOW PROXY
-    # ======================================================
-
-    out["capital_flow"] = ((out["mfi_14"] - 50)/50).clip(-1,1)
+    sma50 = close_past.rolling(50).mean()
+    out["dist_sma50"] = np.log(close_past / sma50).clip(-0.3, 0.3)
 
     return out
-
 
 # ======================================================
 # PREDICTOR H9
 # ======================================================
-
-def run_predictor_h9(ticker:str):
-
+def run_predictor_h9(ticker: str):
     raw = get_price_history(ticker=ticker, period="2y", interval="1d")
+
+    # ── DARWIN ────────────────────────────────────────
+    _alpha    = ALPHA_H9
+    _max_pca  = MAX_PCA_COMPONENTS
+    _clip_ret = CLIP_RET
+    _feature_override = None
+
+    if DARWIN_PREDICTOR:
+        try:
+            genome    = load_active_genome(HORIZON)
+            _alpha    = genome.model_params.get("alpha_ridge", ALPHA_H9)
+            _max_pca  = genome.model_params.get("max_pca",     MAX_PCA_COMPONENTS)
+            _clip_ret = genome.model_params.get("clip_ret",    CLIP_RET)
+            if genome.data.get("n_evaluations", 0) >= 20:
+                _feature_override = genome.features
+        except Exception:
+            pass
+    # ─────────────────────────────────────────────────
 
     if raw is None or len(raw) < 300:
         return None
 
-    df = raw[["Open","High","Low","Close","Volume"]].dropna()
-
+    df   = raw[["Open", "High", "Low", "Close", "Volume"]].dropna()
     feat = make_features_h9(df)
 
-    feature_cols = [
-        "range",
-        "mfi_14",
-        "bb_dist",
-        "capital_flow",
-        "ret_lag_1",
-        "ret_lag_5",
-        "ret_lag_10",
-        "ret_lag_20",
-        "ret_lag_30"
+    _base_features = [
+        "range", "mfi_14", "bb_dist", "capital_flow",
+        "ret_lag_1", "ret_lag_5", "ret_lag_10",
+        "ret_lag_20", "ret_lag_30"
     ]
 
-    feat["y_fwd"] = np.log(feat["Close"].shift(-HORIZON) / feat["Close"])
+    if _feature_override:
+        feature_cols = [f for f in _feature_override if f in feat.columns]
+        if len(feature_cols) < 4:
+            feature_cols = _base_features
+    else:
+        feature_cols = _base_features
 
+    feat["y_fwd"] = np.log(feat["Close"].shift(-HORIZON) / feat["Close"])
     clean = feat.dropna(subset=feature_cols + ["y_fwd"])
 
     if len(clean) < 250:
@@ -131,106 +143,55 @@ def run_predictor_h9(ticker:str):
     X = clean[feature_cols].values
     y = clean["y_fwd"].values
 
-    # ======================================================
-    # PCA DINÁMICO
-    # ======================================================
-
     n_samples, n_features = X.shape
-
-    dynamic_pca = max(
-        1,
-        min(MAX_PCA_COMPONENTS, n_features, n_samples-1)
-    )
+    dynamic_pca = max(1, min(_max_pca, n_features, n_samples - 1))
 
     model = Pipeline([
         ("scaler", StandardScaler()),
-        ("pca", PCA(n_components=dynamic_pca, random_state=42)),
-        ("ridge", Ridge(alpha=ALPHA_H9))
+        ("pca",    PCA(n_components=dynamic_pca, random_state=42)),
+        ("ridge",  Ridge(alpha=_alpha))
     ])
-
-    model.fit(X,y)
-
-    # ======================================================
-    # PREDICCIÓN
-    # ======================================================
+    model.fit(X, y)
 
     last_feat = feat[feature_cols].iloc[-1:]
-
     if last_feat.isna().any().any():
         return None
 
-    y_pred_log = float(model.predict(last_feat)[0])
-
-    y_pred_log = np.clip(y_pred_log,-0.18,0.18)
-
+    y_pred_log  = float(model.predict(last_feat)[0])
+    y_pred_log  = np.clip(y_pred_log, -_clip_ret, _clip_ret)
     price_today = float(feat["Close"].iloc[-1])
-    price_9d = price_today * np.exp(y_pred_log)
+    price_9d    = price_today * np.exp(y_pred_log)
 
-    # ======================================================
-    # MÉTRICAS
-    # ======================================================
-
-    ridge_model = model.named_steps["ridge"]
-
-    confidence = 1/(1 + np.std(ridge_model.coef_))
+    confidence = 1 / (1 + np.std(model.named_steps["ridge"].coef_))
 
     return {
-
-        "ticker": ticker,
-        "predictor": "H9",
-
+        "ticker":       ticker,
+        "predictor":    "H9",
         "horizon_days": HORIZON,
-
-        "price_today": round(price_today,4),
-        "price_pred": round(price_9d,4),
-
-        "return_pct": round(y_pred_log*100,4),
-
-        "mfi_14": round(float(feat["mfi_14"].iloc[-1]),1),
-        "bb_position": round(float(feat["bb_dist"].iloc[-1]),2),
-
-        "confidence": round(float(confidence),3),
-
-        "samples": len(clean),
-
-        "model":{
-            "alpha": ALPHA_H9,
-            "pca_components": dynamic_pca
+        "price_today":  round(price_today, 4),
+        "price_pred":   round(price_9d, 4),
+        "return_pct":   round(y_pred_log * 100, 4),
+        "mfi_14":       round(float(feat["mfi_14"].iloc[-1]), 1),
+        "bb_position":  round(float(feat["bb_dist"].iloc[-1]), 2),
+        "confidence":   round(float(confidence), 3),
+        "samples":      len(clean),
+        "model": {
+            "alpha":          _alpha,
+            "pca_components": dynamic_pca,
+            "genome_active":  DARWIN_PREDICTOR,
         },
-
         "timestamp": datetime.now().isoformat()
     }
 
-
-# ======================================================
-# EJECUCIÓN
-# ======================================================
-
 if __name__ == "__main__":
-
-    ticker = sys.argv[1].upper() if len(sys.argv)>1 else "SPY"
-
-    print(f"🚀 Ejecutando H9 Capital Cycle (9d) → {ticker}")
-
+    ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
+    print(f"🚀 H9 → {ticker}")
     result = run_predictor_h9(ticker)
-
     if result:
-
-        filename = f"{ticker}_H9.json"
-
-        path = os.path.join(DATA_OUTPUT_DIR, filename)
-
-        with open(path,"w") as f:
-            json.dump(result,f,indent=2)
-
-        print("\n✅ H9 COMPLETADO")
-        print("----------------------------------------")
-        print(f"📊 {ticker}: ${result['price_today']:,.2f}")
-        print(f"🎯 9d target: ${result['price_pred']:,.2f}")
-        print(f"📈 Retorno Est: {result['return_pct']}%")
-        print(f"💰 MFI: {result['mfi_14']} | BB Dist: {result['bb_position']}")
-        print(f"🔥 Confianza: {result['confidence']}")
-        print("----------------------------------------")
-
+        path = os.path.join(DATA_OUTPUT_DIR, f"{ticker}_H9.json")
+        with open(path, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"✅ H9 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | {result['return_pct']}% | MFI={result['mfi_14']}")
     else:
-        print("❌ Datos insuficientes.")
+        print("❌ Datos insuficientes")
+        
