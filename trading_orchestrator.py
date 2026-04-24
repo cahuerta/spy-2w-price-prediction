@@ -13,6 +13,14 @@ from pm_growth import PMGrowth
 from pm_neutral import PMNeutral
 from pm_defensive import PMDefensive
 
+# ── DARWIN TRACKING ───────────────────────────────────────────────
+try:
+    from darwin_engine.trade_tracker import register_open, register_close
+    DARWIN_TRACKING = True
+except ImportError:
+    DARWIN_TRACKING = False
+# ─────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger("trading_orchestrator")
 logging.basicConfig(level=logging.INFO)
 
@@ -37,7 +45,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.0 ALPHA-CONSUMER | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.1 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
 
     async def _get_real_capital(self) -> float:
         try:
@@ -202,7 +210,7 @@ class TradingOrchestrator:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
-    # RUN PRINCIPAL v4.0
+    # RUN PRINCIPAL v4.1
     # =========================================================
     async def run(
         self,
@@ -212,7 +220,7 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.0 ALPHA-CONSUMER | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.1 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
@@ -295,7 +303,9 @@ class TradingOrchestrator:
 
         closes = list({c["ticker"]: c for c in closes}.values())
 
+        # =========================================================
         # PASO 2: Ejecutar CIERRES
+        # =========================================================
         close_successes = []
         if closes:
             await self._cancel_pending_orders([c["ticker"] for c in closes])
@@ -308,6 +318,32 @@ class TradingOrchestrator:
                     )
                     close_successes.append(order["ticker"])
                     logger.info(f"⚰️ CLOSED {order['ticker']}")
+
+                    # ── DARWIN: registrar cierre ──────────────────
+                    if DARWIN_TRACKING:
+                        try:
+                            alpha_at_close = alpha_map.get(
+                                order["ticker"], {}
+                            ).get("alpha_score", 0.0)
+                            # Obtener precio de salida desde posiciones enriquecidas
+                            exit_price = next(
+                                (
+                                    float(p.get("price_now") or p.get("entry_price") or 0)
+                                    for p in positions
+                                    if str(p.get("ticker", "")).upper() == order["ticker"]
+                                ),
+                                0.0,
+                            )
+                            register_close(
+                                ticker      = order["ticker"],
+                                exit_price  = exit_price,
+                                reason      = order.get("reason", "UNKNOWN"),
+                                alpha_score = alpha_at_close,
+                            )
+                        except Exception as _te:
+                            logger.warning(f"⚠️ darwin close {order['ticker']}: {_te}")
+                    # ─────────────────────────────────────────────
+
                     try:
                         from positions_meta import remove_entry
                         remove_entry(order["ticker"])
@@ -317,7 +353,9 @@ class TradingOrchestrator:
                 except Exception as e:
                     logger.error(f"❌ CLOSE ERROR {order.get('ticker')}: {e}")
 
+        # =========================================================
         # PASO 3: Refrescar capital DESPUÉS de cierres
+        # =========================================================
         self.governor = await self._refresh_governor()
 
         for decision in pm_decisions:
@@ -366,10 +404,9 @@ class TradingOrchestrator:
                         f"score={signal.get('entry_score')} | "
                         f"{signal.get('razon', '')}"
                     )
-                filtered_opens.append(o)  # siempre pasa, solo logea timing
+                filtered_opens.append(o)
             opens = filtered_opens
         # ────────────────────────────────────────────────────────
-                # CONTINÚA desde parte 1 — dentro del método run()
 
         opens_dict   = {o["ticker"].upper(): o for o in opens}
         unique_opens = self._enrich_opens_with_price_and_shares(list(opens_dict.values()))
@@ -416,7 +453,9 @@ class TradingOrchestrator:
             else:
                 logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f}")
 
+        # =========================================================
         # PASO 4: Ejecutar APERTURAS
+        # =========================================================
         results          = []
         executed_opens   = 0
         remaining_orders = self.daily_limit - len(close_successes)
@@ -428,6 +467,22 @@ class TradingOrchestrator:
                 )
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
+
+                # ── DARWIN: registrar apertura ────────────────────
+                if DARWIN_TRACKING:
+                    try:
+                        register_open(
+                            ticker              = order["ticker"],
+                            entry_price         = float(order.get("entry_price") or 0),
+                            shares              = int(order.get("shares") or 0),
+                            reason              = order.get("reason", "UNKNOWN"),
+                            alpha_score         = float(order.get("alpha") or 0),
+                            executor_genome_id  = "executor_v1",
+                            predictor_genome_id = "predictor_v1",
+                        )
+                    except Exception as _te:
+                        logger.warning(f"⚠️ darwin open {order['ticker']}: {_te}")
+                # ─────────────────────────────────────────────────
 
                 if result.get("status") in ("executed", "pending"):
                     try:
@@ -448,7 +503,9 @@ class TradingOrchestrator:
                     "error":  str(e),
                 })
 
+        # =========================================================
         # PASO 5: Limpiar store si cierres OK
+        # =========================================================
         if close_successes:
             all_closes_ok = len(close_successes) == len(closes)
             try:
@@ -469,7 +526,8 @@ class TradingOrchestrator:
         logger.info(
             f"✅ EXECUTED {total_executed} | "
             f"Cierres={len(close_successes)} Aperturas={executed_opens} | "
-            f"Elite={elite_count} | Capital final=${self.fixed_capital:,.0f}"
+            f"Elite={elite_count} | Capital final=${self.fixed_capital:,.0f} | "
+            f"Darwin={'ON' if DARWIN_TRACKING else 'OFF'}"
         )
 
         return {
@@ -483,6 +541,7 @@ class TradingOrchestrator:
             "real_capital":       round(self.fixed_capital, 2),
             "alpha_timestamp":    alpha_data.get("timestamp"),
             "intraday_evaluated": len(intraday_signals),
+            "darwin_tracking":    DARWIN_TRACKING,
             "results":            results,
             "decisions":          pm_decisions,
         }
@@ -562,4 +621,3 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
-        
