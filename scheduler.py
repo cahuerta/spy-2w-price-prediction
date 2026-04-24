@@ -7,6 +7,8 @@
 #     la primera vez del día. Pasos 5-10 + tracker siempre.
 #   - Solo lunes a viernes
 #   - Alive log cada hora
+#   - Darwin Engine: resolver trades diario post-market (17:00 Chile)
+#   - Darwin Engine: ciclo evolutivo viernes post-market (18:00 Chile)
 #
 # Horario mercado US en hora Chile (verano UTC-3):
 #   Apertura  09:30 ET = 10:30 Chile → primera ejecución 11:00
@@ -16,7 +18,7 @@ import os
 import time
 import threading
 import requests
-from datetime import datetime, date
+from datetime import datetime
 import pytz
 
 CHILE_TZ     = pytz.timezone("America/Santiago")
@@ -30,6 +32,10 @@ HORA_INICIO = 11
 HORA_FIN    = 16
 MIN_FIN     = 30
 
+
+# ══════════════════════════════════════════════════════
+# PIPELINE TRIGGER
+# ══════════════════════════════════════════════════════
 
 def _trigger_pipeline(motivo: str):
     ts = datetime.now(CHILE_TZ).isoformat()
@@ -51,6 +57,60 @@ def _trigger_pipeline(motivo: str):
         print(f"❌ Pipeline trigger failed [{motivo}]: {e}")
 
 
+# ══════════════════════════════════════════════════════
+# DARWIN ENGINE TRIGGERS
+# ══════════════════════════════════════════════════════
+
+def _trigger_darwin_resolve(motivo: str):
+    """
+    Resuelve trades cuyo horizonte ya venció.
+    Obtiene el precio real al horizonte teórico y calcula
+    oportunidad perdida/ganada para el fitness.
+    Corre diario post-market.
+    """
+    print(f"🧬 Darwin resolve_pending_trades [{motivo}]")
+    try:
+        from darwin_engine.trade_tracker import resolve_pending_trades
+        resolved = resolve_pending_trades()
+        print(f"✅ Darwin trades resueltos: {len(resolved)}")
+        for t in resolved[:5]:  # log primeros 5
+            print(
+                f"   {t.get('ticker')} | "
+                f"PnL real={t.get('pnl_real_pct', 0):+.2f}% | "
+                f"PnL teórico={t.get('pnl_teorico_pct', 0):+.2f}% | "
+                f"Oportunidad={t.get('oportunidad_pct', 0):+.2f}%"
+            )
+    except Exception as e:
+        print(f"❌ Darwin resolve error: {e}")
+
+
+def _trigger_darwin_evolution(motivo: str):
+    """
+    Ciclo evolutivo completo:
+      1. Evalúa fitness de todos los genomas
+      2. Promueve campeón si hay uno mejor
+      3. Genera nueva generación (mutación + crossover)
+      4. Escribe campeón al repo vía GitHub API
+    Corre viernes post-market.
+    """
+    print(f"🧬 Darwin evolution cycle [{motivo}]")
+    try:
+        from darwin_engine.arena import run_evolution_cycle
+        result = run_evolution_cycle()
+        print(
+            f"✅ Darwin ciclo completado | "
+            f"campeón={result.get('champion_after')} | "
+            f"promovido={result.get('was_promoted')} | "
+            f"nueva_gen={len(result.get('new_generation', []))}"
+        )
+    except Exception as e:
+        print(f"❌ Darwin evolution error: {e}")
+
+
+# ══════════════════════════════════════════════════════
+# HELPERS DE HORARIO
+# ══════════════════════════════════════════════════════
+
 def _es_dia_habil(ahora: datetime) -> bool:
     return ahora.weekday() < 5
 
@@ -65,31 +125,69 @@ def _en_horario_mercado(ahora: datetime) -> bool:
     return False
 
 
+# ══════════════════════════════════════════════════════
+# LOOP PRINCIPAL
+# ══════════════════════════════════════════════════════
+
 def _loop():
     print("🕐 Quant Scheduler iniciado")
 
-    ultimo_trigger: int | None = None
-    ultimo_log_h:   int | None = None
+    ultimo_trigger:         int | None = None
+    ultimo_log_h:           int | None = None
+    darwin_resolve_hoy:     str | None = None   # fecha del último resolve
+    darwin_evolution_hoy:   str | None = None   # fecha del último ciclo evolutivo
 
     while True:
-        ahora = datetime.now(CHILE_TZ)
+        ahora     = datetime.now(CHILE_TZ)
+        fecha_hoy = ahora.strftime("%Y-%m-%d")
 
+        # ── Pipeline de mercado cada 30 min ───────────
         if _es_dia_habil(ahora) and _en_horario_mercado(ahora):
             slot        = 0 if ahora.minute < 30 else 30
             trigger_key = ahora.hour * 100 + slot
-
             if ultimo_trigger != trigger_key:
                 motivo = f"{ahora.hour:02d}:{slot:02d}"
                 _trigger_pipeline(motivo)
                 ultimo_trigger = trigger_key
 
+        # ── Darwin: resolver trades (diario 17:05 Chile) ──
+        # Se ejecuta después del cierre del mercado
+        # 5 minutos después para asegurar que el pipeline terminó
+        if (
+            _es_dia_habil(ahora)
+            and ahora.hour == 17
+            and 5 <= ahora.minute < 15
+            and darwin_resolve_hoy != fecha_hoy
+        ):
+            _trigger_darwin_resolve("post_market_17:05")
+            darwin_resolve_hoy = fecha_hoy
+
+        # ── Darwin: ciclo evolutivo (viernes 18:00 Chile) ─
+        # weekday() == 4 → viernes
+        if (
+            ahora.weekday() == 4
+            and ahora.hour == 18
+            and ahora.minute < 10
+            and darwin_evolution_hoy != fecha_hoy
+        ):
+            _trigger_darwin_evolution("viernes_18:00")
+            darwin_evolution_hoy = fecha_hoy
+
+        # ── Alive log cada hora ───────────────────────
         if ahora.minute < 5 and ultimo_log_h != ahora.hour:
             dia = "hábil" if _es_dia_habil(ahora) else "fin de semana"
-            print(f"💓 Scheduler alive | {ahora.strftime('%Y-%m-%d %H:%M')} Chile | {dia}")
+            print(
+                f"💓 Scheduler alive | "
+                f"{ahora.strftime('%Y-%m-%d %H:%M')} Chile | {dia}"
+            )
             ultimo_log_h = ahora.hour
 
         time.sleep(60)
 
+
+# ══════════════════════════════════════════════════════
+# START
+# ══════════════════════════════════════════════════════
 
 def start_scheduler():
     if not PIPELINE_KEY:
@@ -98,4 +196,3 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
-    
