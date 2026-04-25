@@ -45,7 +45,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.1 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.2 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
 
     async def _get_real_capital(self) -> float:
         try:
@@ -88,6 +88,36 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning(f"⚠️ Intraday signals no disponibles: {e}")
             return {}
+
+    def _get_broker_positions_tickers(self) -> set:
+        """
+        ── FIX v4.2 ──
+        Lee posiciones DIRECTAMENTE desde Alpaca (fuente de verdad).
+        Evita el bug donde portfolio_tickers quedaba vacío porque
+        positions.json en disco estaba desactualizado, causando que
+        el orchestrator reabriera tickers ya existentes en Alpaca
+        → loop buy/sell del mismo ticker en cada ciclo.
+        """
+        try:
+            broker_data = self.broker.get_positions()
+            if not broker_data:
+                logger.warning("⚠️ Broker devolvió 0 posiciones directas")
+                return set()
+            if isinstance(broker_data, dict):
+                tickers = {t.upper() for t in broker_data.keys()}
+            elif isinstance(broker_data, list):
+                tickers = {
+                    str(p.get("ticker", p.get("symbol", ""))).upper()
+                    for p in broker_data
+                    if p.get("ticker") or p.get("symbol")
+                }
+            else:
+                tickers = set()
+            logger.info(f"📋 Broker positions (Alpaca directo): {sorted(tickers)}")
+            return tickers
+        except Exception as e:
+            logger.warning(f"⚠️ _get_broker_positions_tickers error: {e}")
+            return set()
 
     def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
         broker_price_map = {}
@@ -210,7 +240,7 @@ class TradingOrchestrator:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
-    # RUN PRINCIPAL v4.1
+    # RUN PRINCIPAL v4.2
     # =========================================================
     async def run(
         self,
@@ -220,7 +250,7 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.1 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.2 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
@@ -245,13 +275,26 @@ class TradingOrchestrator:
                     save_positions(positions)
                     logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
 
-        positions         = self._enrich_positions_with_price(positions)
-        broker_positions  = load_positions()
-        real_positions    = {p["ticker"].upper() for p in broker_positions}
-        portfolio_tickers = real_positions
-        mode              = market_ctx.get("market_mode", "neutral")
+        positions = self._enrich_positions_with_price(positions)
 
-        logger.info(f"📊 Portfolio: {len(positions)} | Real: {len(real_positions)} | Mode: {mode}")
+        # ── FIX v4.2: portfolio_tickers desde Alpaca directo ──────
+        # ANTES: leía solo desde disco → podía estar desactualizado
+        #        → orchestrator reabría tickers ya en Alpaca
+        # AHORA: lee desde Alpaca (fuente de verdad) + disco (union)
+        broker_real_tickers = self._get_broker_positions_tickers()
+        broker_positions    = load_positions()
+        disk_tickers        = {p["ticker"].upper() for p in broker_positions}
+        real_positions      = broker_real_tickers | disk_tickers
+        portfolio_tickers   = real_positions
+
+        logger.info(
+            f"📊 Portfolio | broker={len(broker_real_tickers)} "
+            f"disco={len(disk_tickers)} union={len(real_positions)} | "
+            f"Mode: {market_ctx.get('market_mode', 'neutral')}"
+        )
+        # ─────────────────────────────────────────────────────────
+
+        mode = market_ctx.get("market_mode", "neutral")
 
         alpha_data = self._load_last_alpha()
         alpha_map  = {
@@ -325,7 +368,6 @@ class TradingOrchestrator:
                             alpha_at_close = alpha_map.get(
                                 order["ticker"], {}
                             ).get("alpha_score", 0.0)
-                            # Obtener precio de salida desde posiciones enriquecidas
                             exit_price = next(
                                 (
                                     float(p.get("price_now") or p.get("entry_price") or 0)
@@ -354,9 +396,20 @@ class TradingOrchestrator:
                     logger.error(f"❌ CLOSE ERROR {order.get('ticker')}: {e}")
 
         # =========================================================
-        # PASO 3: Refrescar capital DESPUÉS de cierres
+        # PASO 3: Refrescar capital + portfolio post-cierres
         # =========================================================
         self.governor = await self._refresh_governor()
+
+        # ── FIX v4.2: actualizar portfolio post-cierres ──────────
+        # Tickers recién cerrados NO deben ser reabiertos este ciclo
+        broker_real_post  = self._get_broker_positions_tickers()
+        portfolio_tickers = broker_real_post | (disk_tickers - set(close_successes))
+        logger.info(
+            f"🔄 Portfolio post-cierres | "
+            f"broker={len(broker_real_post)} | "
+            f"efectivos={sorted(portfolio_tickers)}"
+        )
+        # ─────────────────────────────────────────────────────────
 
         for decision in pm_decisions:
             if decision.get("action") in ["OPEN", "ROTATE"]:
@@ -374,8 +427,7 @@ class TradingOrchestrator:
                     "reason":     f"ALPHA_INJECT_{score:.3f}",
                     "alpha":      score,
                 })
-
-        # ── FILTRO INTRADAY ──────────────────────────────────────
+                        # ── FILTRO INTRADAY ──────────────────────────────────────
         if intraday_signals:
             filtered_opens = []
             for o in opens:
@@ -621,3 +673,4 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
+                
