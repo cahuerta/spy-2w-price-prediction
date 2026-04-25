@@ -1,11 +1,14 @@
 # =========================================================
-# intraday_tracker.py — INTRADAY TRACKER v2.1
+# intraday_tracker.py — INTRADAY TRACKER v2.2
 # =========================================================
+# v2.2:
+#   Reemplaza Alpaca intraday (requería suscripción SIP)
+#   con Yahoo Finance (gratis, 15 min delay).
+#   Compatible con suscripción Alpaca básica.
+#
 # v2.1:
 #   Usa upper_band/lower_band del MasterOrchestrator v7.6
-#   para clasificar posiciones con precisión real en vez
-#   de umbrales fijos hardcodeados.
-#   También usa lower_band[0] para evaluar timing de entrada.
+#   para clasificar posiciones con precisión real.
 # =========================================================
 
 import os
@@ -16,9 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 import numpy as np
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+import yfinance as yf
 
 logger = logging.getLogger("intraday_tracker")
 logging.basicConfig(level=logging.INFO)
@@ -31,8 +32,6 @@ DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
 PRED_DIR      = DATA_PATH / "predictions"
 INTRADAY_DIR  = DATA_PATH / "intraday"
 ALPHA_FILE    = DATA_PATH / "alpha_last.json"
-ALPACA_KEY    = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 
 MIN_ALPHA_COMPRA = float(os.getenv("INTRADAY_MIN_ALPHA", "0.65"))
 
@@ -42,19 +41,10 @@ AHEAD_THRESHOLD     = float(os.getenv("INTRADAY_AHEAD",     "1.015"))
 LAGGING_THRESHOLD   = float(os.getenv("INTRADAY_LAGGING",   "0.985"))
 DIVERGING_THRESHOLD = float(os.getenv("INTRADAY_DIVERGING", "0.970"))
 
-_alpaca_client: Optional[StockHistoricalDataClient] = None
-
 
 # =========================================================
 # HELPERS
 # =========================================================
-
-def _get_alpaca_client() -> StockHistoricalDataClient:
-    global _alpaca_client
-    if _alpaca_client is None:
-        _alpaca_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
-    return _alpaca_client
-
 
 def _load_json(path: Path) -> Dict:
     if not path.exists():
@@ -74,42 +64,60 @@ def _save_json(path: Path, data: Any) -> None:
 
 
 # =========================================================
-# PRECIO ACTUAL + MOMENTUM
+# PRECIO ACTUAL CON YAHOO FINANCE
 # =========================================================
 
 def _get_intraday_bars(ticker: str, lookback_minutes: int = 90) -> Optional[List[float]]:
+    """
+    Obtiene precios recientes usando Yahoo Finance.
+    15 min de delay — suficiente para monitoreo de posiciones.
+    Reemplaza la versión que usaba Alpaca intraday (requería SIP).
+    """
     try:
-        client = _get_alpaca_client()
-        now    = datetime.now(timezone.utc)
-        start  = now - timedelta(minutes=lookback_minutes)
+        interval = "5m" if lookback_minutes <= 60 else "15m"
+        tk   = yf.Ticker(ticker)
+        hist = tk.history(period="1d", interval=interval)
 
-        request = StockBarsRequest(
-            symbol_or_symbols=ticker,
-            timeframe=TimeFrame.Minute,
-            start=start,
-            end=now,
-        )
-        bars = client.get_stock_bars(request).df
-        if bars is None or bars.empty:
+        if hist is None or hist.empty:
             return None
 
-        bars = bars.reset_index()
-        if "close" not in bars.columns:
-            return None
-
-        closes = bars["close"].tolist()
+        closes = hist["Close"].dropna().tolist()
         return closes if len(closes) >= 2 else None
 
     except Exception as e:
-        logger.warning(f"⚠️ intraday bars {ticker}: {e}")
+        logger.warning(f"⚠️ intraday bars Yahoo {ticker}: {e}")
         return None
 
 
 def _get_current_price(ticker: str) -> Optional[float]:
-    bars = _get_intraday_bars(ticker, lookback_minutes=10)
-    if bars:
-        return float(bars[-1])
-    return None
+    """
+    Precio actual via Yahoo Finance (15 min delay).
+    Primero intenta fast_info (más rápido), fallback a history.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+
+        # Método 1: fast_info — más rápido
+        try:
+            fi = tk.fast_info
+            price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
+            if price and float(price) > 0:
+                return float(price)
+        except Exception:
+            pass
+
+        # Método 2: history reciente — fallback
+        hist = tk.history(period="1d", interval="5m")
+        if hist is not None and not hist.empty:
+            closes = hist["Close"].dropna()
+            if len(closes) > 0:
+                return float(closes.iloc[-1])
+
+        return None
+
+    except Exception as e:
+        logger.warning(f"⚠️ current price Yahoo {ticker}: {e}")
+        return None
 
 
 def _momentum_score(closes: List[float]) -> float:
@@ -124,7 +132,7 @@ def _momentum_score(closes: List[float]) -> float:
 
 
 # =========================================================
-# CURVA ESPERADA — ahora lee bandas si existen
+# CURVA ESPERADA
 # =========================================================
 
 def _get_price_curve(ticker: str) -> Optional[Dict]:
@@ -142,16 +150,10 @@ def _get_price_curve(ticker: str) -> Optional[Dict]:
 
 
 def _get_band_for_day(curve: Dict, dia: int, band: str) -> Optional[float]:
-    """
-    Retorna upper_band o lower_band para el día N.
-    Fallback a price_path si las bandas no existen (predicciones antiguas).
-    band: "upper_band" | "lower_band"
-    """
-    idx  = max(0, min(dia - 1, 8))  # clamp 0-8
+    idx  = max(0, min(dia - 1, 8))
     data = curve.get(band, [])
     if data and idx < len(data):
         return float(data[idx])
-    # Fallback: usar price_path
     path = curve.get("price_path", [])
     return float(path[idx]) if path and idx < len(path) else None
 
@@ -248,19 +250,16 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
     bars           = _get_intraday_bars(ticker, lookback_minutes=90)
     momentum       = _momentum_score(bars) if bars else 0.0
 
-    # Usar lower_band[0] si existe — entrada buena cuando precio < lower_band
     lower_band_dia1 = _get_band_for_day(curve, 1, "lower_band") if curve else None
     upper_band_dia1 = _get_band_for_day(curve, 1, "upper_band") if curve else None
 
     if lower_band_dia1 and upper_band_dia1:
-        # Precio dentro de la banda o por debajo → buena entrada
         band_width  = upper_band_dia1 - lower_band_dia1
         precio_norm = (precio_actual - lower_band_dia1) / band_width if band_width > 0 else 0.5
         precio_score = float(np.clip(1.0 - precio_norm, 0.0, 1.0))
-        precio_ok    = precio_actual <= upper_band_dia1  # no caro vs banda superior
+        precio_ok    = precio_actual <= upper_band_dia1
         usar_bandas  = True
     else:
-        # Fallback: lógica original sin bandas
         precio_score = float(np.clip(0.5 + (1.0 - tracking_ratio) * 50, 0.0, 1.0))
         precio_ok    = tracking_ratio <= ENTRY_THRESHOLD
         usar_bandas  = False
@@ -274,8 +273,10 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
 
     razones = []
     if not precio_ok:
-        razones.append(f"precio sobre banda superior ({tracking_ratio:.3f})" if usar_bandas
-                       else f"precio caro vs curva ({tracking_ratio:.3f})")
+        razones.append(
+            f"precio sobre banda superior ({tracking_ratio:.3f})" if usar_bandas
+            else f"precio caro vs curva ({tracking_ratio:.3f})"
+        )
     if not momentum_ok:
         razones.append(f"momentum negativo ({momentum:.2f})")
     if not score_ok:
@@ -296,13 +297,13 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
         "entrar_ahora":         entrar_ahora,
         "razon":                " | ".join(razones),
         "uso_bandas":           usar_bandas,
+        "fuente_precio":        "yahoo",
     }
 
     if usar_bandas:
         result["lower_band_dia1"] = round(lower_band_dia1, 4)
         result["upper_band_dia1"] = round(upper_band_dia1, 4)
 
-    # Agregar análisis de trayectoria si existe
     if curve and curve.get("analysis"):
         result["curve_analysis"] = curve["analysis"]
 
@@ -314,17 +315,6 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
 # =========================================================
 
 def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Optional[Dict]:
-    """
-    Compara precio actual vs bandas reales del día N.
-
-    curve_status con bandas reales:
-      ahead     → precio > upper_band[dia]
-      on_track  → precio entre lower_band y upper_band
-      lagging   → precio < lower_band[dia]
-      diverging → precio < lower_band[dia] por más de 1 std adicional
-
-    Fallback a umbrales fijos si no hay bandas.
-    """
     precio_actual   = _get_current_price(ticker)
     precio_esperado = _get_expected_price_for_day(ticker, dia_actual)
 
@@ -336,13 +326,12 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
     momentum       = _momentum_score(bars) if bars else 0.0
     curve          = _get_price_curve(ticker)
 
-    # Intentar usar bandas reales del orchestrator
     upper = _get_band_for_day(curve, dia_actual, "upper_band") if curve else None
     lower = _get_band_for_day(curve, dia_actual, "lower_band") if curve else None
 
     if upper and lower and lower > 0:
         usar_bandas = True
-        std_band    = (upper - lower) / 3.0  # banda ≈ 1.5 std → 1 std = (upper-lower)/3
+        std_band    = (upper - lower) / 3.0
 
         if precio_actual > upper:
             curve_status = "ahead"
@@ -363,7 +352,6 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         else:
             curve_status = "diverging"
 
-    # Retorno real vs precio original de entrada
     ret_vs_entrada     = None
     ret_esperado_total = None
 
@@ -379,7 +367,8 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         f"📊 {ticker} día {dia_actual} | "
         f"actual={precio_actual:.2f} esperado={precio_esperado:.2f} "
         f"ratio={tracking_ratio:.3f} → {curve_status}"
-        + (f" [bandas reales]" if usar_bandas else " [fallback]")
+        + (f" [bandas]" if usar_bandas else " [fallback]")
+        + f" [yahoo]"
     )
 
     result = {
@@ -395,13 +384,13 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         "ret_vs_entrada_pct":     ret_vs_entrada,
         "ret_esperado_total_pct": ret_esperado_total,
         "uso_bandas":             usar_bandas,
+        "fuente_precio":          "yahoo",
     }
 
     if usar_bandas:
         result["upper_band_hoy"] = round(upper, 4)
         result["lower_band_hoy"] = round(lower, 4)
 
-    # Incluir best_exit_day del análisis si existe
     if curve and curve.get("analysis"):
         best_exit = curve["analysis"].get("best_exit_day")
         if best_exit:
@@ -420,7 +409,7 @@ def run_intraday_tracker() -> Dict:
     fecha_str = ahora.date().isoformat()
     hora_str  = ahora.strftime("%H:%M")
 
-    logger.info(f"📡 Intraday tracker v2.1 | {fecha_str} {hora_str} UTC")
+    logger.info(f"📡 Intraday tracker v2.2 (Yahoo) | {fecha_str} {hora_str} UTC")
 
     # ── 1. CANDIDATOS COMPRA ─────────────────────────────────
     candidatos = _get_compra_candidates()
