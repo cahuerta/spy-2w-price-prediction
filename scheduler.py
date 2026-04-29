@@ -2,8 +2,9 @@
 # Corre como thread daemon dentro del proceso FastAPI.
 #
 # Responsabilidades:
-#   - Disparar pipeline UNA vez al día a las 11:30 Chile
-#     (mercado US abierto desde 10:30, precios disponibles)
+#   - Pipeline APERTURA: 11:30 Chile — predice + abre posiciones
+#   - Pipeline CIERRE:   15:30 Chile — solo cierra, no abre
+#   - Monitor horario:   12:00-15:00 Yahoo Finance (posiciones)
 #   - Solo lunes a viernes
 #   - Alive log cada hora
 #   - Darwin Engine: resolver trades diario post-market (17:05 Chile)
@@ -13,11 +14,11 @@
 #   Apertura  09:30 ET = 10:30 Chile
 #   Cierre    16:00 ET = 17:00 Chile
 #
-# ¿Por qué una vez al día?
-#   - Suscripción Alpaca no permite datos intraday SIP
-#   - Horizontes H1-H10 son diarios, no intradía
-#   - Evita el loop buy/sell que ocurría cada 30 min
-#   - Una predicción diaria con datos EOD es suficiente y correcta
+# EJECUCIONES DIARIAS:
+#   11:30 → APERTURA  — predicción + alpha + trading (abre Y cierra)
+#   15:30 → CIERRE    — solo cierra posiciones divergentes
+#   17:05 → Darwin resolve trades
+#   18:00 viernes → Darwin evolución
 
 import os
 import time
@@ -33,18 +34,26 @@ PIPELINE_URL = os.getenv(
 )
 PIPELINE_KEY = os.getenv("PIPELINE_KEY", "")
 
-# ── Hora de ejecución diaria ──────────────────────────
-HORA_PIPELINE  = int(os.getenv("PIPELINE_HOUR", "11"))
-MIN_PIPELINE   = int(os.getenv("PIPELINE_MIN",  "30"))
+# ── Horarios ──────────────────────────────────────────
+HORA_APERTURA  = int(os.getenv("PIPELINE_HOUR",        "11"))
+MIN_APERTURA   = int(os.getenv("PIPELINE_MIN",         "30"))
+HORA_CIERRE    = int(os.getenv("PIPELINE_CIERRE_HOUR", "15"))
+MIN_CIERRE     = int(os.getenv("PIPELINE_CIERRE_MIN",  "30"))
+
+MONITOR_HORA_INICIO = int(os.getenv("MONITOR_HORA_INICIO", "12"))
+MONITOR_HORA_FIN    = int(os.getenv("MONITOR_HORA_FIN",    "15"))
 
 
 # ══════════════════════════════════════════════════════
-# PIPELINE TRIGGER
+# PIPELINE TRIGGERS
 # ══════════════════════════════════════════════════════
 
-def _trigger_pipeline(motivo: str):
+def _trigger_pipeline(motivo: str, close_only: bool = False):
     ts = datetime.now(CHILE_TZ).isoformat()
-    print(f"🚀 Disparando pipeline [{motivo}] | {ts}")
+    tipo = "🔴 CIERRE" if close_only else "🟢 APERTURA"
+    print(f"{'='*55}")
+    print(f"{tipo} [{motivo}] | {ts}")
+    print(f"{'='*55}")
     try:
         res = requests.post(
             PIPELINE_URL,
@@ -52,14 +61,60 @@ def _trigger_pipeline(motivo: str):
                 "X-PIPELINE-KEY": PIPELINE_KEY,
                 "Content-Type":   "application/json",
             },
-            timeout=60 * 30
+            json={"close_only": close_only},
+            timeout=60 * 30,
         )
         if res.status_code == 200:
-            print(f"✅ Pipeline OK [{motivo}] | {res.json()}")
+            print(f"✅ Pipeline {tipo} OK | {res.json()}")
         else:
-            print(f"❌ Pipeline HTTP {res.status_code} [{motivo}] | {res.text}")
+            print(f"❌ Pipeline {tipo} HTTP {res.status_code} | {res.text}")
     except Exception as e:
-        print(f"❌ Pipeline trigger failed [{motivo}]: {e}")
+        print(f"❌ Pipeline {tipo} trigger failed: {e}")
+
+
+# ══════════════════════════════════════════════════════
+# MONITOR HORARIO (Yahoo Finance)
+# ══════════════════════════════════════════════════════
+
+def _trigger_monitor(motivo: str):
+    print(f"📡 Monitor horario [{motivo}]")
+    try:
+        from intraday_tracker import run_intraday_tracker
+        result = run_intraday_tracker()
+
+        n_pos = len(result.get("monitor_posiciones", []))
+        print(f"✅ Monitor OK | posiciones={n_pos}")
+
+        diverging = [
+            p for p in result.get("monitor_posiciones", [])
+            if p.get("curve_status") == "diverging"
+        ]
+        if diverging:
+            tickers = [p["ticker"] for p in diverging]
+            print(f"⚠️  DIVERGING: {tickers} → disparando cierre defensivo")
+            _trigger_defensive_close(tickers)
+
+    except Exception as e:
+        print(f"❌ Monitor error: {e}")
+
+
+def _trigger_defensive_close(tickers: list):
+    try:
+        res = requests.post(
+            PIPELINE_URL.replace("/pipeline/run", "/trading/monitor-close"),
+            headers={
+                "X-PIPELINE-KEY": PIPELINE_KEY,
+                "Content-Type":   "application/json",
+            },
+            json={"tickers": tickers, "reason": "intraday_diverging"},
+            timeout=60,
+        )
+        if res.status_code == 200:
+            print(f"✅ Cierre defensivo ejecutado: {tickers}")
+        else:
+            print(f"⚠️  Cierre defensivo HTTP {res.status_code}: {res.text}")
+    except Exception as e:
+        print(f"❌ Cierre defensivo error: {e}")
 
 
 # ══════════════════════════════════════════════════════
@@ -67,10 +122,6 @@ def _trigger_pipeline(motivo: str):
 # ══════════════════════════════════════════════════════
 
 def _trigger_darwin_resolve(motivo: str):
-    """
-    Resuelve trades cuyo horizonte ya venció.
-    Corre diario post-market.
-    """
     print(f"🧬 Darwin resolve_pending_trades [{motivo}]")
     try:
         from darwin_engine.trade_tracker import resolve_pending_trades
@@ -88,11 +139,6 @@ def _trigger_darwin_resolve(motivo: str):
 
 
 def _trigger_darwin_evolution(motivo: str):
-    """
-    Ciclo evolutivo completo viernes post-market:
-      1. Executor arena
-      2. Predictor arena H1-H10
-    """
     print(f"🧬 Darwin evolution cycle [{motivo}]")
 
     try:
@@ -129,14 +175,25 @@ def _es_dia_habil(ahora: datetime) -> bool:
     return ahora.weekday() < 5
 
 
+def _en_horario_monitor(ahora: datetime) -> bool:
+    return MONITOR_HORA_INICIO <= ahora.hour <= MONITOR_HORA_FIN
+
+
 # ══════════════════════════════════════════════════════
 # LOOP PRINCIPAL
 # ══════════════════════════════════════════════════════
 
 def _loop():
-    print(f"🕐 Quant Scheduler iniciado | pipeline={HORA_PIPELINE:02d}:{MIN_PIPELINE:02d} Chile")
+    print(
+        f"🕐 Quant Scheduler iniciado\n"
+        f"   🟢 APERTURA: {HORA_APERTURA:02d}:{MIN_APERTURA:02d} Chile\n"
+        f"   🔴 CIERRE:   {HORA_CIERRE:02d}:{MIN_CIERRE:02d} Chile\n"
+        f"   📡 MONITOR:  {MONITOR_HORA_INICIO:02d}:00-{MONITOR_HORA_FIN:02d}:00 Chile (cada hora)"
+    )
 
-    pipeline_hoy:         str | None = None
+    apertura_hoy:         str | None = None
+    cierre_hoy:           str | None = None
+    monitor_ultima_hora:  int | None = None
     ultimo_log_h:         int | None = None
     darwin_resolve_hoy:   str | None = None
     darwin_evolution_hoy: str | None = None
@@ -145,18 +202,46 @@ def _loop():
         ahora     = datetime.now(CHILE_TZ)
         fecha_hoy = ahora.strftime("%Y-%m-%d")
 
-        # ── Pipeline: UNA vez al día a las 11:30 ──────
+        # ── 🟢 APERTURA: 11:30 — predice + abre + cierra ──
         if (
             _es_dia_habil(ahora)
-            and ahora.hour == HORA_PIPELINE
-            and ahora.minute >= MIN_PIPELINE
-            and ahora.minute < MIN_PIPELINE + 5   # ventana de 5 min
-            and pipeline_hoy != fecha_hoy
+            and ahora.hour  == HORA_APERTURA
+            and MIN_APERTURA <= ahora.minute < MIN_APERTURA + 5
+            and apertura_hoy != fecha_hoy
         ):
-            _trigger_pipeline(f"diario_{HORA_PIPELINE:02d}:{MIN_PIPELINE:02d}")
-            pipeline_hoy = fecha_hoy
+            _trigger_pipeline(
+                f"APERTURA_{HORA_APERTURA:02d}:{MIN_APERTURA:02d}",
+                close_only=False,
+            )
+            apertura_hoy = fecha_hoy
 
-        # ── Darwin: resolver trades (17:05 Chile) ─────
+        # ── 🔴 CIERRE: 15:30 — solo cierra posiciones ─────
+        # Solo si la apertura ya corrió hoy
+        if (
+            _es_dia_habil(ahora)
+            and ahora.hour  == HORA_CIERRE
+            and MIN_CIERRE <= ahora.minute < MIN_CIERRE + 5
+            and cierre_hoy  != fecha_hoy
+            and apertura_hoy == fecha_hoy
+        ):
+            _trigger_pipeline(
+                f"CIERRE_{HORA_CIERRE:02d}:{MIN_CIERRE:02d}",
+                close_only=True,
+            )
+            cierre_hoy = fecha_hoy
+
+        # ── 📡 MONITOR HORARIO: 12:00-15:00 Yahoo ─────────
+        if (
+            _es_dia_habil(ahora)
+            and _en_horario_monitor(ahora)
+            and ahora.minute < 5
+            and monitor_ultima_hora != ahora.hour
+            and apertura_hoy == fecha_hoy
+        ):
+            _trigger_monitor(f"{ahora.hour:02d}:00")
+            monitor_ultima_hora = ahora.hour
+
+        # ── 🧬 Darwin: resolver trades 17:05 ──────────────
         if (
             _es_dia_habil(ahora)
             and ahora.hour == 17
@@ -166,23 +251,24 @@ def _loop():
             _trigger_darwin_resolve("post_market_17:05")
             darwin_resolve_hoy = fecha_hoy
 
-        # ── Darwin: ciclo evolutivo (viernes 18:00) ───
+        # ── 🧬 Darwin: ciclo evolutivo viernes 18:00 ──────
         if (
             ahora.weekday() == 4
-            and ahora.hour == 18
+            and ahora.hour  == 18
             and ahora.minute < 10
             and darwin_evolution_hoy != fecha_hoy
         ):
             _trigger_darwin_evolution("viernes_18:00")
             darwin_evolution_hoy = fecha_hoy
 
-        # ── Alive log cada hora ───────────────────────
+        # ── 💓 Alive log cada hora ─────────────────────────
         if ahora.minute < 5 and ultimo_log_h != ahora.hour:
             dia = "hábil" if _es_dia_habil(ahora) else "fin de semana"
             print(
                 f"💓 Scheduler alive | "
                 f"{ahora.strftime('%Y-%m-%d %H:%M')} Chile | {dia} | "
-                f"pipeline_hoy={'✅' if pipeline_hoy == fecha_hoy else '⏳'}"
+                f"apertura={'✅' if apertura_hoy == fecha_hoy else '⏳'} | "
+                f"cierre={'✅' if cierre_hoy == fecha_hoy else '⏳'}"
             )
             ultimo_log_h = ahora.hour
 
@@ -200,4 +286,4 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
-    
+        
