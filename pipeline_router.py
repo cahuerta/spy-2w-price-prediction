@@ -1,10 +1,12 @@
 # =========================================================
-# pipeline_router.py — PIPELINE ROUTER v2.3
+# pipeline_router.py — PIPELINE ROUTER v2.4
 # =========================================================
 # v2.2: [F7] Intraday tracker como paso 10.5
 # v2.3: [F8] Intraday evaluator como paso 4.6
-#        Evalúa decisiones del tracker de ayer y ajusta
-#        umbrales automáticamente. No es crítico.
+# v2.4: [F9] gc.collect() entre pasos pesados
+#        Libera memoria entre model runner, evaluator y alpha engine
+#        para evitar crash "Ran out of memory (used over 512MB)"
+#        Cada paso corre uno a uno sin acumular en memoria.
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -12,6 +14,7 @@ from datetime import datetime, timezone
 import logging
 import traceback
 import os
+import gc
 import httpx
 import asyncio
 from pathlib import Path
@@ -74,6 +77,19 @@ def _evaluator_done_today(data_path: Path) -> bool:
     return by_folder or by_name
 
 
+def _alpha_done_today(data_path: Path) -> bool:
+    """[F9] Smart skip para alpha engine — evita doble ejecución en pipeline cierre."""
+    alpha_file = data_path / "alpha_last.json"
+    if not alpha_file.exists():
+        return False
+    try:
+        data = json.loads(alpha_file.read_text())
+        ts   = data.get("timestamp", "")
+        return str(ts)[:10] == _today_utc()
+    except Exception:
+        return False
+
+
 # =========================================================
 # BACKGROUND PIPELINE
 # =========================================================
@@ -104,6 +120,8 @@ async def _run_pipeline_logic(request: Request):
             tmp.replace(screener_file)
             logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
 
+        gc.collect()  # [F9] liberar después del screener
+
         # ── 2. DECIDER ────────────────────────────────────
         if _decider_done_today(DATA_PATH):
             tickers_data = json.loads((DATA_PATH / "tickers.json").read_text())
@@ -115,6 +133,8 @@ async def _run_pipeline_logic(request: Request):
             decider_out = run_decider()
             logger.info(f"✅ Decider OK | added={len(decider_out.get('added', []))} | total={decider_out.get('total')}")
 
+        gc.collect()  # [F9] liberar después del decider
+
         # ── 3. MODEL RUNNER ───────────────────────────────
         if _models_done_today(DATA_PATH):
             pred_count = sum(1 for _ in (DATA_PATH / "predictions").glob(f"**/{today}.json"))
@@ -125,6 +145,8 @@ async def _run_pipeline_logic(request: Request):
             await loop.run_in_executor(None, run_all_models)
             logger.info("✅ Model runner OK")
 
+        gc.collect()  # [F9] CRÍTICO — liberar los 87 modelos antes del evaluator
+
         # ── 4. EVALUATOR ──────────────────────────────────
         if _evaluator_done_today(DATA_PATH):
             logger.info("⚡ [4/10] Evaluator SKIP — evaluaciones de hoy existen")
@@ -132,6 +154,8 @@ async def _run_pipeline_logic(request: Request):
             logger.info("📊 [4/10] Evaluator...")
             evaluate_all()
             logger.info("✅ Evaluator OK")
+
+        gc.collect()  # [F9] CRÍTICO — liberar evaluaciones antes del alpha engine
 
         # ── 4.5 REGIME LEARNER ────────────────────────────
         logger.info("🧠 [4.5/10] Regime learner...")
@@ -142,10 +166,9 @@ async def _run_pipeline_logic(request: Request):
         except Exception as e:
             logger.warning(f"⚠️ Learner falló (no crítico): {e}")
 
+        gc.collect()  # [F9] liberar learner
+
         # ── 4.6 INTRADAY EVALUATOR ────────────────────────
-        # [F8] Evalúa decisiones del tracker de ayer.
-        # Ajusta min_score automáticamente en intraday_learning.json.
-        # No es crítico — si falla el pipeline continúa.
         logger.info("📊 [4.6/10] Intraday evaluator...")
         try:
             from intraday_evaluator import run_intraday_evaluator
@@ -163,15 +186,21 @@ async def _run_pipeline_logic(request: Request):
         except Exception as e:
             logger.warning(f"⚠️ Intraday evaluator falló (no crítico): {e}")
 
+        gc.collect()  # [F9] liberar intraday evaluator
+
         # ── 5. MARKET QUANT ───────────────────────────────
         logger.info("📉 [5/10] Market quantitative...")
         quant_ctx = run_market_state()
         logger.info(f"✅ Market quant OK | regime={quant_ctx.regime}")
 
+        gc.collect()  # [F9] liberar market quant
+
         # ── 6. MARKET QUALITATIVE ─────────────────────────
         logger.info("🧠 [6/10] Market qualitative...")
         qual_ctx = evaluate_qualitative_market()
         logger.info(f"✅ Market qual OK | impact={qual_ctx.impact_score:.3f}")
+
+        gc.collect()  # [F9] liberar market qual
 
         # ── 7. MARKET ORCHESTRATOR ────────────────────────
         logger.info("🧭 [7/10] Market orchestration...")
@@ -179,18 +208,31 @@ async def _run_pipeline_logic(request: Request):
         market_ctx  = market_orch.evaluate(quant_ctx.to_dict(), qual_ctx.to_dict())
         logger.info(f"🎯 MARKET MODE = {market_ctx.market_mode.upper()} (conf {market_ctx.confidence:.2f})")
 
+        # Liberar objetos intermedios ya no necesarios
+        del quant_ctx, qual_ctx, market_orch
+        gc.collect()  # [F9] CRÍTICO — liberar antes del alpha engine
+
         # ── 8. ALPHA ENGINE ───────────────────────────────
-        logger.info("🧠 [8/10] Alpha engine...")
-        tickers_file = DATA_PATH / "tickers.json"
-        tickers      = json.loads(tickers_file.read_text())
-        alpha_out    = compute_and_persist_alpha(tickers)
-        logger.info(f"✅ Alpha OK | valid={alpha_out.get('valid_alphas')} universe={alpha_out.get('universe_size')}")
+        # [F9] Smart skip: si ya corrió hoy (pipeline apertura) reutilizar resultado
+        if _alpha_done_today(DATA_PATH):
+            logger.info("⚡ [8/10] Alpha SKIP — ya corrió hoy")
+            alpha_out = json.loads((DATA_PATH / "alpha_last.json").read_text())
+        else:
+            logger.info("🧠 [8/10] Alpha engine...")
+            tickers_file = DATA_PATH / "tickers.json"
+            tickers      = json.loads(tickers_file.read_text())
+            alpha_out    = compute_and_persist_alpha(tickers)
+            logger.info(f"✅ Alpha OK | valid={alpha_out.get('valid_alphas')} universe={alpha_out.get('universe_size')}")
+
+        gc.collect()  # [F9] CRÍTICO — liberar alpha antes del trading
 
         # ── 9. TRADING ORCHESTRATOR ───────────────────────
         logger.info("🤖 [9/10] Trading orchestrator...")
         trading_orch = TradingOrchestrator()
         trade_out    = await trading_orch.run(market_ctx=market_ctx.to_dict())
         logger.info(f"✅ Trading OK | mode={trade_out.get('mode')} decisions={len(trade_out.get('decisions', []))}")
+
+        gc.collect()  # [F9] liberar trading orchestrator
 
         # ── 10. COMMIT ────────────────────────────────────
         logger.info("💾 [10/10] Committing pipeline results...")
@@ -221,9 +263,9 @@ async def _run_pipeline_logic(request: Request):
 
         logger.info("✅ Pipeline committed")
 
+        gc.collect()  # [F9] liberar después del commit
+
         # ── 10.5 INTRADAY TRACKER ─────────────────────────
-        # [F7] Corre DESPUÉS del commit — predicciones ya en disco.
-        # No es crítico: si falla el pipeline ya terminó correctamente.
         logger.info("📡 [10.5/10] Intraday tracker...")
         try:
             from intraday_tracker import run_intraday_tracker
@@ -245,6 +287,7 @@ async def _run_pipeline_logic(request: Request):
         traceback.print_exc()
 
     finally:
+        gc.collect()  # [F9] limpieza final siempre
         end_ts = datetime.utcnow().isoformat()
         logger.info("=" * 60)
         logger.info(f"🏁 PIPELINE END | {end_ts}")
