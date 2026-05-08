@@ -22,7 +22,7 @@ from datetime import date
 # =========================================================
 LOOKBACK_DAYS     = int(os.getenv("SCREENER_LOOKBACK", "90"))
 MIN_REQUIRED_DAYS = 15
-MAX_CONCURRENT    = 8
+MAX_CONCURRENT    = 2
 MAX_UNIVERSE      = 300
 
 BASE_DIR         = Path(__file__).resolve().parent
