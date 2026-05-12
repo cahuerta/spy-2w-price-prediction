@@ -454,7 +454,56 @@ def root():
         "service": "spy-2w-price-prediction",
         "env":     "production"
     }
+@app.post("/internal/debug/fix-entry-dates")
+async def fix_entry_dates(request: Request):
+    """
+    Agrega entry_date estimada a posiciones que no la tienen.
+    Llamar una sola vez para corregir posiciones históricas.
+    """
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403)
 
+    try:
+        from positions_meta import get_all, set_entry_date
+        from portfolio_store import load_positions
+
+        meta     = get_all()
+        fixed    = []
+        skipped  = []
+
+        # Fechas estimadas por ticker según logs históricos
+        ESTIMATED_DATES = {
+            "GLW":  "2026-04-21",
+            "JNJ":  "2026-04-21",
+            "VZ":   "2026-04-21",
+            "WMT":  "2026-04-21",
+            "GILD": "2026-04-21",
+            "PG":   "2026-04-21",
+            "KO":   "2026-04-21",
+            "AMAT": "2026-04-22",
+            "CEG":  "2026-04-27",
+            "FDX":  "2026-04-27",
+            "CAT":  "2026-05-05",
+            "DOW":  "2026-05-05",
+            "MPC":  "2026-05-05",
+        }
+
+        for ticker, data in meta.items():
+            if not data.get("entry_date"):
+                date = ESTIMATED_DATES.get(ticker.upper(), "2026-04-21")
+                set_entry_date(ticker, date)
+                fixed.append(f"{ticker} → {date}")
+            else:
+                skipped.append(ticker)
+
+        return {
+            "status":  "ok",
+            "fixed":   fixed,
+            "skipped": skipped,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 # =========================================================
 # SHUTDOWN
 # =========================================================
