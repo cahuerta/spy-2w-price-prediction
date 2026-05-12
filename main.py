@@ -1,5 +1,5 @@
 # =========================================================
-# main.py — TRADING SUITE ENTERPRISE v2.9.1 PRODUCCIÓN
+# main.py — TRADING SUITE ENTERPRISE v2.9.2 PRODUCCIÓN
 # =========================================================
 # ✔ Runtime de trading (NO batch)
 # ✔ NO decide mercado
@@ -10,12 +10,18 @@
 # ✔ Ejecuta SOLO TradingOrchestrator
 # ✔ 🔥 MERGE DE TICKERS EN STARTUP (NUNCA BORRA)
 # ✔ 🕐 SCHEDULER INTERNO (reemplaza cron externo)
+#
+# v2.9.2:
+#   [M1] /internal/trading/monitor-close — cierre defensivo horario
+#   [M2] /internal/darwin/run            — ciclo evolutivo manual
+#   [M3] /internal/darwin/status         — estado del Darwin Engine
 # =========================================================
 
 import os
 import json
 import logging
 import signal
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -128,15 +134,15 @@ def load_market_context() -> MarketOrchestrationContext:
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite v2.9.1 START")
+    logger.info("🚀 Trading Suite v2.9.2 START")
     merge_tickers_on_startup()
     start_scheduler()
     yield
-    logger.info("🛑 Trading Suite v2.9.1 STOP")
+    logger.info("🛑 Trading Suite v2.9.2 STOP")
 
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.9.1",
+    version="2.9.2",
     lifespan=lifespan,
 )
 
@@ -200,6 +206,191 @@ async def trading_run(request: Request):
         "market_mode": market_ctx.market_mode,
         "result":      result,
         "timestamp":   datetime.utcnow().isoformat(),
+    }
+
+# =========================================================
+# [M1] MONITOR CLOSE — cierre defensivo horario
+# =========================================================
+@app.post("/internal/trading/monitor-close")
+async def monitor_close(payload: Dict[str, Any], request: Request):
+    """
+    Cierra posiciones divergentes detectadas por el intraday tracker.
+    Llamado automáticamente por el scheduler cada hora 12:00-15:00 Chile.
+    También puede llamarse manualmente.
+
+    Body: {"tickers": ["GLW", "VZ"], "reason": "intraday_diverging"}
+    """
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    tickers = payload.get("tickers", [])
+    reason  = payload.get("reason", "monitor_close")
+
+    if not tickers:
+        return {"status": "ok", "closed": [], "message": "sin tickers"}
+
+    logger.info(f"🔴 Monitor close | {tickers} | {reason}")
+
+    orchestrator = TradingOrchestrator()
+    closed       = []
+    errors       = []
+
+    for ticker in tickers:
+        try:
+            result = await asyncio.wait_for(
+                orchestrator.broker.execute_decision({
+                    "action": "CLOSE",
+                    "ticker": ticker,
+                    "reason": reason,
+                }),
+                timeout=30,
+            )
+            closed.append(ticker)
+            logger.info(f"⚰️ Monitor closed {ticker}")
+
+            try:
+                from positions_meta import remove_entry
+                remove_entry(ticker)
+            except Exception:
+                pass
+
+            try:
+                from darwin_engine.trade_tracker import register_close
+                register_close(
+                    ticker      = ticker,
+                    exit_price  = 0.0,
+                    reason      = reason,
+                    alpha_score = 0.0,
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            errors.append({"ticker": ticker, "error": str(e)})
+            logger.error(f"❌ Monitor close {ticker}: {e}")
+
+    return {
+        "status":    "ok",
+        "closed":    closed,
+        "errors":    errors,
+        "requested": tickers,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+# =========================================================
+# [M2] DARWIN RUN — ciclo evolutivo manual
+# =========================================================
+@app.post("/internal/darwin/run")
+async def darwin_run(request: Request):
+    """
+    Ejecuta el ciclo evolutivo del Darwin Engine manualmente.
+    Body: {"dry_run": true}  → solo evalúa, no promueve
+    Body: {"dry_run": false} → ejecuta real (default)
+    """
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    try:
+        body    = await request.json()
+        dry_run = body.get("dry_run", False)
+    except Exception:
+        dry_run = False
+
+    results = {}
+
+    # Resolver trades pendientes
+    try:
+        from darwin_engine.trade_tracker import resolve_pending_trades
+        resolved = resolve_pending_trades()
+        results["trades_resolved"] = len(resolved)
+        logger.info(f"🧬 Darwin resolve: {len(resolved)} trades resueltos")
+    except Exception as e:
+        results["trades_resolved_error"] = str(e)
+
+    # Executor genome arena
+    try:
+        from darwin_engine.arena import run_evolution_cycle
+        executor_result = run_evolution_cycle(dry_run=dry_run)
+        results["executor"] = {
+            "champion":       executor_result.get("champion_after"),
+            "was_promoted":   executor_result.get("was_promoted"),
+            "new_generation": executor_result.get("new_generation", []),
+        }
+    except Exception as e:
+        results["executor_error"] = str(e)
+
+    # Predictor arena H1-H10
+    try:
+        from darwin_engine.predictor_arena import run_predictor_evolution
+        predictor_result = run_predictor_evolution(dry_run=dry_run)
+        results["predictors"] = {
+            "h_evaluated": predictor_result.get("h_evaluated"),
+            "promotions":  predictor_result.get("promotions"),
+            "ranking":     predictor_result.get("ranking", []),
+        }
+    except Exception as e:
+        results["predictors_error"] = str(e)
+
+    return {
+        "status":    "ok",
+        "dry_run":   dry_run,
+        "timestamp": datetime.utcnow().isoformat(),
+        "results":   results,
+    }
+
+# =========================================================
+# [M3] DARWIN STATUS — estado del Darwin Engine
+# =========================================================
+@app.get("/internal/darwin/status")
+async def darwin_status(request: Request):
+    """
+    Muestra el estado actual del Darwin Engine:
+    - Campeón activo (executor + predictores H1-H10)
+    - Trades acumulados / resueltos / PnL
+    - Hit rates por H
+    """
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
+
+    status = {}
+
+    try:
+        from darwin_engine.trade_tracker import get_tracker_summary
+        status["tracker"] = get_tracker_summary()
+    except Exception as e:
+        status["tracker_error"] = str(e)
+
+    try:
+        from darwin_engine.predictor_genome import PredictorGenome
+        predictors = {}
+        for h in range(1, 11):
+            genome = PredictorGenome.load_champion(h)
+            predictors[f"H{h}"] = {
+                "genome_id":  genome.genome_id,
+                "generation": genome.generation,
+                "hit_rate":   genome.hit_rate,
+                "n_evals":    genome.data.get("n_evaluations", 0),
+            }
+        status["predictors"] = predictors
+    except Exception as e:
+        status["predictors_error"] = str(e)
+
+    try:
+        from darwin_engine.arena import get_champion
+        champion = get_champion()
+        if champion:
+            status["executor"] = {
+                "genome_id":  champion.genome_id,
+                "generation": champion.generation,
+                "fitness":    champion.fitness,
+            }
+    except Exception as e:
+        status["executor_error"] = str(e)
+
+    return {
+        "status":    "ok",
+        "timestamp": datetime.utcnow().isoformat(),
+        "darwin":    status,
     }
 
 # =========================================================
@@ -283,5 +474,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         log_level="error",
-    )
+                )
     
