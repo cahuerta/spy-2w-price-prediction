@@ -20,10 +20,10 @@ from datetime import date
 # =========================================================
 # CONFIG
 # =========================================================
-LOOKBACK_DAYS     = int(os.getenv("SCREENER_LOOKBACK", "90"))
+LOOKBACK_DAYS     = int(os.getenv("SCREENER_LOOKBACK", "60"))
 MIN_REQUIRED_DAYS = 15
 MAX_CONCURRENT    = 2
-MAX_UNIVERSE      = 300
+MAX_UNIVERSE      = 100
 
 BASE_DIR         = Path(__file__).resolve().parent
 LOCAL_SP500_FILE = BASE_DIR / "sp500.json"
