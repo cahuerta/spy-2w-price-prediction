@@ -1,14 +1,11 @@
 # =========================================================
-# intraday_tracker.py — INTRADAY TRACKER v2.2
+# intraday_tracker.py — INTRADAY TRACKER v2.3
 # =========================================================
-# v2.2:
-#   Reemplaza Alpaca intraday (requería suscripción SIP)
-#   con Yahoo Finance (gratis, 15 min delay).
-#   Compatible con suscripción Alpaca básica.
-#
-# v2.1:
-#   Usa upper_band/lower_band del MasterOrchestrator v7.6
-#   para clasificar posiciones con precisión real.
+# v2.3:
+#   Cierre por divergencia más robusto:
+#   Requiere 2 desviaciones estándar bajo lower_band
+#   para clasificar como "diverging" real.
+#   Evita cierres prematuros por ruido intraday.
 # =========================================================
 
 import os
@@ -35,11 +32,13 @@ ALPHA_FILE    = DATA_PATH / "alpha_last.json"
 
 MIN_ALPHA_COMPRA = float(os.getenv("INTRADAY_MIN_ALPHA", "0.65"))
 
-# Fallback si no hay bandas del orchestrator
 ENTRY_THRESHOLD     = float(os.getenv("INTRADAY_ENTRY_THRESHOLD", "1.005"))
 AHEAD_THRESHOLD     = float(os.getenv("INTRADAY_AHEAD",     "1.015"))
 LAGGING_THRESHOLD   = float(os.getenv("INTRADAY_LAGGING",   "0.985"))
 DIVERGING_THRESHOLD = float(os.getenv("INTRADAY_DIVERGING", "0.970"))
+
+# Multiplicador de desviación para cierre real
+DIVERGING_STD_MULT = float(os.getenv("INTRADAY_DIVERGING_STD_MULT", "2.0"))
 
 
 # =========================================================
@@ -68,36 +67,22 @@ def _save_json(path: Path, data: Any) -> None:
 # =========================================================
 
 def _get_intraday_bars(ticker: str, lookback_minutes: int = 90) -> Optional[List[float]]:
-    """
-    Obtiene precios recientes usando Yahoo Finance.
-    15 min de delay — suficiente para monitoreo de posiciones.
-    Reemplaza la versión que usaba Alpaca intraday (requería SIP).
-    """
     try:
         interval = "5m" if lookback_minutes <= 60 else "15m"
         tk   = yf.Ticker(ticker)
         hist = tk.history(period="1d", interval=interval)
-
         if hist is None or hist.empty:
             return None
-
         closes = hist["Close"].dropna().tolist()
         return closes if len(closes) >= 2 else None
-
     except Exception as e:
         logger.warning(f"⚠️ intraday bars Yahoo {ticker}: {e}")
         return None
 
 
 def _get_current_price(ticker: str) -> Optional[float]:
-    """
-    Precio actual via Yahoo Finance (15 min delay).
-    Primero intenta fast_info (más rápido), fallback a history.
-    """
     try:
         tk = yf.Ticker(ticker)
-
-        # Método 1: fast_info — más rápido
         try:
             fi = tk.fast_info
             price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
@@ -105,16 +90,12 @@ def _get_current_price(ticker: str) -> Optional[float]:
                 return float(price)
         except Exception:
             pass
-
-        # Método 2: history reciente — fallback
         hist = tk.history(period="1d", interval="5m")
         if hist is not None and not hist.empty:
             closes = hist["Close"].dropna()
             if len(closes) > 0:
                 return float(closes.iloc[-1])
-
         return None
-
     except Exception as e:
         logger.warning(f"⚠️ current price Yahoo {ticker}: {e}")
         return None
@@ -123,8 +104,8 @@ def _get_current_price(ticker: str) -> Optional[float]:
 def _momentum_score(closes: List[float]) -> float:
     if not closes or len(closes) < 3:
         return 0.0
-    last   = closes[-1]
-    prev   = float(np.mean(closes[-4:-1]))
+    last = closes[-1]
+    prev = float(np.mean(closes[-4:-1]))
     if prev <= 0:
         return 0.0
     change = (last - prev) / prev
@@ -179,7 +160,6 @@ def _get_compra_candidates() -> List[str]:
     alpha_data = _load_json(ALPHA_FILE)
     results    = alpha_data.get("results", {})
     candidates = []
-
     for ticker, data in results.items():
         if not isinstance(data, dict):
             continue
@@ -196,7 +176,6 @@ def _get_compra_candidates() -> List[str]:
         rec  = pred.get("prediction", {}).get("recommendation", "")
         if rec == "COMPRA":
             candidates.append(ticker.upper())
-
     return candidates
 
 
@@ -254,8 +233,8 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
     upper_band_dia1 = _get_band_for_day(curve, 1, "upper_band") if curve else None
 
     if lower_band_dia1 and upper_band_dia1:
-        band_width  = upper_band_dia1 - lower_band_dia1
-        precio_norm = (precio_actual - lower_band_dia1) / band_width if band_width > 0 else 0.5
+        band_width   = upper_band_dia1 - lower_band_dia1
+        precio_norm  = (precio_actual - lower_band_dia1) / band_width if band_width > 0 else 0.5
         precio_score = float(np.clip(1.0 - precio_norm, 0.0, 1.0))
         precio_ok    = precio_actual <= upper_band_dia1
         usar_bandas  = True
@@ -333,14 +312,22 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         usar_bandas = True
         std_band    = (upper - lower) / 3.0
 
+        # =====================================================
+        # v2.3 — Cierre robusto: requiere 2σ bajo lower_band
+        # Antes cerraba al primer toque del lower_band
+        # Ahora requiere caída significativa fuera del cono
+        # =====================================================
+        diverging_threshold = lower - (DIVERGING_STD_MULT * std_band)
+
         if precio_actual > upper:
             curve_status = "ahead"
         elif precio_actual >= lower:
             curve_status = "on_track"
-        elif precio_actual >= lower - std_band:
-            curve_status = "lagging"
+        elif precio_actual >= diverging_threshold:
+            curve_status = "lagging"       # entre lower y -2σ → esperar
         else:
-            curve_status = "diverging"
+            curve_status = "diverging"     # bajo -2σ → cierre real
+
     else:
         usar_bandas = False
         if tracking_ratio >= AHEAD_THRESHOLD:
@@ -388,8 +375,9 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
     }
 
     if usar_bandas:
-        result["upper_band_hoy"] = round(upper, 4)
-        result["lower_band_hoy"] = round(lower, 4)
+        result["upper_band_hoy"]        = round(upper, 4)
+        result["lower_band_hoy"]        = round(lower, 4)
+        result["diverging_threshold"]   = round(diverging_threshold, 4)
 
     if curve and curve.get("analysis"):
         best_exit = curve["analysis"].get("best_exit_day")
@@ -411,7 +399,6 @@ def run_intraday_tracker() -> Dict:
 
     logger.info(f"📡 Intraday tracker v2.2 (Yahoo) | {fecha_str} {hora_str} UTC")
 
-    # ── 1. CANDIDATOS COMPRA ─────────────────────────────────
     candidatos = _get_compra_candidates()
     senales    = []
     entrar_now = []
@@ -433,7 +420,6 @@ def run_intraday_tracker() -> Dict:
     else:
         logger.info("ℹ️  Sin candidatos COMPRA")
 
-    # ── 2. POSICIONES ABIERTAS ───────────────────────────────
     posiciones_abiertas = _get_open_positions_with_date()
     monitor_posiciones  = []
 
@@ -451,7 +437,6 @@ def run_intraday_tracker() -> Dict:
     else:
         logger.info("ℹ️  Sin posiciones abiertas")
 
-    # ── 3. GUARDAR SNAPSHOT ──────────────────────────────────
     snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
     snapshot      = _load_json(snapshot_path)
 
@@ -486,10 +471,8 @@ def get_entry_signals_today() -> Dict[str, Dict]:
     fecha_str     = datetime.now(timezone.utc).date().isoformat()
     snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
     snapshot      = _load_json(snapshot_path)
-
     if not snapshot:
         return {}
-
     best_by_ticker: Dict[str, Dict] = {}
     for hora, data in snapshot.items():
         for senal in data.get("senales", []):
@@ -499,28 +482,19 @@ def get_entry_signals_today() -> Dict[str, Dict]:
             score = senal.get("entry_score", 0)
             if ticker not in best_by_ticker or score > best_by_ticker[ticker]["entry_score"]:
                 best_by_ticker[ticker] = {**senal, "mejor_hora": hora}
-
     return best_by_ticker
 
 
 def get_position_status_today() -> Dict[str, Dict]:
-    """
-    Último status de cada posición abierta monitoreada hoy.
-    Llamable desde dashboard para mostrar estado vs curva.
-    """
     fecha_str     = datetime.now(timezone.utc).date().isoformat()
     snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
     snapshot      = _load_json(snapshot_path)
-
     if not snapshot:
         return {}
-
     latest: Dict[str, Dict] = {}
     for hora in sorted(snapshot.keys()):
         for pos in snapshot[hora].get("monitor_posiciones", []):
             ticker = pos.get("ticker")
             if ticker:
                 latest[ticker] = {**pos, "ultima_hora": hora}
-
     return latest
-    
