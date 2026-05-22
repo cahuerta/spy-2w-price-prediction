@@ -45,7 +45,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.2 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.3 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
 
     async def _get_real_capital(self) -> float:
         try:
@@ -90,14 +90,6 @@ class TradingOrchestrator:
             return {}
 
     def _get_broker_positions_tickers(self) -> set:
-        """
-        ── FIX v4.2 ──
-        Lee posiciones DIRECTAMENTE desde Alpaca (fuente de verdad).
-        Evita el bug donde portfolio_tickers quedaba vacío porque
-        positions.json en disco estaba desactualizado, causando que
-        el orchestrator reabriera tickers ya existentes en Alpaca
-        → loop buy/sell del mismo ticker en cada ciclo.
-        """
         try:
             broker_data = self.broker.get_positions()
             if not broker_data:
@@ -240,7 +232,7 @@ class TradingOrchestrator:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
-    # RUN PRINCIPAL v4.2
+    # RUN PRINCIPAL v4.3
     # =========================================================
     async def run(
         self,
@@ -250,7 +242,7 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.2 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.3 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
@@ -277,10 +269,6 @@ class TradingOrchestrator:
 
         positions = self._enrich_positions_with_price(positions)
 
-        # ── FIX v4.2: portfolio_tickers desde Alpaca directo ──────
-        # ANTES: leía solo desde disco → podía estar desactualizado
-        #        → orchestrator reabría tickers ya en Alpaca
-        # AHORA: lee desde Alpaca (fuente de verdad) + disco (union)
         broker_real_tickers = self._get_broker_positions_tickers()
         broker_positions    = load_positions()
         disk_tickers        = {p["ticker"].upper() for p in broker_positions}
@@ -292,7 +280,6 @@ class TradingOrchestrator:
             f"disco={len(disk_tickers)} union={len(real_positions)} | "
             f"Mode: {market_ctx.get('market_mode', 'neutral')}"
         )
-        # ─────────────────────────────────────────────────────────
 
         mode = market_ctx.get("market_mode", "neutral")
 
@@ -356,7 +343,8 @@ class TradingOrchestrator:
 
             for order in closes[:self.daily_limit]:
                 try:
-                    await asyncio.wait_for(
+                    # v4.3 FIX: capturar result para obtener filled_avg_price
+                    result = await asyncio.wait_for(
                         self.broker.execute_decision(order), timeout=30
                     )
                     close_successes.append(order["ticker"])
@@ -368,14 +356,31 @@ class TradingOrchestrator:
                             alpha_at_close = alpha_map.get(
                                 order["ticker"], {}
                             ).get("alpha_score", 0.0)
-                            exit_price = next(
-                                (
-                                    float(p.get("price_now") or p.get("entry_price") or 0)
-                                    for p in positions
-                                    if str(p.get("ticker", "")).upper() == order["ticker"]
-                                ),
-                                0.0,
-                            )
+
+                            # v4.3 FIX: capturar precio real de ejecución
+                            exit_price = 0.0
+                            if result and hasattr(result, "filled_avg_price") and result.filled_avg_price:
+                                exit_price = float(result.filled_avg_price)
+                            elif result and isinstance(result, dict):
+                                exit_price = float(
+                                    result.get("filled_avg_price")
+                                    or result.get("fill_price")
+                                    or result.get("price")
+                                    or 0
+                                )
+
+                            # Fallback: precio en memoria pre-cierre
+                            if exit_price <= 0:
+                                exit_price = next(
+                                    (
+                                        float(p.get("price_now") or p.get("entry_price") or 0)
+                                        for p in positions
+                                        if str(p.get("ticker", "")).upper() == order["ticker"]
+                                    ),
+                                    0.0,
+                                )
+
+                            logger.info(f"📝 Darwin close {order['ticker']} @ ${exit_price:.2f}")
                             register_close(
                                 ticker      = order["ticker"],
                                 exit_price  = exit_price,
@@ -400,8 +405,6 @@ class TradingOrchestrator:
         # =========================================================
         self.governor = await self._refresh_governor()
 
-        # ── FIX v4.2: actualizar portfolio post-cierres ──────────
-        # Tickers recién cerrados NO deben ser reabiertos este ciclo
         broker_real_post  = self._get_broker_positions_tickers()
         portfolio_tickers = broker_real_post | (disk_tickers - set(close_successes))
         logger.info(
@@ -409,7 +412,6 @@ class TradingOrchestrator:
             f"broker={len(broker_real_post)} | "
             f"efectivos={sorted(portfolio_tickers)}"
         )
-        # ─────────────────────────────────────────────────────────
 
         for decision in pm_decisions:
             if decision.get("action") in ["OPEN", "ROTATE"]:
@@ -427,7 +429,8 @@ class TradingOrchestrator:
                     "reason":     f"ALPHA_INJECT_{score:.3f}",
                     "alpha":      score,
                 })
-                        # ── FILTRO INTRADAY ──────────────────────────────────────
+
+        # ── FILTRO INTRADAY ──────────────────────────────────────
         if intraday_signals:
             filtered_opens = []
             for o in opens:
@@ -673,4 +676,3 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
-                
