@@ -1,25 +1,8 @@
 # =========================================================
-# intraday_evaluator.py — INTRADAY EVALUATOR v1.0
+# intraday_evaluator.py — INTRADAY EVALUATOR v1.1
 # =========================================================
-# Corre una vez al día dentro del pipeline (paso 4.6).
-# Lee snapshots del día anterior y evalúa si las decisiones
-# del tracker fueron correctas.
-#
-# Aprende dos cosas:
-#
-# 1. ENTRY TIMING — ¿fue buena hora para entrar?
-#    Compara precio al momento de "entrar_ahora: true/false"
-#    vs precio de cierre del día.
-#    → Si dijo esperar y el precio bajó → acertó
-#    → Si dijo entrar y el precio subió → acertó
-#
-# 2. POSITION TRACKING — ¿fue correcto el curve_status?
-#    Compara curve_status asignado vs movimiento real posterior.
-#    → Si dijo "ahead" y el precio siguió subiendo → acertó
-#    → Si dijo "diverging" y siguió bajando → acertó
-#
-# Guarda aprendizaje en /data/intraday_learning.json
-# El tracker lee ese archivo para ajustar sus umbrales.
+# v1.1: Conecta evaluaciones de entry timing con Darwin
+#       predictor genomes — actualiza hit rates de shadows
 # =========================================================
 
 import os
@@ -47,7 +30,6 @@ LEARNING_FILE  = DATA_PATH / "intraday_learning.json"
 ALPACA_KEY     = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET  = os.getenv("ALPACA_SECRET_KEY")
 
-# Mínimo de evaluaciones antes de ajustar umbrales
 MIN_SAMPLES_ADJUST = int(os.getenv("INTRADAY_MIN_SAMPLES", "10"))
 
 _alpaca_client: Optional[StockHistoricalDataClient] = None
@@ -86,7 +68,6 @@ def _save_json(path: Path, data: Any) -> None:
 # =========================================================
 
 def _get_closing_price(ticker: str, fecha: date) -> Optional[float]:
-    """Precio de cierre de un día específico."""
     try:
         client  = _get_alpaca_client()
         request = StockBarsRequest(
@@ -108,10 +89,6 @@ def _get_closing_price(ticker: str, fecha: date) -> Optional[float]:
 
 
 def _get_price_at_hour(ticker: str, fecha: date, hora_str: str) -> Optional[float]:
-    """
-    Precio aproximado en una hora específica del día.
-    hora_str formato: "HH:MM" UTC
-    """
     try:
         client = _get_alpaca_client()
         hora   = int(hora_str.split(":")[0])
@@ -147,16 +124,6 @@ def _evaluate_entry_decisions(
     snapshot: Dict,
     fecha: date,
 ) -> List[Dict]:
-    """
-    Para cada señal del día, evalúa si la decisión fue correcta.
-
-    Lógica:
-    - Para cada hora con señal, obtener precio en ese momento
-    - Comparar vs precio de cierre del día
-    - "entrar_ahora: true" → correcto si precio subió hacia cierre
-    - "entrar_ahora: false" → correcto si precio bajó hacia cierre
-      (es decir, era mejor esperar)
-    """
     evaluaciones = []
     precio_cierre_cache: Dict[str, float] = {}
 
@@ -173,7 +140,6 @@ def _evaluate_entry_decisions(
             if not ticker or not precio_señal:
                 continue
 
-            # Precio de cierre (cacheado por ticker)
             if ticker not in precio_cierre_cache:
                 cierre = _get_closing_price(ticker, fecha)
                 if cierre:
@@ -181,16 +147,12 @@ def _evaluate_entry_decisions(
                 else:
                     continue
 
-            precio_cierre = precio_cierre_cache[ticker]
+            precio_cierre   = precio_cierre_cache[ticker]
             ret_desde_señal = (precio_cierre / precio_señal - 1) * 100
 
-            # ¿Fue correcta la decisión?
             if entrar_ahora:
-                # Dijo entrar → correcto si precio subió
                 fue_correcto = ret_desde_señal > 0
             else:
-                # Dijo esperar → correcto si precio bajó
-                # (hubiera sido mejor esperar)
                 fue_correcto = ret_desde_señal < 0
 
             evaluaciones.append({
@@ -217,15 +179,6 @@ def _evaluate_position_decisions(
     snapshot: Dict,
     fecha: date,
 ) -> List[Dict]:
-    """
-    Para cada posición monitoreada, evalúa si el curve_status
-    fue correcto comparando con el movimiento posterior.
-
-    ahead     → correcto si siguió subiendo al cierre
-    on_track  → correcto si no divergió significativamente
-    lagging   → correcto si siguió bajando o no recuperó
-    diverging → correcto si siguió bajando
-    """
     evaluaciones = []
     precio_cierre_cache: Dict[str, float] = {}
 
@@ -252,7 +205,6 @@ def _evaluate_position_decisions(
             precio_cierre   = precio_cierre_cache[ticker]
             ret_desde_señal = (precio_cierre / precio_pos - 1) * 100
 
-            # ¿El status fue correcto?
             if curve_status == "ahead":
                 fue_correcto = ret_desde_señal > 0
             elif curve_status == "on_track":
@@ -288,45 +240,6 @@ def _update_learning(
     entry_evals: List[Dict],
     position_evals: List[Dict],
 ) -> Dict:
-    """
-    Lee el archivo de aprendizaje actual y lo actualiza
-    con las nuevas evaluaciones.
-
-    Estructura de aprendizaje:
-    {
-      "entry_timing": {
-        "total": 150,
-        "correct": 89,
-        "hit_rate": 0.593,
-        "by_score_bucket": {
-          "0.5-0.6": {"total": 30, "correct": 14},
-          "0.6-0.7": {"total": 60, "correct": 38},
-          "0.7-0.8": {"total": 40, "correct": 28},
-          "0.8-1.0": {"total": 20, "correct": 17},
-        },
-        "by_hour": {
-          "11": {"total": 20, "correct": 12},
-          ...
-        },
-        "adjusted_thresholds": {
-          "min_score":        0.55,   # ajustado desde evaluaciones
-          "min_score_updated": "2026-04-18",
-        }
-      },
-      "position_tracking": {
-        "total": 80,
-        "correct": 61,
-        "hit_rate": 0.763,
-        "by_status": {
-          "ahead":     {"total": 15, "correct": 11},
-          "on_track":  {"total": 40, "correct": 32},
-          "lagging":   {"total": 18, "correct": 13},
-          "diverging": {"total": 7,  "correct": 5},
-        }
-      },
-      "last_updated": "2026-04-18"
-    }
-    """
     learning = _load_json(LEARNING_FILE)
     if not learning:
         learning = {
@@ -356,13 +269,11 @@ def _update_learning(
             "last_updated": None,
         }
 
-    # ── Actualizar entry timing ───────────────────────────
     et = learning["entry_timing"]
     for ev in entry_evals:
         et["total"]   += 1
         et["correct"] += 1 if ev["fue_correcto"] else 0
 
-        # Por bucket de score
         score = ev["entry_score"]
         if score < 0.6:
             bucket = "0.5-0.6"
@@ -375,7 +286,6 @@ def _update_learning(
         et["by_score_bucket"][bucket]["total"]   += 1
         et["by_score_bucket"][bucket]["correct"] += 1 if ev["fue_correcto"] else 0
 
-        # Por hora
         hora = ev["hora"].split(":")[0]
         if hora not in et["by_hour"]:
             et["by_hour"][hora] = {"total": 0, "correct": 0}
@@ -385,12 +295,9 @@ def _update_learning(
     if et["total"] > 0:
         et["hit_rate"] = round(et["correct"] / et["total"], 4)
 
-    # ── Ajuste automático de min_score ───────────────────
-    # Si tenemos suficientes muestras, encontrar el bucket
-    # con mejor hit_rate y ajustar el umbral
     if et["total"] >= MIN_SAMPLES_ADJUST:
-        best_bucket     = None
-        best_hit_rate   = 0.0
+        best_bucket   = None
+        best_hit_rate = 0.0
         for bucket, stats in et["by_score_bucket"].items():
             if stats["total"] >= 5:
                 hr = stats["correct"] / stats["total"]
@@ -399,10 +306,8 @@ def _update_learning(
                     best_bucket   = bucket
 
         if best_bucket:
-            # Ajustar min_score al inicio del mejor bucket
-            bucket_start = float(best_bucket.split("-")[0])
-            current      = et["adjusted_thresholds"]["min_score"]
-            # Movimiento suave: no cambiar más de 0.05 a la vez
+            bucket_start  = float(best_bucket.split("-")[0])
+            current       = et["adjusted_thresholds"]["min_score"]
             new_threshold = max(0.45, min(0.80,
                 current + np.clip(bucket_start - current, -0.05, 0.05)
             ))
@@ -414,7 +319,6 @@ def _update_learning(
                     f"(bucket {best_bucket} hit_rate={best_hit_rate:.1%})"
                 )
 
-    # ── Actualizar position tracking ─────────────────────
     pt = learning["position_tracking"]
     for ev in position_evals:
         pt["total"]   += 1
@@ -435,6 +339,123 @@ def _update_learning(
 
 
 # =========================================================
+# v1.1 — ACTUALIZAR SHADOW GENOMES CON HIT RATES REALES
+# =========================================================
+
+def _update_shadow_genome_evals(h_hit_rates: Dict[str, float], fecha: date) -> None:
+    """
+    Registra el hit rate del día en cada shadow genome de cada H.
+    Esto permite que predictor_arena compare campeón vs shadows.
+
+    Los shadows no corren predicciones propias todavía —
+    acumulan el hit rate del campeón como baseline para comparar
+    cuando generen sus propias predicciones.
+    """
+    try:
+        from darwin_engine.predictor_genome import GENOME_BASE, PredictorGenome
+
+        for h_key, hit_rate in h_hit_rates.items():
+            h_num = int(h_key[1:])
+
+            # Actualizar hit rate del campeón
+            try:
+                from darwin_engine.predictor_genome import update_genome_hit_rate
+                update_genome_hit_rate(h_num, hit_rate, n_evals=0)
+            except Exception as e:
+                logger.warning(f"⚠️ update champion H{h_num}: {e}")
+
+            # Registrar en carpeta shadow/evals para el arena
+            shadow_eval_dir = GENOME_BASE / f"H{h_num}" / "shadow" / "evals"
+            shadow_eval_dir.mkdir(parents=True, exist_ok=True)
+
+            # Acumular hit rate diario del campeón como referencia
+            eval_file = shadow_eval_dir / f"champion_baseline.json"
+            existing  = {}
+            if eval_file.exists():
+                try:
+                    existing = json.loads(eval_file.read_text())
+                except Exception:
+                    pass
+
+            daily    = existing.get("daily_rates", [])
+            daily.append({"fecha": fecha.isoformat(), "hit_rate": hit_rate})
+            daily    = daily[-60:]  # últimos 60 días
+
+            avg_rate = float(np.mean([d["hit_rate"] for d in daily]))
+
+            existing.update({
+                "genome_id":      f"H{h_num}_champion_baseline",
+                "horizon":        h_num,
+                "hit_rate":       round(avg_rate, 4),
+                "n_evaluations":  len(daily),
+                "daily_rates":    daily,
+                "last_updated":   fecha.isoformat(),
+            })
+
+            tmp = eval_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(existing, indent=2, default=str))
+            tmp.replace(eval_file)
+
+        logger.info(f"🧬 Darwin shadow evals actualizados | {len(h_hit_rates)} H")
+
+    except Exception as e:
+        logger.warning(f"⚠️ _update_shadow_genome_evals error: {e}")
+
+
+def _compute_h_hit_rates_from_evals(
+    entry_evals: List[Dict],
+) -> Dict[str, float]:
+    """
+    Calcula hit rate aproximado por H basándose en los tickers evaluados.
+    Usa las evaluaciones del día anterior del evaluador existente en disco.
+    """
+    from collections import defaultdict
+
+    eval_dir = DATA_PATH / "evaluations"
+    if not eval_dir.exists():
+        return {}
+
+    hit_counts  = defaultdict(int)
+    eval_counts = defaultdict(int)
+
+    # Solo los tickers evaluados hoy
+    tickers_hoy = {ev["ticker"] for ev in entry_evals}
+
+    for ticker in tickers_hoy:
+        ticker_dir = eval_dir / ticker.upper()
+        if not ticker_dir.exists():
+            continue
+        files = sorted(ticker_dir.glob("*.json"))[-30:]
+        for f in files:
+            try:
+                ev   = json.loads(f.read_text())
+                diag = ev.get("models_diagnostics", {})
+                for h in range(1, 11):
+                    key  = f"H{h}"
+                    data = diag.get(key)
+                    if not isinstance(data, dict):
+                        continue
+                    hit_sign = data.get("hit_sign")
+                    if hit_sign is None:
+                        continue
+                    eval_counts[key] += 1
+                    if hit_sign:
+                        hit_counts[key] += 1
+            except Exception:
+                continue
+
+    result = {}
+    for h in range(1, 11):
+        key   = f"H{h}"
+        total = eval_counts.get(key, 0)
+        if total >= 5:
+            result[key] = round(hit_counts[key] / total, 4)
+
+    logger.info(f"📊 H hit rates calculados: {result}")
+    return result
+
+
+# =========================================================
 # RUN PRINCIPAL
 # =========================================================
 
@@ -443,10 +464,9 @@ def run_intraday_evaluator() -> Dict:
     Evalúa el snapshot del día anterior y actualiza el aprendizaje.
     Llamado desde pipeline_router como paso 4.6.
     """
-    hoy   = datetime.now(timezone.utc).date()
-    ayer  = hoy - timedelta(days=1)
+    hoy  = datetime.now(timezone.utc).date()
+    ayer = hoy - timedelta(days=1)
 
-    # Saltar fines de semana
     if ayer.weekday() >= 5:
         logger.info(f"⏭ Intraday evaluator SKIP — ayer fue fin de semana ({ayer})")
         return {"skipped": True, "reason": "weekend"}
@@ -463,7 +483,6 @@ def run_intraday_evaluator() -> Dict:
 
     logger.info(f"📊 Evaluando snapshot intraday de {ayer} | {len(snapshot)} horas")
 
-    # Evaluar decisiones
     entry_evals    = _evaluate_entry_decisions(snapshot, ayer)
     position_evals = _evaluate_position_decisions(snapshot, ayer)
 
@@ -472,8 +491,13 @@ def run_intraday_evaluator() -> Dict:
         f"positions={len(position_evals)}"
     )
 
-    # Actualizar aprendizaje
     learning = _update_learning(entry_evals, position_evals)
+
+    # ── v1.1: Actualizar Darwin con hit rates reales ──────
+    h_hit_rates = _compute_h_hit_rates_from_evals(entry_evals)
+    if h_hit_rates:
+        _update_shadow_genome_evals(h_hit_rates, ayer)
+    # ─────────────────────────────────────────────────────
 
     et = learning["entry_timing"]
     pt = learning["position_tracking"]
@@ -486,13 +510,14 @@ def run_intraday_evaluator() -> Dict:
     )
 
     return {
-        "fecha_evaluada":   ayer.isoformat(),
-        "entry_evals":      len(entry_evals),
-        "position_evals":   len(position_evals),
-        "entry_hit_rate":   et.get("hit_rate"),
-        "position_hit_rate":pt.get("hit_rate"),
-        "min_score_actual": et["adjusted_thresholds"]["min_score"],
-        "total_historico":  et["total"],
+        "fecha_evaluada":    ayer.isoformat(),
+        "entry_evals":       len(entry_evals),
+        "position_evals":    len(position_evals),
+        "entry_hit_rate":    et.get("hit_rate"),
+        "position_hit_rate": pt.get("hit_rate"),
+        "min_score_actual":  et["adjusted_thresholds"]["min_score"],
+        "total_historico":   et["total"],
+        "darwin_h_updated":  list(h_hit_rates.keys()),
     }
 
 
@@ -501,10 +526,6 @@ def run_intraday_evaluator() -> Dict:
 # =========================================================
 
 def get_learned_thresholds() -> Dict:
-    """
-    Retorna los umbrales ajustados por el evaluador.
-    El tracker llama esto al iniciar para usar valores calibrados.
-    """
     learning = _load_json(LEARNING_FILE)
     if not learning:
         return {
@@ -524,11 +545,10 @@ def get_learned_thresholds() -> Dict:
 
 
 def _get_best_hours(by_hour: Dict) -> List[str]:
-    """Retorna las horas con mejor hit rate (mínimo 5 evaluaciones)."""
     ranked = []
     for hora, stats in by_hour.items():
         if stats["total"] >= 5:
             hr = stats["correct"] / stats["total"]
             ranked.append((hora, hr))
     ranked.sort(key=lambda x: x[1], reverse=True)
-    return [h for h, _ in ranked[:3]]  # top 3 horas
+    return [h for h, _ in ranked[:3]]
