@@ -232,8 +232,30 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
     logger.info(f"🔴 Monitor close | {tickers} | {reason}")
 
     orchestrator = TradingOrchestrator()
-    closed       = []
-    errors       = []
+
+    # Cargar posiciones en memoria para fallback de precio
+    try:
+        from portfolio_store import load_positions
+        positions_snapshot = load_positions()
+    except Exception:
+        positions_snapshot = []
+
+    # Cargar alpha scores para registrar en Darwin
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        _alpha_file = _Path(os.getenv("DATA_PATH", "/data")) / "alpha_last.json"
+        _alpha_data = _json.loads(_alpha_file.read_text()) if _alpha_file.exists() else {}
+        alpha_map   = {
+            t.upper(): d.get("alpha_score", 0.0)
+            for t, d in _alpha_data.get("results", {}).items()
+            if isinstance(d, dict)
+        }
+    except Exception:
+        alpha_map = {}
+
+    closed = []
+    errors = []
 
     for ticker in tickers:
         try:
@@ -254,16 +276,45 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
             except Exception:
                 pass
 
+            # ── DARWIN: capturar precio real de ejecución ──
             try:
                 from darwin_engine.trade_tracker import register_close
+
+                # Intentar obtener precio del resultado del broker
+                exit_price = 0.0
+                if result and hasattr(result, "filled_avg_price") and result.filled_avg_price:
+                    exit_price = float(result.filled_avg_price)
+                elif result and isinstance(result, dict):
+                    exit_price = float(
+                        result.get("filled_avg_price")
+                        or result.get("fill_price")
+                        or result.get("price")
+                        or 0
+                    )
+
+                # Fallback: precio en memoria pre-cierre
+                if exit_price <= 0:
+                    exit_price = next(
+                        (
+                            float(p.get("price_now") or p.get("current_price") or p.get("avg_entry_price") or 0)
+                            for p in positions_snapshot
+                            if str(p.get("ticker", "")).upper() == ticker.upper()
+                        ),
+                        0.0,
+                    )
+
+                alpha_at_close = alpha_map.get(ticker.upper(), 0.0)
+                logger.info(f"📝 Darwin monitor-close {ticker} @ ${exit_price:.2f}")
+
                 register_close(
                     ticker      = ticker,
-                    exit_price  = 0.0,
+                    exit_price  = exit_price,
                     reason      = reason,
-                    alpha_score = 0.0,
+                    alpha_score = alpha_at_close,
                 )
-            except Exception:
-                pass
+            except Exception as _de:
+                logger.warning(f"⚠️ darwin monitor-close {ticker}: {_de}")
+            # ───────────────────────────────────────────────
 
         except Exception as e:
             errors.append({"ticker": ticker, "error": str(e)})
@@ -275,7 +326,8 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
         "errors":    errors,
         "requested": tickers,
         "timestamp": datetime.utcnow().isoformat(),
-    }
+                                  }
+    
 
 # =========================================================
 # [M2] DARWIN RUN — ciclo evolutivo manual
