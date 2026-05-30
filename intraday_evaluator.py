@@ -1,8 +1,14 @@
 # =========================================================
-# intraday_evaluator.py — INTRADAY EVALUATOR v1.1
+# intraday_evaluator.py — INTRADAY EVALUATOR v1.2
 # =========================================================
 # v1.1: Conecta evaluaciones de entry timing con Darwin
 #       predictor genomes — actualiza hit rates de shadows
+# v1.2: FIX OOM — _compute_h_hit_rates_from_evals cargaba
+#       hasta 30 JSONs por ticker en RAM simultáneamente.
+#       Con ~130 tickers × 30 archivos × models_diagnostics
+#       completo → crash OOM al 3er día hábil.
+#       Fix: máximo 5 archivos por ticker + del explícito
+#       para liberar memoria inmediatamente tras cada lectura.
 # =========================================================
 
 import os
@@ -31,6 +37,9 @@ ALPACA_KEY     = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET  = os.getenv("ALPACA_SECRET_KEY")
 
 MIN_SAMPLES_ADJUST = int(os.getenv("INTRADAY_MIN_SAMPLES", "10"))
+
+# [FIX OOM] Máximo archivos de evaluación por ticker
+MAX_EVAL_FILES_PER_TICKER = int(os.getenv("MAX_EVAL_FILES_PER_TICKER", "5"))
 
 _alpaca_client: Optional[StockHistoricalDataClient] = None
 
@@ -337,6 +346,14 @@ def _update_learning(
 
     return learning
 
+# =========================================================
+# FIN PARTE 1 — continúa en PARTE 2
+# =========================================================
+# =========================================================
+# PARTE 2 — pegar inmediatamente después de PARTE 1
+# (eliminar el comentario "FIN PARTE 1" antes de pegar)
+# =========================================================
+
 
 # =========================================================
 # v1.1 — ACTUALIZAR SHADOW GENOMES CON HIT RATES REALES
@@ -369,7 +386,7 @@ def _update_shadow_genome_evals(h_hit_rates: Dict[str, float], fecha: date) -> N
             shadow_eval_dir.mkdir(parents=True, exist_ok=True)
 
             # Acumular hit rate diario del campeón como referencia
-            eval_file = shadow_eval_dir / f"champion_baseline.json"
+            eval_file = shadow_eval_dir / "champion_baseline.json"
             existing  = {}
             if eval_file.exists():
                 try:
@@ -377,19 +394,19 @@ def _update_shadow_genome_evals(h_hit_rates: Dict[str, float], fecha: date) -> N
                 except Exception:
                     pass
 
-            daily    = existing.get("daily_rates", [])
+            daily = existing.get("daily_rates", [])
             daily.append({"fecha": fecha.isoformat(), "hit_rate": hit_rate})
-            daily    = daily[-60:]  # últimos 60 días
+            daily = daily[-60:]  # últimos 60 días
 
             avg_rate = float(np.mean([d["hit_rate"] for d in daily]))
 
             existing.update({
-                "genome_id":      f"H{h_num}_champion_baseline",
-                "horizon":        h_num,
-                "hit_rate":       round(avg_rate, 4),
-                "n_evaluations":  len(daily),
-                "daily_rates":    daily,
-                "last_updated":   fecha.isoformat(),
+                "genome_id":     f"H{h_num}_champion_baseline",
+                "horizon":       h_num,
+                "hit_rate":      round(avg_rate, 4),
+                "n_evaluations": len(daily),
+                "daily_rates":   daily,
+                "last_updated":  fecha.isoformat(),
             })
 
             tmp = eval_file.with_suffix(".tmp")
@@ -407,7 +424,11 @@ def _compute_h_hit_rates_from_evals(
 ) -> Dict[str, float]:
     """
     Calcula hit rate aproximado por H basándose en los tickers evaluados.
-    Usa las evaluaciones del día anterior del evaluador existente en disco.
+
+    [FIX OOM v1.2] Antes cargaba [-30:] archivos por ticker en RAM
+    simultáneamente → crash OOM al 3er día hábil con ~130 tickers.
+    Ahora: máximo MAX_EVAL_FILES_PER_TICKER (default=5) archivos,
+    y cada JSON se libera explícitamente con del tras procesarlo.
     """
     from collections import defaultdict
 
@@ -425,7 +446,10 @@ def _compute_h_hit_rates_from_evals(
         ticker_dir = eval_dir / ticker.upper()
         if not ticker_dir.exists():
             continue
-        files = sorted(ticker_dir.glob("*.json"))[-30:]
+
+        # [FIX OOM] Límite estricto: solo los N más recientes
+        files = sorted(ticker_dir.glob("*.json"))[-MAX_EVAL_FILES_PER_TICKER:]
+
         for f in files:
             try:
                 ev   = json.loads(f.read_text())
@@ -441,6 +465,9 @@ def _compute_h_hit_rates_from_evals(
                     eval_counts[key] += 1
                     if hit_sign:
                         hit_counts[key] += 1
+                # [FIX OOM] Liberar memoria explícitamente tras cada archivo
+                del ev
+                del diag
             except Exception:
                 continue
 
@@ -552,3 +579,4 @@ def _get_best_hours(by_hour: Dict) -> List[str]:
             ranked.append((hora, hr))
     ranked.sort(key=lambda x: x[1], reverse=True)
     return [h for h, _ in ranked[:3]]
+            
