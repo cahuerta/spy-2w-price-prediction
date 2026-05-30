@@ -1,5 +1,5 @@
 """
-pm_defensive.py - DEFENSIVE POSITION MANAGER v1.8 PRODUCCION
+pm_defensive.py - DEFENSIVE POSITION MANAGER v1.9 PRODUCCION
 
 FIX v1.8:
   [F7] entry_price fallback a avg_entry_price — Alpaca devuelve
@@ -10,6 +10,18 @@ FIX v1.8:
        HOLD preventivo y se reevalúan en el siguiente ciclo.
   [F9] price_now fallback a current_price — mismo problema
        con el campo de precio actual.
+
+FIX v1.9:
+  [F10] entry_time → entry_date: el sistema nunca escribe entry_time.
+        positions_meta.py guarda entry_date (solo fecha ISO "YYYY-MM-DD").
+        portfolio_store.py mergea entry_date. pm_defensive leía entry_time
+        → siempre "" → days_between explotaba en TODAS las posiciones.
+        Ahora lee entry_date con fallback a entry_time por compatibilidad.
+  [F11] days_between retorna 0 (no MAX_HOLD_DAYS) cuando entry_date
+        está vacío o ausente — antes forzaba cierre por tiempo en
+        posiciones sin metadata. Ahora las trata como nuevas.
+  [F12] days_between maneja fechas sin timezone (solo "YYYY-MM-DD")
+        añadiendo CL_TIMEZONE antes de comparar.
 """
 
 import os
@@ -51,13 +63,24 @@ def pct_change(current: float, entry: float) -> float:
 
 
 def days_between(entry_iso: str) -> int:
+    """
+    [F11] Retorna 0 si entry_iso está vacío o ausente — la posición
+          se trata como nueva, no como expirada.
+    [F12] Maneja fechas sin timezone ("YYYY-MM-DD") añadiendo
+          CL_TIMEZONE antes de comparar.
+    """
     try:
-        entry_str = entry_iso.replace("Z", "+00:00")
+        if not entry_iso or not entry_iso.strip():
+            return 0
+        entry_str = entry_iso.strip().replace("Z", "+00:00")
         dt = datetime.fromisoformat(entry_str)
+        if dt.tzinfo is None:
+            # Fecha sin hora ni tz: "2026-05-26" → medianoche Santiago
+            dt = CL_TIMEZONE.localize(dt)
         return max(0, (datetime.now(CL_TIMEZONE) - dt.astimezone(CL_TIMEZONE)).days)
     except Exception as e:
         logger.warning(f"days_between error '{entry_iso}': {e}")
-        return MAX_HOLD_DAYS_NON_ANCHOR
+        return 0
 
 
 def _safe_price(pos: Dict, *keys) -> float:
@@ -136,7 +159,7 @@ class DefensiveDecision:
 
 
 # =========================================================
-# PM DEFENSIVO v1.8
+# PM DEFENSIVO v1.9
 # =========================================================
 
 class PMDefensive:
@@ -147,7 +170,7 @@ class PMDefensive:
         self._anchor_universe    = _load_anchor_universe()
         self._anchor_tickers     = {a["ticker"].upper() for a in self._anchor_universe}
         logger.info(
-            f"PMDefensive v1.8 | anclas={len(self._anchor_tickers)}: "
+            f"PMDefensive v1.9 | anclas={len(self._anchor_tickers)}: "
             f"{sorted(self._anchor_tickers)}"
         )
 
@@ -201,9 +224,13 @@ class PMDefensive:
                     {"entry": entry, "price": price},
                 )
 
-        ret        = pct_change(price, entry)
-        entry_time = str(pos.get("entry_time", ""))
-        age        = days_between(entry_time)
+        ret = pct_change(price, entry)
+
+        # [F10] Leer entry_date con fallback a entry_time por compatibilidad
+        entry_date = str(
+            pos.get("entry_date") or pos.get("entry_time") or ""
+        )
+        age = days_between(entry_date)
 
         # Stop catastrófico — aplica a TODOS incluyendo anchors
         if ret <= -CATASTROPHIC_STOP_PCT:
@@ -356,7 +383,7 @@ class PMDefensive:
         holds  = len([d for d in decisions if d.action == "HOLD"])
 
         logger.info(
-            f"DEFENSIVE v1.8 | pos={len(positions)} anchors={len(anchors)} "
+            f"DEFENSIVE v1.9 | pos={len(positions)} anchors={len(anchors)} "
             f"| closes={closes} opens={opens} holds={holds} "
             f"rotates={rotations_done} | capital=${total_capital:,.0f}"
         )
@@ -380,33 +407,42 @@ if __name__ == "__main__":
             "avg_entry_price": 230.70,
             "current_price":   231.47,
             "qty":             18,
-            "entry_time":      "2026-02-26T14:30:00Z",
+            "entry_date":      "2026-02-26",
         },
-        {   # Anchor sin entry_price — debe ser HOLD (no CLOSE)
+        {   # Anchor sin entry_date — debe ser HOLD (no CLOSE, no warning)
             "ticker":    "KO",
             "price_now": 75.50,
             "qty":       56,
-            "entry_time": "2026-02-26T14:30:00Z",
         },
-        {   # No-anchor normal
+        {   # No-anchor con entry_date como fecha simple
             "ticker":          "BALL",
             "avg_entry_price": 64.95,
             "current_price":   64.03,
             "qty":             67,
-            "entry_time":      "2026-03-01T14:30:00Z",
+            "entry_date":      "2026-03-01",
+        },
+        {   # No-anchor sin entry_date — debe ser HOLD (age=0, no expirado)
+            "ticker":          "STT",
+            "avg_entry_price": 156.72,
+            "current_price":   157.00,
+            "qty":             27,
         },
     ]
 
-    print("\nPMDefensive v1.8 SELF-TEST:")
+    print("\nPMDefensive v1.9 SELF-TEST:")
     results = pm.evaluate_portfolio(test_positions, total_capital=85000)
 
     print("\nDECISIONES:")
     for d in results:
         print(f"  {d.action:6} {d.ticker:12} {d.reason}")
 
-    jnj = next((d for d in results if d.ticker == "JNJ"), None)
-    ko  = next((d for d in results if d.ticker == "KO"),  None)
+    jnj = next((d for d in results if d.ticker == "JNJ"),  None)
+    ko  = next((d for d in results if d.ticker == "KO"),   None)
+    stt = next((d for d in results if d.ticker == "STT"),  None)
+
     assert jnj and jnj.action == "HOLD", f"❌ JNJ debe ser HOLD, es {jnj}"
     assert ko  and ko.action  == "HOLD", f"❌ KO debe ser HOLD, es {ko}"
-    print("\n✅ v1.8 TEST OK — anchors protegidos con campos Alpaca")
-      
+    assert stt and stt.action == "HOLD", f"❌ STT sin entry_date debe ser HOLD (age=0), es {stt}"
+
+    print("\n✅ v1.9 TEST OK — entry_date unificado, sin falsos cierres por fecha faltante")
+  
