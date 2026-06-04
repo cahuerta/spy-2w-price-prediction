@@ -2,7 +2,7 @@
 # providers/cache_provider.py
 # =========================================================
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 
@@ -13,6 +13,7 @@ from market_data_cache import (
 )
 
 MAX_CACHE_AGE_HOURS = 18
+MAX_ROWS = 500  # ~2 años de días hábiles, suficiente para KNN/PCA
 
 
 def _is_cache_stale(ticker: str) -> bool:
@@ -32,15 +33,21 @@ def _is_cache_stale(ticker: str) -> bool:
 
 def get_price_history(
     ticker: str,
-    period: str = "5y",
+    period: str = "2y",  # ← bajado de 5y
     interval: str = "1d"
 ):
     """
     Cache-first provider.
     Si no existe o está vencido → refresca automáticamente.
+    Retorna máximo MAX_ROWS filas para controlar memoria.
     """
 
     if _is_cache_stale(ticker):
         refresh_market_cache(ticker, period=period)
 
-    return load_prices_df(ticker)
+    df = load_prices_df(ticker)
+
+    if df is not None and not df.empty:
+        return df.tail(MAX_ROWS)
+
+    return df
