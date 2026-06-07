@@ -132,11 +132,14 @@ class TradingOrchestrator:
             sod_equity = current_equity
             try:
                 SOD_FILE.parent.mkdir(parents=True, exist_ok=True)
-                SOD_FILE.write_text(json.dumps({
+                # [FIX] Escritura atómica via tmp → replace para evitar race condition
+                tmp = SOD_FILE.with_suffix(".tmp")
+                tmp.write_text(json.dumps({
                     "date":   today_str,
                     "equity": sod_equity,
                     "saved_at": datetime.now(timezone.utc).isoformat(),
                 }))
+                tmp.replace(SOD_FILE)
                 logger.info(f"🔋 SOD nuevo | fecha={today_str} equity=${sod_equity:,.0f}")
             except Exception as e:
                 logger.warning(f"⚠️ Error guardando SOD: {e}")
@@ -464,6 +467,7 @@ class TradingOrchestrator:
                     result = await asyncio.wait_for(
                         self.broker.execute_decision(order), timeout=30
                     )
+                    # [FIX] close_successes solo cuenta broker OK — Darwin puede fallar por separado
                     close_successes.append(order["ticker"])
                     logger.info(f"⚰️ CLOSED {order['ticker']}")
 
@@ -593,13 +597,14 @@ class TradingOrchestrator:
                         f"score={signal.get('entry_score')} "
                         f"ratio={signal.get('tracking_ratio')}"
                     )
+                    filtered_opens.append(o)
                 else:
+                    # [FIX] Signal negativa → NO añadir a filtered_opens
                     logger.info(
                         f"⏳ INTRADAY ESPERA {ticker} | "
                         f"score={signal.get('entry_score')} | "
                         f"{signal.get('razon', '')}"
                     )
-                filtered_opens.append(o)
             opens = filtered_opens
         # ────────────────────────────────────────────────────────
 
@@ -749,7 +754,7 @@ class TradingOrchestrator:
 
     # =========================================================
     # PREVIEW EXECUTABILITY
-        # =========================================================
+    # =========================================================
     async def preview_executability(self, market_ctx: Dict) -> Dict:
         positions  = self._enrich_positions_with_price(load_positions())
         alpha_data = self._load_last_alpha()
