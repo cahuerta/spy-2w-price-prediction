@@ -1,5 +1,5 @@
 # =========================================================
-# dashboard.py — ENTERPRISE DASHBOARD MODULE v1.1
+# dashboard.py — ENTERPRISE DASHBOARD MODULE (PRODUCCIÓN)
 # =========================================================
 # 🔹 LEE SOLO DESDE /data/predictions
 # 🔹 signals.py NO es fuente de análisis
@@ -8,16 +8,14 @@
 # 🔹 ESTE ARCHIVO NO MONTA FASTAPI (solo router)
 # 🔹 RATE LIMIT SOLO EN ENDPOINT PESADO (summary)
 #
-# FIX v1.1:
-#   [D1] universe(): kill switch retornaba executable=True —
-#        score <= -0.40 significa CERRAR posición existente,
-#        NO abrir nueva. Ahora executable=False + block_reason
-#        diferenciado entre "kill_switch_close" (tiene posición)
-#        y "kill_switch_no_open" (no tiene posición).
-#   [D2] executability_preview(): creaba TradingOrchestrator()
-#        sin capital real → CapitalGovernor usaba $1M del env
-#        en vez de ~$85k reales → sizings incorrectos en frontend.
-#        Ahora lee equity real de Alpaca antes de instanciar.
+# FIX:
+#   [D1] universe(): kill switch retornaba executable=True — corregido
+#   [D2] executability_preview(): capital real de Alpaca
+#   [D3] universe(): agregado tickers.json como fuente principal
+#        Antes solo leía alpha_last.json → universe vacío cuando
+#        el pipeline no corre (fin de semana, etc.)
+#        Ahora: tickers.json (fuente principal) + alpha_last.json
+#        (enriquece con alpha reciente) + positions (posiciones abiertas)
 # =========================================================
 
 import os
@@ -124,18 +122,12 @@ def safe_float(v):
         return None
 
 async def _get_real_capital() -> float:
-    """
-    [D2] Lee equity real de Alpaca para que el CapitalGovernor
-    use el capital correcto (~$85k) en vez del env ($1M).
-    Fallback a FIXED_CAPITAL si Alpaca no responde.
-    """
     try:
         from broker import get_engine
         engine  = get_engine()
         account = await engine.get_account()
         equity  = float(account.equity)
         if equity > 0:
-            logger.info(f"💰 Capital real Alpaca (dashboard): ${equity:,.0f}")
             return equity
     except Exception as e:
         logger.warning(f"⚠️ No se pudo leer equity Alpaca: {e} → usando env")
@@ -291,7 +283,6 @@ async def market_context():
 
 # =========================================================
 # EXECUTABILITY PREVIEW
-# [D2] Lee capital real de Alpaca antes de instanciar orchestrator
 # =========================================================
 @router.get("/executability-preview")
 async def executability_preview():
@@ -301,29 +292,38 @@ async def executability_preview():
 
     market_ctx = json.loads(market_ctx_path.read_text())
 
-    # [D2] Capital real para sizing correcto
     real_capital = await _get_real_capital()
     orchestrator = TradingOrchestrator()
-    orchestrator.fixed_capital    = real_capital
+    orchestrator.fixed_capital     = real_capital
     orchestrator._fallback_capital = real_capital
 
     return await orchestrator.preview_executability(market_ctx=market_ctx)
 
 # =========================================================
 # UNIVERSE
-# [D1] Kill switch: executable=False — score <= -0.40 significa
-#      CERRAR posición existente, NO abrir nueva.
+# [D3] tickers.json como fuente principal del universo completo
+#      alpha_last.json enriquece con datos recientes
+#      positions agrega posiciones abiertas aunque no estén en tickers
 # =========================================================
 @router.get("/universe")
 async def universe():
     from portfolio_store import load_positions
 
     ALPHA_FILE      = Path(DATA_PATH) / "alpha_last.json"
+    TICKERS_FILE    = Path(DATA_PATH) / "tickers.json"
     market_ctx_path = Path(DATA_PATH) / "market_context.json"
 
+    # Fuente 1: universo completo de tickers evaluados históricamente
+    try:
+        tickers_universe = set(json.loads(TICKERS_FILE.read_text()) or [])
+    except Exception:
+        tickers_universe = set()
+
+    # Fuente 2: alpha reciente (puede ser subset del universo)
     alpha_data = load_json(ALPHA_FILE) or {}
     alpha_map  = alpha_data.get("results", {})
 
+    # Fuente 3: posiciones abiertas en broker
     positions_list = load_positions()
     positions = {
         p.get("ticker", "").upper(): p
@@ -336,9 +336,10 @@ async def universe():
     thresholds        = {"growth": 0.65, "neutral": 0.75, "defensive": 0.85}
     current_threshold = thresholds.get(mode, 0.75)
 
-    rows = []
+    # Unión de las tres fuentes
+    universe_tickers = tickers_universe | set(alpha_map.keys()) | set(positions.keys())
 
-    universe_tickers = set(alpha_map.keys()) | set(positions.keys())
+    rows = []
 
     for ticker in universe_tickers:
         data  = alpha_map.get(ticker, {})
@@ -350,33 +351,26 @@ async def universe():
 
         if score is None:
             block_reason = "no_alpha"
-
         elif score <= -0.40:
-            # [D1] Kill switch: NO es apertura — es señal de cierre
-            # executable=False porque no se debe ABRIR esta posición
-            # El orchestrator cerrará la posición existente si la hay
             is_executable = False
             block_reason  = "kill_switch_close" if has_position else "kill_switch_no_open"
-
         elif score >= current_threshold:
             is_executable = True
-
         else:
             block_reason = "alpha_below_threshold"
 
-        # Si el alpha_engine ya generó un motivo explícito
         if data.get("reason"):
             block_reason = data["reason"]
 
         rows.append({
-            "ticker":       ticker,
-            "alpha":        score,
-            "confidence":   data.get("components", {}).get("confidence"),
+            "ticker":        ticker,
+            "alpha":         score,
+            "confidence":    data.get("components", {}).get("confidence"),
             "positionValue": positions.get(ticker.upper(), {}).get("market_value", 0),
-            "executable":   is_executable,
-            "block_reason": block_reason,
-            "has_position": has_position,
-            "mode_context": mode,
+            "executable":    is_executable,
+            "block_reason":  block_reason,
+            "has_position":  has_position,
+            "mode_context":  mode,
         })
 
     rows.sort(
@@ -398,4 +392,4 @@ async def real_execution():
     except Exception as e:
         logger.error(f"Error en endpoint real-execution: {e}")
         raise HTTPException(500, str(e))
-        
+    
