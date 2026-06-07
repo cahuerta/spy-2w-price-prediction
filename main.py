@@ -1,5 +1,5 @@
 # =========================================================
-# main.py — TRADING SUITE ENTERPRISE v2.9.2 PRODUCCIÓN
+# main.py — TRADING SUITE ENTERPRISE v2.9.3 PRODUCCIÓN
 # =========================================================
 # ✔ Runtime de trading (NO batch)
 # ✔ NO decide mercado
@@ -15,6 +15,10 @@
 #   [M1] /internal/trading/monitor-close — cierre defensivo horario
 #   [M2] /internal/darwin/run            — ciclo evolutivo manual
 #   [M3] /internal/darwin/status         — estado del Darwin Engine
+#
+# v2.9.3:
+#   [M4] /internal/pipeline/last — agregada autenticación X-PIPELINE-KEY
+#        antes estaba sin protección, exponiendo configuración del pipeline
 # =========================================================
 
 import os
@@ -134,15 +138,15 @@ def load_market_context() -> MarketOrchestrationContext:
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite v2.9.2 START")
+    logger.info("🚀 Trading Suite v2.9.3 START")
     merge_tickers_on_startup()
     start_scheduler()
     yield
-    logger.info("🛑 Trading Suite v2.9.2 STOP")
+    logger.info("🛑 Trading Suite v2.9.3 STOP")
 
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.9.2",
+    version="2.9.3",
     lifespan=lifespan,
 )
 
@@ -280,7 +284,6 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
             try:
                 from darwin_engine.trade_tracker import register_close
 
-                # Intentar obtener precio del resultado del broker
                 exit_price = 0.0
                 if result and hasattr(result, "filled_avg_price") and result.filled_avg_price:
                     exit_price = float(result.filled_avg_price)
@@ -326,8 +329,8 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
         "errors":    errors,
         "requested": tickers,
         "timestamp": datetime.utcnow().isoformat(),
-                                  }
-    
+    }
+
 
 # =========================================================
 # [M2] DARWIN RUN — ciclo evolutivo manual
@@ -456,7 +459,10 @@ async def internal_pipeline_last(request: Request):
 
 
 @app.get("/internal/pipeline/last")
-async def get_last_pipeline():
+async def get_last_pipeline(request: Request):
+    # [M4] FIX v2.9.3: agregada autenticación — antes sin protección
+    if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
+        raise HTTPException(403, "Invalid pipeline key")
     if not PIPELINE_AUDIT_FILE.exists():
         return {"status": "no_pipeline_executed"}
     return load_json(PIPELINE_AUDIT_FILE, {})
@@ -506,6 +512,7 @@ def root():
         "service": "spy-2w-price-prediction",
         "env":     "production"
     }
+
 @app.post("/internal/debug/fix-entry-dates")
 async def fix_entry_dates(request: Request):
     """
@@ -519,11 +526,10 @@ async def fix_entry_dates(request: Request):
         from positions_meta import get_all, set_entry_date
         from portfolio_store import load_positions
 
-        meta     = get_all()
-        fixed    = []
-        skipped  = []
+        meta    = get_all()
+        fixed   = []
+        skipped = []
 
-        # Fechas estimadas por ticker según logs históricos
         ESTIMATED_DATES = {
             "GLW":  "2026-04-21",
             "JNJ":  "2026-04-21",
@@ -556,6 +562,7 @@ async def fix_entry_dates(request: Request):
 
     except Exception as e:
         return {"error": str(e)}
+
 # =========================================================
 # SHUTDOWN
 # =========================================================
@@ -575,5 +582,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         log_level="error",
-                )
+    )
     
