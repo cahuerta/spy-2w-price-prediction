@@ -360,3 +360,4 @@ async def cancel_ticker_orders(ticker: str, x_api_key: str = Header(None)):
     engine    = get_engine()
     cancelled = await engine.cancel_orders_for_ticker(ticker)
     return {"ticker": ticker.upper(), "cancelled": cancelled}
+    
