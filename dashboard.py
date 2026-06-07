@@ -1,5 +1,5 @@
 # =========================================================
-# dashboard.py — ENTERPRISE DASHBOARD MODULE (PRODUCCIÓN)
+# dashboard.py — ENTERPRISE DASHBOARD MODULE v1.1
 # =========================================================
 # 🔹 LEE SOLO DESDE /data/predictions
 # 🔹 signals.py NO es fuente de análisis
@@ -7,6 +7,17 @@
 # 🔹 signals = visor secundario (pestaña señales)
 # 🔹 ESTE ARCHIVO NO MONTA FASTAPI (solo router)
 # 🔹 RATE LIMIT SOLO EN ENDPOINT PESADO (summary)
+#
+# FIX v1.1:
+#   [D1] universe(): kill switch retornaba executable=True —
+#        score <= -0.40 significa CERRAR posición existente,
+#        NO abrir nueva. Ahora executable=False + block_reason
+#        diferenciado entre "kill_switch_close" (tiene posición)
+#        y "kill_switch_no_open" (no tiene posición).
+#   [D2] executability_preview(): creaba TradingOrchestrator()
+#        sin capital real → CapitalGovernor usaba $1M del env
+#        en vez de ~$85k reales → sizings incorrectos en frontend.
+#        Ahora lee equity real de Alpaca antes de instanciar.
 # =========================================================
 
 import os
@@ -20,7 +31,7 @@ from datetime import datetime
 from collections import defaultdict, deque
 from functools import lru_cache
 from trading_orchestrator import TradingOrchestrator
-from real_performance import get_alpaca_real_metrics  # <--- Añade esto
+from real_performance import get_alpaca_real_metrics
 from fastapi import (
     APIRouter,
     Query,
@@ -112,8 +123,26 @@ def safe_float(v):
     except Exception:
         return None
 
+async def _get_real_capital() -> float:
+    """
+    [D2] Lee equity real de Alpaca para que el CapitalGovernor
+    use el capital correcto (~$85k) en vez del env ($1M).
+    Fallback a FIXED_CAPITAL si Alpaca no responde.
+    """
+    try:
+        from broker import get_engine
+        engine  = get_engine()
+        account = await engine.get_account()
+        equity  = float(account.equity)
+        if equity > 0:
+            logger.info(f"💰 Capital real Alpaca (dashboard): ${equity:,.0f}")
+            return equity
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo leer equity Alpaca: {e} → usando env")
+    return float(os.getenv("FIXED_CAPITAL", 1_000_000))
+
 # =========================================================
-# STATUS (SIN RATE LIMIT)
+# STATUS
 # =========================================================
 @router.get("/status")
 async def status():
@@ -126,7 +155,7 @@ async def status():
     }
 
 # =========================================================
-# TICKERS (SIN RATE LIMIT)
+# TICKERS
 # =========================================================
 @router.get("/tickers")
 async def tickers():
@@ -136,7 +165,7 @@ async def tickers():
     }
 
 # =========================================================
-# SUMMARY (ÚNICO CON RATE LIMIT)
+# SUMMARY (CON RATE LIMIT)
 # =========================================================
 @router.get("/predictions/summary")
 async def prediction_summary(
@@ -164,10 +193,10 @@ async def prediction_summary(
             continue
 
         data.append({
-            "date_base": p.get("date_base"),
-            "price_now": safe_float(p.get("price_now")),
-            "price_pred": safe_float(p.get("price_pred")),
-            "ret_ens_pct": safe_float(p.get("ret_ens_pct")),
+            "date_base":      p.get("date_base"),
+            "price_now":      safe_float(p.get("price_now")),
+            "price_pred":     safe_float(p.get("price_pred")),
+            "ret_ens_pct":    safe_float(p.get("ret_ens_pct")),
             "recommendation": p.get("recommendation"),
         })
 
@@ -176,12 +205,12 @@ async def prediction_summary(
 
     return {
         "ticker": ticker,
-        "count": len(data),
-        "data": data,
+        "count":  len(data),
+        "data":   data,
     }
 
 # =========================================================
-# LATEST (SIN RATE LIMIT)
+# LATEST
 # =========================================================
 @router.get("/latest/{ticker}")
 async def latest_snapshot(ticker: str):
@@ -198,14 +227,10 @@ async def latest_snapshot(ticker: str):
     if not last:
         raise HTTPException(404, "Invalid prediction file")
 
-    return {
-        "ticker": ticker,
-        "latest": last
-    }
+    return {"ticker": ticker, "latest": last}
 
 # =========================================================
-# EVALUATION LATEST (SIN RATE LIMIT)
-# LEE DESDE /data/evaluations/<TICKER>/*.json
+# EVALUATION LATEST
 # =========================================================
 @router.get("/evaluation-latest/{ticker}")
 async def evaluation_latest(ticker: str):
@@ -223,18 +248,18 @@ async def evaluation_latest(ticker: str):
         raise HTTPException(404, f"No evaluation files for {ticker}")
 
     last_fp = files[-1]
-    last = load_json(last_fp)
+    last    = load_json(last_fp)
     if not last:
         raise HTTPException(404, "Invalid evaluation file")
 
     return {
-        "ticker": ticker,
+        "ticker":     ticker,
         "evaluation": last,
-        "file": last_fp.name,
+        "file":       last_fp.name,
     }
 
 # =========================================================
-# SCREENER (SIN RATE LIMIT)
+# SCREENER
 # =========================================================
 @router.get("/screener")
 async def screener():
@@ -249,7 +274,7 @@ async def screener():
     return data
 
 # =========================================================
-# MARKET CONTEXT (SIN RATE LIMIT)
+# MARKET CONTEXT
 # =========================================================
 @router.get("/market-context")
 async def market_context():
@@ -264,110 +289,107 @@ async def market_context():
 
     return data
 
+# =========================================================
+# EXECUTABILITY PREVIEW
+# [D2] Lee capital real de Alpaca antes de instanciar orchestrator
+# =========================================================
 @router.get("/executability-preview")
 async def executability_preview():
-    from trading_orchestrator import TradingOrchestrator
-
-    orchestrator = TradingOrchestrator()
-
     market_ctx_path = Path(DATA_PATH) / "market_context.json"
     if not market_ctx_path.exists():
         raise HTTPException(404, "market_context.json not found")
 
     market_ctx = json.loads(market_ctx_path.read_text())
 
-    return await orchestrator.preview_executability(
-        market_ctx=market_ctx
-    )
+    # [D2] Capital real para sizing correcto
+    real_capital = await _get_real_capital()
+    orchestrator = TradingOrchestrator()
+    orchestrator.fixed_capital    = real_capital
+    orchestrator._fallback_capital = real_capital
 
+    return await orchestrator.preview_executability(market_ctx=market_ctx)
+
+# =========================================================
+# UNIVERSE
+# [D1] Kill switch: executable=False — score <= -0.40 significa
+#      CERRAR posición existente, NO abrir nueva.
+# =========================================================
 @router.get("/universe")
 async def universe():
     from portfolio_store import load_positions
 
-    # 1. Usar el archivo exacto que usa el orquestador
-    ALPHA_FILE = Path(DATA_PATH) / "alpha_last.json"
+    ALPHA_FILE      = Path(DATA_PATH) / "alpha_last.json"
     market_ctx_path = Path(DATA_PATH) / "market_context.json"
 
-    # 2. Cargar Alpha
     alpha_data = load_json(ALPHA_FILE) or {}
-    alpha_map = alpha_data.get("results", {})
+    alpha_map  = alpha_data.get("results", {})
 
-    # 3. Cargar Posiciones y Contexto
     positions_list = load_positions()
-
     positions = {
         p.get("ticker", "").upper(): p
         for p in positions_list
         if "ticker" in p
     }
-    market_ctx = load_json(market_ctx_path) or {}
-    mode = market_ctx.get("market_mode", "neutral")
 
-    # 4. Definir Thresholds (espejo del Orquestador)
-    thresholds = {"growth": 0.65, "neutral": 0.75, "defensive": 0.85}
+    market_ctx        = load_json(market_ctx_path) or {}
+    mode              = market_ctx.get("market_mode", "neutral")
+    thresholds        = {"growth": 0.65, "neutral": 0.75, "defensive": 0.85}
     current_threshold = thresholds.get(mode, 0.75)
 
     rows = []
 
-    alpha_tickers = set(alpha_map.keys())
-    position_tickers = set(positions.keys())
-
-    universe_tickers = alpha_tickers | position_tickers
+    universe_tickers = set(alpha_map.keys()) | set(positions.keys())
 
     for ticker in universe_tickers:
-
-        data = alpha_map.get(ticker, {})
-        score = data.get("alpha_score") 
+        data  = alpha_map.get(ticker, {})
+        score = data.get("alpha_score")
 
         is_executable = False
-        block_reason = None
+        block_reason  = None
+        has_position  = ticker.upper() in positions
 
         if score is None:
             block_reason = "no_alpha"
 
+        elif score <= -0.40:
+            # [D1] Kill switch: NO es apertura — es señal de cierre
+            # executable=False porque no se debe ABRIR esta posición
+            # El orchestrator cerrará la posición existente si la hay
+            is_executable = False
+            block_reason  = "kill_switch_close" if has_position else "kill_switch_no_open"
+
+        elif score >= current_threshold:
+            is_executable = True
+
         else:
-            # Kill switch → ejecutable (cerrar)
-            if score <= -0.40:
-                is_executable = True
-                block_reason = "kill_switch"
-
-            # Alpha suficiente
-            elif score >= current_threshold:
-                is_executable = True
-
-            # Alpha insuficiente
-            else:
-                block_reason = "alpha_below_threshold"
+            block_reason = "alpha_below_threshold"
 
         # Si el alpha_engine ya generó un motivo explícito
         if data.get("reason"):
             block_reason = data["reason"]
 
         rows.append({
-            "ticker": ticker,
-            "alpha": score,
-            "confidence": data.get("components", {}).get("confidence"),
+            "ticker":       ticker,
+            "alpha":        score,
+            "confidence":   data.get("components", {}).get("confidence"),
             "positionValue": positions.get(ticker.upper(), {}).get("market_value", 0),
-            "executable": is_executable,
+            "executable":   is_executable,
             "block_reason": block_reason,
-            "mode_context": mode,  # Para que el front sepa por qué el threshold es ese
+            "has_position": has_position,
+            "mode_context": mode,
         })
 
-    # Ordenar por Alpha
     rows.sort(
         key=lambda x: x["alpha"] if x["alpha"] is not None else -999,
-        reverse=True
+        reverse=True,
     )
     return {"rows": rows}
+
 # =========================================================
-# REAL PERFORMANCE (BROKER LAYER)
+# REAL PERFORMANCE
 # =========================================================
 @router.get("/real-execution")
 async def real_execution():
-    """
-    Consonancia con la Capa de Ejecución Real (Alpaca).
-    Calcula Win Rate y PnL de órdenes cerradas físicamente.
-    """
     try:
         metrics = await get_alpaca_real_metrics()
         if metrics.get("status") == "error":
