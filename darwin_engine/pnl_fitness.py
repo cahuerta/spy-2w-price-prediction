@@ -1,20 +1,24 @@
 """
 darwin_engine/pnl_fitness.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ARCHIVO NUEVO — darwin_engine/pnl_fitness.py
-
-Calcula el fitness real de cada genome combinando:
-  1. trade_tracker   → atribución de trades a genomas
-  2. Alpaca orders   → PnL real ejecutado
-  3. evaluator       → si el H acertó en su horizonte teórico
-
-Fitness final = Sharpe ponderado - penalización por oportunidad perdida
-
-Usado por arena.py para decidir qué genome promueve a producción.
+FIX v1.1:
+  [F1] _max_drawdown: filtra nan/inf antes de calcular — trades con
+       exit_price=0 (bug broker pre-v3.3) generaban pnl_real_pct=nan
+       que se propagaba a nan en fitness, bloqueando la selección
+       de campeón indefinidamente (nan >= umbral → siempre False).
+  [F2] compute_executor_fitness: filtra retornos inválidos (nan/inf/None)
+       antes de calcular sharpe y drawdown. Si quedan menos de 5 trades
+       válidos retorna insufficient_data en vez de nan.
+  [F3] compute_combined_fitness: usa math.isnan() para detectar nan
+       en e_fitness/p_fitness antes de la penalización — numpy evalúa
+       nan < -0.5 como False, dejando pasar el nan al combined.
+  [F4] _select_champion en arena.py: idem, protección contra nan en
+       champion_fitness e improvement.
 """
 
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -48,6 +52,17 @@ def _save_json(path: Path, data: Dict) -> None:
     tmp.replace(path)
 
 
+def _is_valid_return(v) -> bool:
+    """[F1][F2] True solo si el valor es un float finito y no None."""
+    if v is None:
+        return False
+    try:
+        f = float(v)
+        return math.isfinite(f)
+    except (TypeError, ValueError):
+        return False
+
+
 def _sharpe(returns: List[float], annualize: int = 252) -> float:
     """Sharpe ratio anualizado. Retorna 0 si no hay suficientes datos."""
     if len(returns) < 5:
@@ -60,10 +75,18 @@ def _sharpe(returns: List[float], annualize: int = 252) -> float:
 
 
 def _max_drawdown(returns: List[float]) -> float:
-    """Max drawdown desde retornos porcentuales."""
+    """
+    [F1] Max drawdown desde retornos porcentuales.
+    Filtra nan/inf antes de calcular — antes un solo nan en el array
+    propagaba nan a toda la cadena de fitness.
+    """
     if not returns:
         return 0.0
-    equity = np.cumprod(1 + np.array(returns) / 100)
+    # [F1] Filtrar valores inválidos
+    clean = [r for r in returns if _is_valid_return(r)]
+    if not clean:
+        return 0.0
+    equity = np.cumprod(1 + np.array(clean, dtype=float) / 100)
     peak   = np.maximum.accumulate(equity)
     dd     = (equity - peak) / peak
     return float(abs(dd.min()))
@@ -164,74 +187,80 @@ def compute_executor_fitness(genome_id: str) -> Dict:
     """
     Fitness del executor = qué tan bien decide cuándo entrar/salir.
 
-    Mide:
-    - Sharpe sobre retornos reales
-    - Max drawdown
-    - Penalización por oportunidad perdida (cerró antes y dejó dinero)
-    - Premio por cortar pérdidas (cerró antes y evitó caída mayor)
+    [F2] Filtra retornos inválidos (nan/inf/None) antes de calcular.
     """
     trades = _load_resolved_trades(genome_id, "executor")
     trades = _enrich_with_alpaca_pnl(trades)
 
-    if len(trades) < 5:
+    # [F2] Filtrar trades con pnl inválido (exit_price=0 → pnl=-100% o nan)
+    valid_trades = [t for t in trades if _is_valid_return(t.get("pnl_real_pct"))]
+    invalid_count = len(trades) - len(valid_trades)
+    if invalid_count > 0:
+        logger.warning(
+            f"⚠️ {genome_id}: {invalid_count} trades con PnL inválido descartados "
+            f"(probablemente exit_price=0 — fix broker v3.3)"
+        )
+
+    if len(valid_trades) < 5:
         return {
-            "genome_id":    genome_id,
-            "genome_type":  "executor",
-            "fitness":      0.0,
-            "status":       "insufficient_data",
-            "n_trades":     len(trades),
-            "min_required": 5,
+            "genome_id":      genome_id,
+            "genome_type":    "executor",
+            "fitness":        0.0,
+            "status":         "insufficient_data",
+            "n_trades":       len(valid_trades),
+            "n_invalid":      invalid_count,
+            "min_required":   5,
         }
 
-    returns          = [float(t["pnl_real_pct"]) for t in trades]
-    oportunidades    = [float(t.get("oportunidad_pct") or 0) for t in trades]
-    cerro_antes      = [t.get("closed_before_horizon", False) for t in trades]
+    returns       = [float(t["pnl_real_pct"]) for t in valid_trades]
+    oportunidades = [float(t.get("oportunidad_pct") or 0) for t in valid_trades]
+    cerro_antes   = [t.get("closed_before_horizon", False) for t in valid_trades]
 
     sharpe   = _sharpe(returns)
-    max_dd   = _max_drawdown(returns)
+    max_dd   = _max_drawdown(returns)   # [F1] ya filtra nan internamente
     win_rate = float(np.mean([r > 0 for r in returns]))
     avg_pnl  = float(np.mean(returns))
 
     # Penalización: cerró antes Y dejó dinero sobre la mesa
     oport_perdida = [
         abs(op) for op, antes in zip(oportunidades, cerro_antes)
-        if antes and op > 0  # op > 0 = teórico mejor que real
+        if antes and op > 0
     ]
     penalizacion = float(np.mean(oport_perdida)) if oport_perdida else 0.0
 
     # Premio: cerró antes Y evitó pérdida mayor
     oport_ganada = [
         abs(op) for op, antes in zip(oportunidades, cerro_antes)
-        if antes and op < 0  # op < 0 = real mejor que teórico
+        if antes and op < 0
     ]
     premio = float(np.mean(oport_ganada)) if oport_ganada else 0.0
 
-    # Fitness final
     fitness = sharpe - (max_dd * 2) - (penalizacion * 0.5) + (premio * 0.3)
 
     result = {
-        "genome_id":         genome_id,
-        "genome_type":       "executor",
-        "fitness":           round(fitness, 4),
-        "status":            "ok",
-        "n_trades":          len(trades),
-        "sharpe":            round(sharpe, 4),
-        "max_drawdown":      round(max_dd, 4),
-        "win_rate":          round(win_rate, 4),
-        "avg_pnl_pct":       round(avg_pnl, 4),
+        "genome_id":          genome_id,
+        "genome_type":        "executor",
+        "fitness":            round(fitness, 4),
+        "status":             "ok",
+        "n_trades":           len(valid_trades),
+        "n_invalid":          invalid_count,
+        "sharpe":             round(sharpe, 4),
+        "max_drawdown":       round(max_dd, 4),
+        "win_rate":           round(win_rate, 4),
+        "avg_pnl_pct":        round(avg_pnl, 4),
         "penalizacion_oport": round(penalizacion, 4),
-        "premio_timing":     round(premio, 4),
-        "computed_at":       datetime.now(timezone.utc).isoformat(),
+        "premio_timing":      round(premio, 4),
+        "computed_at":        datetime.now(timezone.utc).isoformat(),
     }
 
-    # Guardar en disco
     path = FITNESS_DIR / f"{genome_id}_executor.json"
     _save_json(path, result)
 
     logger.info(
         f"🏋️ Executor fitness | {genome_id} | "
         f"fitness={fitness:.4f} sharpe={sharpe:.4f} "
-        f"dd={max_dd:.4f} win={win_rate:.2%} n={len(trades)}"
+        f"dd={max_dd:.4f} win={win_rate:.2%} n={len(valid_trades)} "
+        f"(descartados={invalid_count})"
     )
     return result
 
@@ -243,16 +272,10 @@ def compute_executor_fitness(genome_id: str) -> Dict:
 def compute_predictor_fitness(genome_id: str) -> Dict:
     """
     Fitness del predictor = qué tan bien predice la dirección correcta.
-
-    Mide:
-    - Hit rate en horizonte teórico (¿acertó la dirección al vencimiento?)
-    - Confianza calibrada (alta confianza + acierto = mejor fitness)
-    - Penalización por alta confianza + error (el peor caso)
     """
     trades = _load_resolved_trades(genome_id, "predictor")
     trades = [t for t in trades if t.get("predictor_was_right") is not None]
 
-    # Complementar con evaluaciones del evaluator existente
     h_hit_rates = _get_h_hit_rates()
 
     if len(trades) < 5 and not h_hit_rates:
@@ -264,8 +287,7 @@ def compute_predictor_fitness(genome_id: str) -> Dict:
             "n_trades":     len(trades),
         }
 
-    # Fitness base desde trades atribuidos
-    predictor_hits   = []
+    predictor_hits    = []
     confidence_scores = []
 
     for t in trades:
@@ -279,41 +301,38 @@ def compute_predictor_fitness(genome_id: str) -> Dict:
         confidence_scores.append(confidence)
 
     if predictor_hits:
-        hit_rate  = float(np.mean(predictor_hits))
-        # Calibración: penaliza alta confianza con error
+        hit_rate = float(np.mean(predictor_hits))
         calibration_errors = [
-            abs(conf - hit) * conf  # error ponderado por confianza
+            abs(conf - hit) * conf
             for conf, hit in zip(confidence_scores, predictor_hits)
         ]
         calibration_penalty = float(np.mean(calibration_errors))
     else:
-        # Sin trades propios → usar hit rates del evaluator como proxy
         if h_hit_rates:
             hit_rate            = float(np.mean(list(h_hit_rates.values())))
-            calibration_penalty = 0.1  # penalización neutral sin datos propios
+            calibration_penalty = 0.1
         else:
             hit_rate            = 0.5
             calibration_penalty = 0.1
 
-    # Bonus por H con mejor hit rate
     best_h_bonus = 0.0
     if h_hit_rates:
         best_h_rate  = max(h_hit_rates.values())
-        best_h_bonus = max(0, best_h_rate - 0.50) * 2  # bonus proporcional al exceso sobre 50%
+        best_h_bonus = max(0, best_h_rate - 0.50) * 2
 
     fitness = (hit_rate - 0.50) * 4 + best_h_bonus - calibration_penalty
 
     result = {
-        "genome_id":            genome_id,
-        "genome_type":          "predictor",
-        "fitness":              round(fitness, 4),
-        "status":               "ok",
-        "n_trades":             len(trades),
-        "hit_rate":             round(hit_rate, 4),
-        "calibration_penalty":  round(calibration_penalty, 4),
-        "best_h_bonus":         round(best_h_bonus, 4),
-        "h_hit_rates":          h_hit_rates,
-        "computed_at":          datetime.now(timezone.utc).isoformat(),
+        "genome_id":           genome_id,
+        "genome_type":         "predictor",
+        "fitness":             round(fitness, 4),
+        "status":              "ok",
+        "n_trades":            len(trades),
+        "hit_rate":            round(hit_rate, 4),
+        "calibration_penalty": round(calibration_penalty, 4),
+        "best_h_bonus":        round(best_h_bonus, 4),
+        "h_hit_rates":         h_hit_rates,
+        "computed_at":         datetime.now(timezone.utc).isoformat(),
     }
 
     path = FITNESS_DIR / f"{genome_id}_predictor.json"
@@ -336,12 +355,8 @@ def compute_combined_fitness(
     executor_genome_id: str,
 ) -> Dict:
     """
-    Fitness combinado predictor + executor.
-    El arena usa esto para decidir qué par promover.
-
-    Un buen sistema necesita AMBOS:
-    - Predictor que acierte la dirección
-    - Executor que sepa cuándo entrar y salir
+    [F3] Usa math.isnan() para detectar nan en e_fitness/p_fitness.
+    numpy evalúa nan < -0.5 como False, dejando pasar el nan al combined.
     """
     pred_fit = compute_predictor_fitness(predictor_genome_id)
     exec_fit = compute_executor_fitness(executor_genome_id)
@@ -349,11 +364,17 @@ def compute_combined_fitness(
     p_fitness = pred_fit.get("fitness", 0.0)
     e_fitness = exec_fit.get("fitness", 0.0)
 
-    # Ponderación: el executor tiene más impacto en el PnL real
+    # [F3] Reemplazar nan por 0.0 explícitamente antes de operar
+    if not _is_valid_return(p_fitness):
+        logger.warning(f"⚠️ p_fitness nan/inf para {predictor_genome_id} → usando 0.0")
+        p_fitness = 0.0
+    if not _is_valid_return(e_fitness):
+        logger.warning(f"⚠️ e_fitness nan/inf para {executor_genome_id} → usando 0.0")
+        e_fitness = 0.0
+
     combined = (p_fitness * 0.40) + (e_fitness * 0.60)
 
     # Penalización si uno de los dos es muy malo
-    # (no sirve tener buen predictor con mal executor ni viceversa)
     if p_fitness < -0.5 or e_fitness < -0.5:
         combined *= 0.7
         logger.warning(
@@ -395,7 +416,6 @@ def compute_combined_fitness(
 def rank_all_genomes() -> List[Dict]:
     """
     Lee todos los fitness guardados y los rankea.
-    Usado por arena.py para seleccionar los mejores.
     """
     if not FITNESS_DIR.exists():
         return []
@@ -436,12 +456,12 @@ def get_fitness_summary() -> Dict:
 
     champion = ranking[0]
     return {
-        "total_genomes":    len(ranking),
+        "total_genomes": len(ranking),
         "champion": {
-            "predictor_id":   champion.get("predictor_genome_id"),
-            "executor_id":    champion.get("executor_genome_id"),
-            "fitness":        champion.get("combined_fitness"),
-            "computed_at":    champion.get("computed_at"),
+            "predictor_id": champion.get("predictor_genome_id"),
+            "executor_id":  champion.get("executor_genome_id"),
+            "fitness":      champion.get("combined_fitness"),
+            "computed_at":  champion.get("computed_at"),
         },
         "top_3": [
             {
@@ -452,4 +472,5 @@ def get_fitness_summary() -> Dict:
             for r in ranking[:3]
         ],
         "status": "ok",
-    }
+  }
+  
