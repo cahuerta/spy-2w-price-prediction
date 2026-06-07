@@ -1,5 +1,5 @@
 # =========================================================
-# main.py — TRADING SUITE ENTERPRISE v2.9.3 PRODUCCIÓN
+# main.py — TRADING SUITE ENTERPRISE v2.9.4 PRODUCCIÓN
 # =========================================================
 # ✔ Runtime de trading (NO batch)
 # ✔ NO decide mercado
@@ -18,7 +18,12 @@
 #
 # v2.9.3:
 #   [M4] /internal/pipeline/last — agregada autenticación X-PIPELINE-KEY
-#        antes estaba sin protección, exponiendo configuración del pipeline
+#
+# v2.9.4:
+#   [M5] merge_tickers_on_startup: filtra tickers fantasma validando
+#        contra anchor_universe.json — tickers que no existen en el
+#        anchor universe se loggean como advertencia pero NO se agregan
+#        al universe de predicción (evita OPENs silenciosos ignorados).
 # =========================================================
 
 import os
@@ -29,7 +34,7 @@ import asyncio
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,12 +66,13 @@ class Config:
 
 config = Config()
 
-DATA_PATH            = config.DATA_PATH
-TICKERS_FILE         = DATA_PATH / "tickers.json"
-REPO_TICKERS_FILE    = Path(__file__).resolve().parent / "tickers.json"
-MARKET_CTX_FILE      = DATA_PATH / "market_context.json"
-SCREENER_FILE        = DATA_PATH / "screener_candidates.json"
-PIPELINE_AUDIT_FILE  = DATA_PATH / "last_pipeline.json"
+DATA_PATH           = config.DATA_PATH
+TICKERS_FILE        = DATA_PATH / "tickers.json"
+REPO_TICKERS_FILE   = Path(__file__).resolve().parent / "tickers.json"
+MARKET_CTX_FILE     = DATA_PATH / "market_context.json"
+SCREENER_FILE       = DATA_PATH / "screener_candidates.json"
+PIPELINE_AUDIT_FILE = DATA_PATH / "last_pipeline.json"
+ANCHOR_FILE         = Path(os.getenv("ANCHOR_FILE", str(Path(__file__).resolve().parent / "anchor_universe.json")))
 
 # =========================================================
 # LOGGING
@@ -92,9 +98,34 @@ def load_json(path: Path, default):
     return json.loads(path.read_text())
 
 # =========================================================
+# [M5] CARGAR ANCHOR UNIVERSE COMO REFERENCIA
+# =========================================================
+def _load_anchor_tickers() -> Set[str]:
+    """
+    [M5] Carga los tickers del anchor_universe.json como set de referencia.
+    Se usa para validar tickers en merge_tickers_on_startup.
+    Retorna set vacío si el archivo no existe — en ese caso no se filtra nada.
+    """
+    try:
+        if ANCHOR_FILE.exists():
+            data = json.loads(ANCHOR_FILE.read_text())
+            if isinstance(data, list):
+                tickers = {a["ticker"].upper() for a in data if "ticker" in a}
+                logger.info(f"⚓ Anchor reference: {len(tickers)} tickers")
+                return tickers
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo leer anchor_universe.json: {e}")
+    return set()
+
+# =========================================================
 # 🔥 MERGE DE TICKERS (STARTUP)
 # =========================================================
 def merge_tickers_on_startup():
+    """
+    [M5] Merge de tickers en startup con validación contra anchor_universe.
+    Tickers fantasma (no en anchor universe) se loggean pero no se agregan.
+    Si anchor_universe.json no existe, se comporta igual que antes (sin filtro).
+    """
     logger.info("🔧 Merging tickers on startup")
 
     disk_tickers: List[str] = load_json(TICKERS_FILE, [])
@@ -112,6 +143,22 @@ def merge_tickers_on_startup():
             base_tickers = []
     else:
         base_tickers = []
+
+    # [M5] Validar contra anchor universe
+    anchor_tickers = _load_anchor_tickers()
+
+    if anchor_tickers:
+        # Separar válidos de fantasma
+        valid_base   = [t for t in base_tickers if t.upper() in anchor_tickers]
+        phantom      = [t for t in base_tickers if t.upper() not in anchor_tickers]
+
+        if phantom:
+            logger.warning(
+                f"⚠️ Tickers fantasma ignorados ({len(phantom)}) — "
+                f"no están en anchor_universe.json: {phantom}"
+            )
+
+        base_tickers = valid_base
 
     merged = sorted(set(disk_tickers) | set(base_tickers))
 
@@ -138,15 +185,15 @@ def load_market_context() -> MarketOrchestrationContext:
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite v2.9.3 START")
+    logger.info("🚀 Trading Suite v2.9.4 START")
     merge_tickers_on_startup()
     start_scheduler()
     yield
-    logger.info("🛑 Trading Suite v2.9.3 STOP")
+    logger.info("🛑 Trading Suite v2.9.4 STOP")
 
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.9.3",
+    version="2.9.4",
     lifespan=lifespan,
 )
 
@@ -217,13 +264,6 @@ async def trading_run(request: Request):
 # =========================================================
 @app.post("/internal/trading/monitor-close")
 async def monitor_close(payload: Dict[str, Any], request: Request):
-    """
-    Cierra posiciones divergentes detectadas por el intraday tracker.
-    Llamado automáticamente por el scheduler cada hora 12:00-15:00 Chile.
-    También puede llamarse manualmente.
-
-    Body: {"tickers": ["GLW", "VZ"], "reason": "intraday_diverging"}
-    """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
@@ -237,14 +277,12 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
 
     orchestrator = TradingOrchestrator()
 
-    # Cargar posiciones en memoria para fallback de precio
     try:
         from portfolio_store import load_positions
         positions_snapshot = load_positions()
     except Exception:
         positions_snapshot = []
 
-    # Cargar alpha scores para registrar en Darwin
     try:
         import json as _json
         from pathlib import Path as _Path
@@ -280,7 +318,6 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
             except Exception:
                 pass
 
-            # ── DARWIN: capturar precio real de ejecución ──
             try:
                 from darwin_engine.trade_tracker import register_close
 
@@ -295,7 +332,6 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
                         or 0
                     )
 
-                # Fallback: precio en memoria pre-cierre
                 if exit_price <= 0:
                     exit_price = next(
                         (
@@ -317,7 +353,6 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
                 )
             except Exception as _de:
                 logger.warning(f"⚠️ darwin monitor-close {ticker}: {_de}")
-            # ───────────────────────────────────────────────
 
         except Exception as e:
             errors.append({"ticker": ticker, "error": str(e)})
@@ -337,11 +372,6 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
 # =========================================================
 @app.post("/internal/darwin/run")
 async def darwin_run(request: Request):
-    """
-    Ejecuta el ciclo evolutivo del Darwin Engine manualmente.
-    Body: {"dry_run": true}  → solo evalúa, no promueve
-    Body: {"dry_run": false} → ejecuta real (default)
-    """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
@@ -353,7 +383,6 @@ async def darwin_run(request: Request):
 
     results = {}
 
-    # Resolver trades pendientes
     try:
         from darwin_engine.trade_tracker import resolve_pending_trades
         resolved = resolve_pending_trades()
@@ -362,7 +391,6 @@ async def darwin_run(request: Request):
     except Exception as e:
         results["trades_resolved_error"] = str(e)
 
-    # Executor genome arena
     try:
         from darwin_engine.arena import run_evolution_cycle
         executor_result = run_evolution_cycle(dry_run=dry_run)
@@ -374,7 +402,6 @@ async def darwin_run(request: Request):
     except Exception as e:
         results["executor_error"] = str(e)
 
-    # Predictor arena H1-H10
     try:
         from darwin_engine.predictor_arena import run_predictor_evolution
         predictor_result = run_predictor_evolution(dry_run=dry_run)
@@ -394,16 +421,10 @@ async def darwin_run(request: Request):
     }
 
 # =========================================================
-# [M3] DARWIN STATUS — estado del Darwin Engine
+# [M3] DARWIN STATUS
 # =========================================================
 @app.get("/internal/darwin/status")
 async def darwin_status(request: Request):
-    """
-    Muestra el estado actual del Darwin Engine:
-    - Campeón activo (executor + predictores H1-H10)
-    - Trades acumulados / resueltos / PnL
-    - Hit rates por H
-    """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
 
@@ -460,7 +481,6 @@ async def internal_pipeline_last(request: Request):
 
 @app.get("/internal/pipeline/last")
 async def get_last_pipeline(request: Request):
-    # [M4] FIX v2.9.3: agregada autenticación — antes sin protección
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403, "Invalid pipeline key")
     if not PIPELINE_AUDIT_FILE.exists():
@@ -498,6 +518,7 @@ async def internal_positions(request: Request):
     from portfolio_store import load_positions
     return load_positions()
 
+
 # =========================================================
 # HEALTH
 # =========================================================
@@ -515,10 +536,6 @@ def root():
 
 @app.post("/internal/debug/fix-entry-dates")
 async def fix_entry_dates(request: Request):
-    """
-    Agrega entry_date estimada a posiciones que no la tienen.
-    Llamar una sola vez para corregir posiciones históricas.
-    """
     if request.headers.get("X-PIPELINE-KEY") != config.PIPELINE_KEY:
         raise HTTPException(403)
 
@@ -554,11 +571,7 @@ async def fix_entry_dates(request: Request):
             else:
                 skipped.append(ticker)
 
-        return {
-            "status":  "ok",
-            "fixed":   fixed,
-            "skipped": skipped,
-        }
+        return {"status": "ok", "fixed": fixed, "skipped": skipped}
 
     except Exception as e:
         return {"error": str(e)}
