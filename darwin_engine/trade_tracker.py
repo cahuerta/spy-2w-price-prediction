@@ -8,6 +8,14 @@ FIXES v1.1:
        → el orchestrator debe llamarlo SOLO después de fill confirmado
   [T3] resolve_pending_trades salta tickers europeos sin precio Alpaca
        → evita que queden pendientes para siempre
+
+FIX v1.2:
+  [T4] register_close valida exit_price > 0 antes de registrar —
+       antes el broker podía devolver exit_price=0.0 (bug pre-v3.3)
+       causando pnl_real_pct=-100% ficticio que contaminaba el
+       fitness del Darwin Engine con nan.
+  [T5] register_open valida entry_price > 0 y shares > 0 antes de
+       registrar — evita trades fantasma con datos vacíos.
 """
 
 import json
@@ -33,8 +41,6 @@ ALPACA_KEY    = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 
 # [T1] Tickers no ejecutables en Alpaca paper
-# Se mantienen en anchor_universe para cuando se migre a broker internacional
-# pero NO deben registrarse en Darwin (nunca se ejecutan → datos basura)
 ALPACA_UNSUPPORTED = {
     "OR.PA", "AIR.PA", "NOVN.SW", "ENB.TO", "MFC.TO",
     "IBE.MC", "SAN.MC", "DTE.DE", "NESN.SW", "RY.TO",
@@ -74,7 +80,6 @@ def _get_alpaca_client():
 
 def _get_price_at_date(ticker: str, target_date) -> Optional[float]:
     """Obtiene precio de cierre en una fecha específica desde Alpaca."""
-    # [T3] Saltar tickers no soportados
     if ticker.upper() in ALPACA_UNSUPPORTED:
         logger.info(f"⏭ _get_price_at_date skip {ticker} — no soportado en Alpaca")
         return None
@@ -110,10 +115,6 @@ def _get_price_at_date(ticker: str, target_date) -> Optional[float]:
 # ══════════════════════════════════════════════════════
 
 def _read_h_signals(ticker: str, entry_date) -> Dict[str, Any]:
-    """
-    Lee el JSON de predicción del día de entrada para obtener
-    la señal, confianza y retorno esperado de cada H.
-    """
     date_str  = entry_date.strftime("%Y-%m-%d")
     pred_path = PRED_DIR / ticker / f"{date_str}.json"
 
@@ -169,26 +170,31 @@ def register_open(
 ) -> Optional[Dict[str, Any]]:
     """
     Llamar desde trading_orchestrator SOLO después de confirmar fill.
-
-    [T1] Retorna None y no registra si el ticker no es ejecutable
-         en Alpaca paper (tickers europeos/canadienses).
-
-    IMPORTANTE: llamar solo cuando result.get("status") in ("executed", "filled")
     """
-
     # [T1] No registrar tickers no ejecutables en Alpaca
     ticker_upper = ticker.upper()
     if ticker_upper in ALPACA_UNSUPPORTED:
-        logger.info(
-            f"⏭ register_open skip {ticker} — "
-            f"no soportado en Alpaca paper (se registrará cuando se migre a broker internacional)"
-        )
+        logger.info(f"⏭ register_open skip {ticker} — no soportado en Alpaca paper")
         return None
 
-    # [T1] Detectar por sufijo europeo/canadiense aunque no esté en la lista
     unsupported_suffixes = (".PA", ".DE", ".SW", ".TO", ".MC", ".AS", ".MI", ".BR")
     if any(ticker_upper.endswith(s) for s in unsupported_suffixes):
         logger.info(f"⏭ register_open skip {ticker} — sufijo europeo/canadiense no soportado")
+        return None
+
+    # [T5] Validar datos de entrada
+    if not entry_price or float(entry_price) <= 0:
+        logger.error(
+            f"❌ register_open {ticker} entry_price={entry_price} inválido — "
+            f"trade no registrado (fill no confirmado o precio vacío)"
+        )
+        return None
+
+    if not shares or int(shares) <= 0:
+        logger.error(
+            f"❌ register_open {ticker} shares={shares} inválido — "
+            f"trade no registrado"
+        )
         return None
 
     now        = datetime.now(timezone.utc)
@@ -271,6 +277,14 @@ def register_close(
     if any(ticker_upper.endswith(s) for s in unsupported_suffixes):
         return None
 
+    # [T4] Validar exit_price antes de registrar
+    if exit_price is None or float(exit_price) <= 0:
+        logger.error(
+            f"❌ register_close {ticker} exit_price={exit_price} inválido — "
+            f"trade no registrado (evitar PnL=-100% ficticio en Darwin)"
+        )
+        return None
+
     trade = _find_open_trade(ticker)
     if not trade:
         logger.warning(f"⚠️ register_close: no se encontró trade abierto para {ticker}")
@@ -299,15 +313,15 @@ def register_close(
     days_held = (exit_date - entry_date_obj).days
 
     trade.update({
-        "status":               "closed_pending_resolution",
-        "exit_price":           round(exit_price, 4),
-        "exit_date":            str(exit_date),
-        "exit_timestamp":       now.isoformat(),
-        "reason_close":         reason,
-        "alpha_score_exit":     round(alpha_score, 4),
-        "days_held":            days_held,
-        "pnl_real_pct":         round(pnl_real_pct, 4),
-        "pnl_real_usd":         round(pnl_real_usd, 2),
+        "status":                "closed_pending_resolution",
+        "exit_price":            round(exit_price, 4),
+        "exit_date":             str(exit_date),
+        "exit_timestamp":        now.isoformat(),
+        "reason_close":          reason,
+        "alpha_score_exit":      round(alpha_score, 4),
+        "days_held":             days_held,
+        "pnl_real_pct":          round(pnl_real_pct, 4),
+        "pnl_real_usd":          round(pnl_real_usd, 2),
         "closed_before_horizon": days_held < horizon_days,
     })
 
@@ -351,13 +365,12 @@ def resolve_pending_trades() -> List[Dict]:
         if today < horizon_date:
             continue
 
-        ticker      = trade["ticker"]
+        ticker = trade["ticker"]
 
         # [T3] Saltar tickers europeos — nunca tendrán precio en Alpaca
         ticker_upper = ticker.upper()
         unsupported_suffixes = (".PA", ".DE", ".SW", ".TO", ".MC", ".AS", ".MI", ".BR")
         if ticker_upper in ALPACA_UNSUPPORTED or any(ticker_upper.endswith(s) for s in unsupported_suffixes):
-            # Marcar como resuelto con datos vacíos para no quedar pendiente siempre
             trade.update({
                 "status":              "resolved_unsupported",
                 "price_at_horizon":    None,
@@ -467,7 +480,7 @@ def get_tracker_summary() -> Dict[str, Any]:
     if not TRACKER_DIR.exists():
         return {"total": 0, "open": 0, "pending": 0, "resolved": 0}
 
-    counts  = {"open": 0, "closed_pending_resolution": 0, "resolved": 0}
+    counts   = {"open": 0, "closed_pending_resolution": 0, "resolved": 0}
     pnl_list = []
 
     for path in TRACKER_DIR.glob("*.json"):
@@ -477,18 +490,18 @@ def get_tracker_summary() -> Dict[str, Any]:
         if status == "resolved" and trade.get("pnl_real_pct") is not None:
             pnl_list.append(float(trade["pnl_real_pct"]))
 
-    avg_pnl  = float(np.mean(pnl_list))              if pnl_list else 0.0
-    total_pnl = float(np.sum(pnl_list))              if pnl_list else 0.0
-    win_rate  = float(np.mean([p > 0 for p in pnl_list])) if pnl_list else 0.0
+    avg_pnl   = float(np.mean(pnl_list))                    if pnl_list else 0.0
+    total_pnl = float(np.sum(pnl_list))                     if pnl_list else 0.0
+    win_rate  = float(np.mean([p > 0 for p in pnl_list]))   if pnl_list else 0.0
 
     return {
-        "total":          sum(counts.values()),
-        "open":           counts.get("open", 0),
-        "pending":        counts.get("closed_pending_resolution", 0),
-        "resolved":       counts.get("resolved", 0),
-        "avg_pnl_pct":    round(avg_pnl,   4),
-        "total_pnl_pct":  round(total_pnl,  4),
-        "win_rate":       round(win_rate,   4),
-        "n_pnl_samples":  len(pnl_list),
-      }
+        "total":         sum(counts.values()),
+        "open":          counts.get("open", 0),
+        "pending":       counts.get("closed_pending_resolution", 0),
+        "resolved":      counts.get("resolved", 0),
+        "avg_pnl_pct":   round(avg_pnl,   4),
+        "total_pnl_pct": round(total_pnl,  4),
+        "win_rate":      round(win_rate,   4),
+        "n_pnl_samples": len(pnl_list),
+  }
   
