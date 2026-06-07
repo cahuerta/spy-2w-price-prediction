@@ -1,5 +1,5 @@
 # =========================================================
-# broker.py — V3.2 PURE EXECUTOR (NO SIZING)
+# broker.py — V3.3 PURE EXECUTOR (NO SIZING)
 # =========================================================
 #
 # FIX v3.1:
@@ -12,6 +12,18 @@
 #        prefijo "sys_" para identificar órdenes del sistema
 #        vs órdenes manuales en análisis posteriores.
 #        Formato: sys_{TICKER}_{timestamp_ms}
+#
+# FIX v3.3:
+#   [B5] execute_decision() CLOSE: close_position() devuelve un
+#        objeto Order de Alpaca pero el código anterior solo
+#        extraía el id — nunca capturaba filled_avg_price.
+#        El dict retornado no tenía precio → Darwin tracker
+#        recibía exit_price=0.0 → PnL real=-100% en todos
+#        los cierres (monitor-close y trading_orchestrator).
+#        Ahora se espera el fill con polling (igual que BUY)
+#        y se retorna filled_avg_price + price en el dict.
+#        Fallback: si el polling no resuelve en 5s, se busca
+#        el precio actual de la posición antes del cierre.
 # =========================================================
 
 import os
@@ -63,7 +75,7 @@ class TradingEngine:
             raise ValueError("Faltan credenciales de Alpaca")
 
         self.client = TradingClient(self.key, self.secret, paper=self.paper)
-        logger.info(f"🔌 Broker V3.2 conectado ({'PAPER' if self.paper else 'LIVE'})")
+        logger.info(f"🔌 Broker V3.3 conectado ({'PAPER' if self.paper else 'LIVE'})")
 
     def is_executable(self, ticker: str) -> bool:
         return ticker is not None and not ticker.upper().endswith(".SN")
@@ -156,14 +168,14 @@ class TradingEngine:
                 return await self._place_market_order(ticker, shares, OrderSide.BUY)
 
             elif action == "CLOSE":
-                res = self.client.close_position(ticker)
-                logger.info(f"⚰️ CLOSED position for {ticker}")
-                return {"status": "executed", "order_id": getattr(res, "id", "sync_close")}
+                # [B5] FIX v3.3: capturar filled_avg_price del cierre
+                return await self._close_position(ticker)
 
             elif action == "ROTATE":
                 close_ticker = decision.get("close_ticker", "").upper()
                 if close_ticker:
-                    self.client.close_position(close_ticker)
+                    # [B5] También usar _close_position para ROTATE
+                    await self._close_position(close_ticker)
 
                 if shares > 0:
                     return await self._place_market_order(ticker, shares, OrderSide.BUY)
@@ -172,6 +184,64 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"❌ EXECUTION ERROR for {ticker}: {str(e)}")
             return {"status": "error", "message": str(e)}
+
+    # =========================================================
+    # [B5] CLOSE POSITION — con polling de filled_avg_price
+    # =========================================================
+    async def _close_position(self, ticker: str) -> Dict[str, Any]:
+        """
+        [B5] Cierra una posición y espera el fill para capturar
+        el precio real de ejecución. Antes, close_position()
+        retornaba un Order pero solo se extraía el id — el
+        filled_avg_price nunca llegaba al Darwin tracker,
+        causando exit_price=0.0 y PnL real=-100%.
+        """
+        # Capturar precio pre-cierre como fallback (antes de cerrar)
+        pre_close_price = 0.0
+        try:
+            positions = self.client.get_all_positions()
+            for p in positions:
+                if p.symbol.upper() == ticker.upper():
+                    pre_close_price = float(p.current_price) if hasattr(p, "current_price") and p.current_price else float(p.avg_entry_price)
+                    break
+        except Exception as e:
+            logger.warning(f"⚠️ {ticker} no se pudo capturar precio pre-cierre: {e}")
+
+        # Ejecutar cierre
+        res = self.client.close_position(ticker)
+        order_id = getattr(res, "id", None)
+        logger.info(f"⚰️ CLOSE enviado {ticker} | order_id={order_id} | pre_price=${pre_close_price:.2f}")
+
+        # Polling para capturar filled_avg_price
+        filled_price = None
+        if order_id:
+            for attempt in range(5):
+                await asyncio.sleep(1)
+                try:
+                    order = self.client.get_order_by_id(order_id)
+                    if order.status == OrderStatus.FILLED:
+                        if order.filled_avg_price:
+                            filled_price = float(order.filled_avg_price)
+                        logger.info(
+                            f"⚰️ CLOSED {ticker} FILLED at "
+                            f"${filled_price:.2f}" if filled_price else
+                            f"⚰️ CLOSED {ticker} FILLED (sin precio)"
+                        )
+                        break
+                except Exception as e:
+                    logger.warning(f"⚠️ {ticker} polling cierre intento {attempt+1}: {e}")
+
+        # Fallback al precio pre-cierre si el polling no resolvió
+        if not filled_price and pre_close_price > 0:
+            filled_price = pre_close_price
+            logger.info(f"⚰️ {ticker} usando precio pre-cierre como fallback: ${filled_price:.2f}")
+
+        return {
+            "status":           "executed",
+            "order_id":         str(order_id) if order_id else "sync_close",
+            "filled_avg_price": filled_price,
+            "price":            filled_price,
+        }
 
     # =========================================================
     # [B4] PLACE MARKET ORDER — con client_order_id del sistema
@@ -201,6 +271,7 @@ class TradingEngine:
                     "status":           "executed",
                     "order_id":         str(order.id),
                     "client_order_id":  client_id,
+                    "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
                     "price":            float(order.filled_avg_price) if order.filled_avg_price else None,
                 }
 
