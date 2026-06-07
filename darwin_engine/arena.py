@@ -1,28 +1,18 @@
 """
 darwin_engine/arena.py
 ━━━━━━━━━━━━━━━━━━━━━━
-ARCHIVO NUEVO — darwin_engine/arena.py
-
-Orquesta el ciclo evolutivo completo del Darwin Engine.
-
-Ciclo semanal (viernes post-market):
-  1. Cargar todos los genomas activos (producción + shadow)
-  2. Calcular fitness real de cada uno (pnl_fitness.py)
-  3. Rankear por fitness combinado
-  4. Promover el campeón a producción si supera al actual
-  5. Generar nueva generación (mutator.py)
-  6. Guardar nueva generación en shadow
-  7. Escribir campeón al repo vía GitHub API
-  8. Registrar historial evolutivo
-
-Shadow mode:
-  - Variantes nuevas evalúan pero NO ejecutan órdenes reales
-  - Solo después de N trades resueltos compiten contra producción
-  - El campeón actual nunca se reemplaza sin superar en fitness
+FIX v1.1:
+  [F4] _select_champion: math.isfinite() explícito para
+       champion_fitness e improvement — numpy evalúa
+       nan >= umbral como False, dejando al campeón con
+       fitness=nan inamovible indefinidamente.
+       Ahora nan → 0.0 para comparación, permitiendo que
+       candidatos con datos reales puedan desbancarlo.
 """
 
 import json
 import logging
+import math
 import os
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -44,17 +34,16 @@ from darwin_engine.trade_tracker import get_resolved_trades, get_tracker_summary
 
 logger = logging.getLogger("arena")
 
-DATA_PATH    = Path(os.getenv("DATA_PATH", "/data"))
-ARENA_DIR    = DATA_PATH / "darwin" / "arena"
+DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
+ARENA_DIR     = DATA_PATH / "darwin" / "arena"
 CHAMPION_FILE = DATA_PATH / "darwin" / "champion.json"
 HISTORY_FILE  = DATA_PATH / "darwin" / "evolution_history.json"
 
-# Configuración del arena
-MIN_TRADES_TO_COMPETE  = int(os.getenv("DARWIN_MIN_TRADES",   "10"))
-MIN_IMPROVEMENT_PCT    = float(os.getenv("DARWIN_MIN_IMPROVE", "0.05"))
-MAX_SHADOW_GENOMES     = int(os.getenv("DARWIN_MAX_SHADOW",    "8"))
-GENERATION_SIZE        = int(os.getenv("DARWIN_GEN_SIZE",      "5"))
-GITHUB_ENABLED         = os.getenv("GITHUB_TOKEN") is not None
+MIN_TRADES_TO_COMPETE = int(os.getenv("DARWIN_MIN_TRADES",   "10"))
+MIN_IMPROVEMENT_PCT   = float(os.getenv("DARWIN_MIN_IMPROVE", "0.05"))
+MAX_SHADOW_GENOMES    = int(os.getenv("DARWIN_MAX_SHADOW",    "8"))
+GENERATION_SIZE       = int(os.getenv("DARWIN_GEN_SIZE",      "5"))
+GITHUB_ENABLED        = os.getenv("GITHUB_TOKEN") is not None
 
 
 # ══════════════════════════════════════════════════════
@@ -79,8 +68,7 @@ def _append_history(entry: Dict) -> None:
     history = _load_json(HISTORY_FILE)
     events  = history.get("events", [])
     events.append(entry)
-    # Mantener solo los últimos 200 eventos
-    history["events"]     = events[-200:]
+    history["events"]      = events[-200:]
     history["last_update"] = datetime.now(timezone.utc).isoformat()
     _save_json(HISTORY_FILE, history)
 
@@ -90,10 +78,6 @@ def _append_history(entry: Dict) -> None:
 # ══════════════════════════════════════════════════════
 
 def _write_champion_to_github(genome: ExecutorGenome) -> bool:
-    """
-    Escribe el genome campeón al repo vía GitHub API.
-    Solo se ejecuta si GITHUB_TOKEN está configurado.
-    """
     if not GITHUB_ENABLED:
         logger.info("⚠️ GitHub no configurado — campeón solo guardado en disco")
         return False
@@ -122,7 +106,6 @@ def _write_champion_to_github(genome: ExecutorGenome) -> bool:
         content = json.dumps(genome.to_dict(), indent=2, ensure_ascii=False)
         encoded = base64.b64encode(content.encode()).decode()
 
-        # Obtener SHA actual si el archivo existe
         sha = None
         r   = httpx.get(url, headers=headers, params={"ref": branch})
         if r.status_code == 200:
@@ -153,11 +136,6 @@ def _write_champion_to_github(genome: ExecutorGenome) -> bool:
 # ══════════════════════════════════════════════════════
 
 def _load_all_active_genomes() -> Tuple[Optional[ExecutorGenome], List[ExecutorGenome]]:
-    """
-    Retorna (champion, shadow_list).
-    champion: el genoma actualmente en producción
-    shadow_list: genomas en evaluación shadow
-    """
     champion_data = _load_json(CHAMPION_FILE)
     champion      = ExecutorGenome.from_dict(champion_data) if champion_data else None
 
@@ -165,7 +143,6 @@ def _load_all_active_genomes() -> Tuple[Optional[ExecutorGenome], List[ExecutorG
         logger.info("🆕 Sin campeón previo — cargando o creando default")
         champion = ExecutorGenome.load_or_default("executor_v1")
 
-    # Cargar todos los genomas en disco
     shadow = []
     if GENOME_DIR.exists():
         for path in GENOME_DIR.glob("executor_v*.json"):
@@ -193,10 +170,6 @@ def _evaluate_all_genomes(
     shadow: List[ExecutorGenome],
     predictor_genome_id: str = "predictor_v1",
 ) -> Dict[str, Dict]:
-    """
-    Calcula fitness de todos los genomas activos.
-    Retorna dict {genome_id: fitness_result}
-    """
     results = {}
 
     all_genomes = [champion] + shadow
@@ -208,8 +181,9 @@ def _evaluate_all_genomes(
             )
             results[genome.genome_id] = fitness_result
 
-            # Actualizar fitness en el objeto
-            genome.fitness = fitness_result.get("combined_fitness", 0.0)
+            combined = fitness_result.get("combined_fitness", 0.0)
+            # [F4] No persistir nan en el objeto genome
+            genome.fitness = combined if (combined is not None and math.isfinite(combined)) else 0.0
             genome.save()
 
         except Exception as e:
@@ -223,7 +197,7 @@ def _evaluate_all_genomes(
 
 
 # ══════════════════════════════════════════════════════
-# SELECCIÓN: ¿PROMOVER NUEVO CAMPEÓN?
+# SELECCIÓN: ¿PROMOVER NUEVO CAMPEÓN?  [F4]
 # ══════════════════════════════════════════════════════
 
 def _select_champion(
@@ -232,18 +206,25 @@ def _select_champion(
     fitness_results: Dict[str, Dict],
 ) -> Tuple[ExecutorGenome, bool]:
     """
-    Decide si promover un nuevo campeón.
-
-    Reglas:
-    1. El candidato debe tener al menos MIN_TRADES_TO_COMPETE trades resueltos
-    2. Debe superar al campeón actual en al menos MIN_IMPROVEMENT_PCT
-    3. Si el campeón actual no tiene datos → cualquier candidato con datos gana
-
-    Retorna (nuevo_campeón, fue_promovido)
+    [F4] math.isfinite() explícito — numpy evalúa nan >= umbral
+    como False, dejando al campeón inamovible cuando fitness=nan.
+    Ahora nan → 0.0 para comparación.
     """
-    champion_fitness = fitness_results.get(
+    raw_champion_fitness = fitness_results.get(
         current_champion.genome_id, {}
     ).get("combined_fitness", 0.0)
+
+    # [F4] nan/inf → 0.0
+    champion_fitness = (
+        raw_champion_fitness
+        if (raw_champion_fitness is not None and math.isfinite(raw_champion_fitness))
+        else 0.0
+    )
+    if raw_champion_fitness != champion_fitness:
+        logger.warning(
+            f"⚠️ {current_champion.genome_id} fitness={raw_champion_fitness} → "
+            f"tratado como {champion_fitness} para comparación"
+        )
 
     champion_trades = len(
         get_resolved_trades(executor_genome_id=current_champion.genome_id)
@@ -256,15 +237,21 @@ def _select_champion(
         if candidate.genome_id == current_champion.genome_id:
             continue
 
-        cand_fitness = fitness_results.get(
+        raw_cand_fitness = fitness_results.get(
             candidate.genome_id, {}
         ).get("combined_fitness", 0.0)
+
+        # [F4] Candidato con nan no puede ganar
+        if raw_cand_fitness is None or not math.isfinite(raw_cand_fitness):
+            logger.warning(
+                f"⚠️ {candidate.genome_id} fitness={raw_cand_fitness} → saltado"
+            )
+            continue
 
         cand_trades = len(
             get_resolved_trades(executor_genome_id=candidate.genome_id)
         )
 
-        # Mínimo de trades para competir
         if cand_trades < MIN_TRADES_TO_COMPETE:
             logger.info(
                 f"⏳ {candidate.genome_id} insuficientes trades "
@@ -272,17 +259,15 @@ def _select_champion(
             )
             continue
 
-        if cand_fitness > best_fitness:
-            best_fitness   = cand_fitness
+        if raw_cand_fitness > best_fitness:
+            best_fitness   = raw_cand_fitness
             best_candidate = candidate
 
     if best_candidate is None:
         logger.info(f"👑 Campeón actual se mantiene: {current_champion.genome_id}")
         return current_champion, False
 
-    # ¿El candidato supera al campeón en suficiente margen?
     if champion_trades < MIN_TRADES_TO_COMPETE:
-        # Campeón sin datos → promover candidato con datos
         logger.info(
             f"🔄 Promoviendo {best_candidate.genome_id} "
             f"(campeón sin datos suficientes)"
@@ -311,20 +296,15 @@ def _select_champion(
 # ══════════════════════════════════════════════════════
 
 def _build_fitness_context() -> Dict:
-    """
-    Construye el contexto de métricas para el mutador.
-    Lee del evaluator y del tracker para sesgar las mutaciones.
-    """
     context = {}
 
-    # Hit rate de COMPRA desde evaluaciones existentes
     try:
-        eval_dir = DATA_PATH / "evaluations"
+        eval_dir     = DATA_PATH / "evaluations"
         compra_hits  = 0
         compra_total = 0
 
         if eval_dir.exists():
-            for ticker_dir in list(eval_dir.iterdir())[:50]:  # muestra de 50
+            for ticker_dir in list(eval_dir.iterdir())[:50]:
                 if not ticker_dir.is_dir():
                     continue
                 for ef in list(ticker_dir.glob("*.json"))[-5:]:
@@ -340,7 +320,6 @@ def _build_fitness_context() -> Dict:
     except Exception as e:
         logger.debug(f"fitness_context compra: {e}")
 
-    # Oportunidad perdida promedio desde tracker
     try:
         resolved = get_resolved_trades(last_n=50)
         oportunidades = [
@@ -355,10 +334,13 @@ def _build_fitness_context() -> Dict:
     except Exception as e:
         logger.debug(f"fitness_context oportunidad: {e}")
 
-    # Drawdown desde tracker
     try:
         resolved = get_resolved_trades(last_n=100)
-        returns  = [float(t.get("pnl_real_pct") or 0) for t in resolved]
+        returns  = [
+            float(t.get("pnl_real_pct") or 0)
+            for t in resolved
+            if t.get("pnl_real_pct") is not None and math.isfinite(float(t.get("pnl_real_pct") or 0))
+        ]
         if returns:
             equity = np.cumprod(1 + np.array(returns) / 100)
             peak   = np.maximum.accumulate(equity)
@@ -379,23 +361,13 @@ def run_evolution_cycle(
     predictor_genome_id: str = "predictor_v1",
     dry_run: bool = False,
 ) -> Dict:
-    """
-    Ejecuta el ciclo evolutivo completo.
-
-    Args:
-        predictor_genome_id: ID del predictor genome activo
-        dry_run: si True, evalúa pero no promueve ni escribe al repo
-
-    Returns:
-        Resumen del ciclo para logging y dashboard
-    """
     start_time = datetime.now(timezone.utc)
     logger.info("=" * 60)
     logger.info("🧬 DARWIN ENGINE — CICLO EVOLUTIVO")
     logger.info(f"   {start_time.strftime('%Y-%m-%d %H:%M UTC')}")
     logger.info("=" * 60)
 
-    # ── Paso 1: Cargar genomas ────────────────────────
+    # Paso 1: Cargar genomas
     champion, shadow = _load_all_active_genomes()
     tracker_summary  = get_tracker_summary()
 
@@ -405,41 +377,35 @@ def run_evolution_cycle(
         f"resueltos={tracker_summary['resolved']}"
     )
 
-    # ── Paso 2: Evaluar fitness ───────────────────────
-    all_genomes    = [champion] + shadow
-    fitness_results = _evaluate_all_genomes(
-        champion, shadow, predictor_genome_id
-    )
+    # Paso 2: Evaluar fitness
+    all_genomes     = [champion] + shadow
+    fitness_results = _evaluate_all_genomes(champion, shadow, predictor_genome_id)
 
-    # Rankear
     ranked = sorted(
         all_genomes,
-        key=lambda g: fitness_results.get(g.genome_id, {}).get("combined_fitness", float("-inf")),
+        key=lambda g: (
+            fitness_results.get(g.genome_id, {}).get("combined_fitness") or float("-inf")
+        ),
         reverse=True,
     )
 
     logger.info("🏆 Ranking actual:")
     for i, g in enumerate(ranked[:5]):
-        fit = fitness_results.get(g.genome_id, {}).get("combined_fitness", 0)
+        fit    = fitness_results.get(g.genome_id, {}).get("combined_fitness", 0)
         trades = len(get_resolved_trades(executor_genome_id=g.genome_id))
         logger.info(f"   {i+1}. {g.genome_id} | fitness={fit:.4f} | trades={trades}")
 
-    # ── Paso 3: Seleccionar campeón ───────────────────
-    new_champion, was_promoted = _select_champion(
-        champion, shadow, fitness_results
-    )
+    # Paso 3: Seleccionar campeón
+    new_champion, was_promoted = _select_champion(champion, shadow, fitness_results)
 
-    # ── Paso 4: Promover si corresponde ──────────────
+    # Paso 4: Promover si corresponde
     github_written = False
     if was_promoted and not dry_run:
-        # Guardar nuevo campeón
         _save_json(CHAMPION_FILE, new_champion.to_dict())
         logger.info(f"👑 Nuevo campeón guardado: {new_champion.genome_id}")
-
-        # Escribir al repo
         github_written = _write_champion_to_github(new_champion)
 
-    # ── Paso 5: Generar nueva generación ─────────────
+    # Paso 5: Generar nueva generación
     fitness_context = _build_fitness_context()
     new_generation  = generate_next_generation(
         ranked_genomes  = ranked,
@@ -447,11 +413,9 @@ def run_evolution_cycle(
         fitness_context = fitness_context,
     )
 
-    # ── Paso 6: Guardar nueva generación en shadow ───
+    # Paso 6: Guardar nueva generación en shadow
     if not dry_run:
-        # Limpiar shadow viejos con fitness bajo si hay demasiados
         _prune_shadow_genomes(shadow, fitness_results)
-
         for child in new_generation:
             child.save()
             logger.info(
@@ -459,7 +423,7 @@ def run_evolution_cycle(
                 f"(gen={child.generation} padre={child.data.get('parent_ids')})"
             )
 
-    # ── Paso 7: Registrar historial ───────────────────
+    # Paso 7: Registrar historial
     cycle_duration = (datetime.now(timezone.utc) - start_time).total_seconds()
 
     cycle_summary = {
@@ -505,22 +469,18 @@ def _prune_shadow_genomes(
     shadow: List[ExecutorGenome],
     fitness_results: Dict,
 ) -> None:
-    """
-    Elimina genomas shadow con bajo fitness si hay demasiados.
-    Mantiene siempre los mejores MAX_SHADOW_GENOMES.
-    """
     if len(shadow) <= MAX_SHADOW_GENOMES:
         return
 
-    # Ordenar por fitness
     ranked_shadow = sorted(
         shadow,
-        key=lambda g: fitness_results.get(g.genome_id, {}).get("combined_fitness", float("-inf")),
+        key=lambda g: (
+            fitness_results.get(g.genome_id, {}).get("combined_fitness") or float("-inf")
+        ),
         reverse=True,
     )
 
-    # Archivar los peores
-    to_archive = ranked_shadow[MAX_SHADOW_GENOMES:]
+    to_archive  = ranked_shadow[MAX_SHADOW_GENOMES:]
     archive_dir = GENOME_DIR / "archived"
     archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -540,13 +500,12 @@ def _prune_shadow_genomes(
 # ══════════════════════════════════════════════════════
 
 def get_arena_status() -> Dict:
-    """Resumen del estado actual del Darwin Engine. Para el dashboard."""
     champion_data = _load_json(CHAMPION_FILE)
     history       = _load_json(HISTORY_FILE)
     tracker_sum   = get_tracker_summary()
     fitness_sum   = get_fitness_summary()
 
-    events = history.get("events", [])
+    events     = history.get("events", [])
     promotions = [e for e in events if e.get("was_promoted")]
 
     return {
@@ -562,8 +521,8 @@ def get_arena_status() -> Dict:
             "last_cycle":       events[-1].get("timestamp") if events else None,
             "last_promotion":   promotions[-1].get("timestamp") if promotions else None,
         },
-        "tracker":   tracker_sum,
-        "fitness":   fitness_sum,
+        "tracker": tracker_sum,
+        "fitness": fitness_sum,
         "config": {
             "min_trades_to_compete": MIN_TRADES_TO_COMPETE,
             "min_improvement_pct":   MIN_IMPROVEMENT_PCT,
@@ -574,8 +533,16 @@ def get_arena_status() -> Dict:
     }
 
 
+def get_champion() -> Optional[ExecutorGenome]:
+    """Retorna el genome campeón actual. Para dashboard y status."""
+    champion_data = _load_json(CHAMPION_FILE)
+    if champion_data:
+        return ExecutorGenome.from_dict(champion_data)
+    return ExecutorGenome.load_or_default("executor_v1")
+
+
 # ══════════════════════════════════════════════════════
-# CLI — para ejecutar manualmente o desde cron
+# CLI
 # ══════════════════════════════════════════════════════
 
 if __name__ == "__main__":
