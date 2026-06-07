@@ -344,7 +344,7 @@ class TradingOrchestrator:
     # =========================================================
     # RUN PRINCIPAL v4.5
     # =========================================================
-        async def run(
+    async def run(
         self,
         market_ctx: Dict[str, Any],
         signals: Dict = None,
@@ -749,7 +749,7 @@ class TradingOrchestrator:
 
     # =========================================================
     # PREVIEW EXECUTABILITY
-    # =========================================================
+        # =========================================================
     async def preview_executability(self, market_ctx: Dict) -> Dict:
         positions  = self._enrich_positions_with_price(load_positions())
         alpha_data = self._load_last_alpha()
@@ -815,4 +815,17 @@ class TradingOrchestrator:
             elif mode == "defensive":
                 pm  = PMDefensive()
                 raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
-    
+                if isinstance(raw, list):
+                    decisions.extend(
+                        [r if isinstance(r, dict) else r.to_dict() for r in raw]
+                    )
+                elif isinstance(raw, dict):
+                    decisions.extend(raw.get("decisions", []))
+            else:
+                pm  = PMNeutral()
+                raw = pm.evaluate_portfolio(positions)
+                decisions.extend(raw.get("decisions", []))
+        except Exception as e:
+            logger.error(f"PM error: {e}")
+        return decisions
+        
