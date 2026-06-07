@@ -24,9 +24,29 @@ except ImportError:
 logger = logging.getLogger("trading_orchestrator")
 logging.basicConfig(level=logging.INFO)
 
-DATA_PATH   = Path(os.getenv("DATA_PATH", "/data"))
-ALPHA_FILE  = DATA_PATH / "alpha_last.json"
-ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
+DATA_PATH    = Path(os.getenv("DATA_PATH", "/data"))
+ALPHA_FILE   = DATA_PATH / "alpha_last.json"
+ANCHOR_FILE  = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
+CHAMPION_FILE = DATA_PATH / "darwin" / "champion.json"
+
+
+def _load_active_genome_ids() -> tuple:
+    """
+    [FIX] Lee el genome_id real del campeón desde disco.
+    Antes estaba hardcodeado como "executor_v1" / "predictor_v1"
+    → el campeón nunca acumulaba trades → siempre insufficient_data
+    → nunca se promovía ningún candidato.
+    Retorna (executor_genome_id, predictor_genome_id).
+    """
+    try:
+        if CHAMPION_FILE.exists():
+            data = json.loads(CHAMPION_FILE.read_text())
+            exec_id = data.get("genome_id", "executor_v1")
+            pred_id = data.get("predictor_genome_id", "predictor_v1")
+            return exec_id, pred_id
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo leer champion.json: {e} → usando defaults")
+    return "executor_v1", "predictor_v1"
 
 
 class TradingOrchestrator:
@@ -45,7 +65,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.3 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.4 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
 
     async def _get_real_capital(self) -> float:
         try:
@@ -232,8 +252,8 @@ class TradingOrchestrator:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
-    # RUN PRINCIPAL v4.3
-    # =========================================================
+    # RUN PRINCIPAL v4.4
+        # =========================================================
     async def run(
         self,
         market_ctx: Dict[str, Any],
@@ -242,9 +262,13 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.3 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.4 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
+
+        # [FIX] Leer genome_id real del campeón una sola vez por run
+        executor_genome_id, predictor_genome_id = _load_active_genome_ids()
+        logger.info(f"🧬 Genomas activos | executor={executor_genome_id} predictor={predictor_genome_id}")
 
         if hasattr(self.broker, "sync_positions_from_broker"):
             sync_result = self.broker.sync_positions_from_broker()
@@ -343,7 +367,6 @@ class TradingOrchestrator:
 
             for order in closes[:self.daily_limit]:
                 try:
-                    # v4.3 FIX: capturar result para obtener filled_avg_price
                     result = await asyncio.wait_for(
                         self.broker.execute_decision(order), timeout=30
                     )
@@ -357,7 +380,6 @@ class TradingOrchestrator:
                                 order["ticker"], {}
                             ).get("alpha_score", 0.0)
 
-                            # v4.3 FIX: capturar precio real de ejecución
                             exit_price = 0.0
                             if result and hasattr(result, "filled_avg_price") and result.filled_avg_price:
                                 exit_price = float(result.filled_avg_price)
@@ -369,7 +391,6 @@ class TradingOrchestrator:
                                     or 0
                                 )
 
-                            # Fallback: precio en memoria pre-cierre
                             if exit_price <= 0:
                                 exit_price = next(
                                     (
@@ -523,23 +544,30 @@ class TradingOrchestrator:
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
 
-                # ── DARWIN: registrar apertura ────────────────────
+                # ── DARWIN: registrar apertura con genome_id real ─
                 if DARWIN_TRACKING:
                     try:
+                        # [FIX] Usar genome_id del campeón real, no hardcodeado
                         register_open(
                             ticker              = order["ticker"],
                             entry_price         = float(order.get("entry_price") or 0),
                             shares              = int(order.get("shares") or 0),
                             reason              = order.get("reason", "UNKNOWN"),
                             alpha_score         = float(order.get("alpha") or 0),
-                            executor_genome_id  = "executor_v1",
-                            predictor_genome_id = "predictor_v1",
+                            executor_genome_id  = executor_genome_id,
+                            predictor_genome_id = predictor_genome_id,
+                        )
+                        logger.info(
+                            f"📝 TRADE OPEN registrado | {order['ticker']} | "
+                            f"entrada=${order.get('entry_price', 0):.2f} | "
+                            f"dominante=? | horizonte=?d"
                         )
                     except Exception as _te:
                         logger.warning(f"⚠️ darwin open {order['ticker']}: {_te}")
                 # ─────────────────────────────────────────────────
 
-                if result.get("status") in ("executed", "pending"):
+                # Solo registrar entry_date si fill confirmado
+                if result.get("status") == "executed":
                     try:
                         from positions_meta import set_entry_date
                         set_entry_date(order["ticker"])
@@ -676,3 +704,4 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
+        
