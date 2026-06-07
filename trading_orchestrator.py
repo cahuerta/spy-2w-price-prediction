@@ -290,11 +290,24 @@ class TradingOrchestrator:
                 continue
 
             price = None
-            if get_last_price_from_cache:
-                try:
-                    price = get_last_price_from_cache(ticker)
-                except Exception:
-                    pass
+
+            # [F7] Intentar precio actual del broker primero — evita usar precio stale
+            # del PM que puede tener diferencia de segundos vs ejecución real
+            try:
+                broker_data = self.broker.get_positions()
+                if broker_data and ticker in broker_data:
+                    bp = broker_data[ticker].get("current_price") or broker_data[ticker].get("price_now")
+                    if bp and float(bp) > 0:
+                        price = float(bp)
+            except Exception:
+                pass
+
+            if not price or float(price) <= 0:
+                if get_last_price_from_cache:
+                    try:
+                        price = get_last_price_from_cache(ticker)
+                    except Exception:
+                        pass
 
             if not price or float(price) <= 0:
                 price = o.get("entry_price") or o.get("price_now")
@@ -343,7 +356,7 @@ class TradingOrchestrator:
                 logger.info(f"🗑 Órdenes canceladas para {ticker}")
             except Exception as e:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
-
+        
     # =========================================================
     # RUN PRINCIPAL v4.5
     # =========================================================
@@ -359,7 +372,9 @@ class TradingOrchestrator:
 
         anchor_tickers = self._load_anchor_tickers()
 
-        # [FIX] Leer genome_id real del campeón una sola vez por run
+        # [FIX][F9] Leer genome_id real del campeón en cada run()
+        # Garantiza que si Darwin promovió un nuevo campeón entre runs,
+        # los trades nuevos se atribuyen al genoma correcto
         executor_genome_id, predictor_genome_id = _load_active_genome_ids()
         logger.info(f"🧬 Genomas activos | executor={executor_genome_id} predictor={predictor_genome_id}")
 
@@ -375,18 +390,44 @@ class TradingOrchestrator:
         positions = load_positions()
 
         if len(positions) == 0:
+            # [F5] Broker timeout → intentar sync, pero si falla usar disco stale
+            # No quedarse con [] cuando el broker está caído temporalmente
             logger.warning("⚠️ positions.json vacío → fallback broker")
             if hasattr(self.broker, "get_positions"):
-                raw = self.broker.get_positions()
-                if isinstance(raw, dict):
-                    positions = list(raw.values())
-                elif isinstance(raw, list):
-                    positions = raw
-                else:
-                    positions = []
-                if positions:
-                    save_positions(positions)
-                    logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
+                try:
+                    raw = self.broker.get_positions()
+                    if isinstance(raw, dict):
+                        positions = list(raw.values())
+                    elif isinstance(raw, list):
+                        positions = raw
+                    else:
+                        positions = []
+                    if positions:
+                        save_positions(positions)
+                        logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
+                    else:
+                        # Broker devolvió vacío — leer disco como último recurso
+                        from pathlib import Path as _P
+                        import json as _j
+                        _disk = DATA_PATH / "positions.json"
+                        if _disk.exists():
+                            _raw = _j.loads(_disk.read_text())
+                            if _raw:
+                                positions = _raw if isinstance(_raw, list) else [{"ticker": t, **v} for t, v in _raw.items()]
+                                logger.warning(f"⚠️ Broker vacío → usando disco stale: {len(positions)} posiciones")
+                except Exception as e:
+                    logger.error(f"❌ Broker get_positions falló: {e} → usando disco stale")
+                    from pathlib import Path as _P
+                    import json as _j
+                    _disk = DATA_PATH / "positions.json"
+                    if _disk.exists():
+                        try:
+                            _raw = _j.loads(_disk.read_text())
+                            if _raw:
+                                positions = _raw if isinstance(_raw, list) else [{"ticker": t, **v} for t, v in _raw.items()]
+                                logger.warning(f"⚠️ Usando disco stale: {len(positions)} posiciones")
+                        except Exception:
+                            pass
 
         positions = self._enrich_positions_with_price(positions)
 
