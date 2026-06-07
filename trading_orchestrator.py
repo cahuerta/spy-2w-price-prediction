@@ -1,818 +1,577 @@
-# =========================================================
-# trading_orchestrator.py — v4.5 CIRCUIT BREAKER
-# =========================================================
-# FIX v4.5:
-#   [CB1] Circuit breaker global — chequeo pre-ejecución que
-#         pausa APERTURAS si el drawdown diario supera el 5%.
-#         Guarda equity de inicio de día en disco (SOD_FILE).
-#         Los CIERRES siempre se ejecutan aunque el breaker
-#         esté activo — nunca bloquea reducción de riesgo.
-#         Umbral configurable via env CIRCUIT_BREAKER_DD_PCT.
-# =========================================================
+# capital_governor.py — CAPITAL GOVERNOR v2.9
+# ✅ 100% backward compatible v2.8
+#
+# FIX v2.8:
+#   [F4] fixed_capital usa equity real del broker (~$85k)
+#   [F5] _size_candidates usa fixed_capital real para MAX_POSITION_PCT
+#
+# FIX v2.9:
+#   [F6] adjust_sizing_dynamic: sizing ajustado por VIX y correlación
+#        con posiciones existentes. Reduce tamaño en mercados volátiles
+#        y evita concentración en tickers muy correlacionados.
+#        VIX_HIGH (>25) → factor 0.5 | VIX_EXTREME (>35) → factor 0.3
+#        Correlación > CORR_THRESHOLD → penalización proporcional.
+#   [F7] _get_vix_level: lee VIX desde market_context.json (ya calculado
+#        por market_state_evaluator) — no llama yfinance extra.
+#   [F8] _compute_correlation_penalty: usa retornos de 20 días desde
+#        yfinance solo si hay posiciones existentes con precio válido.
+#        Fallback a 1.0 (sin penalización) si falla.
 
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import pytz
 import logging
-import asyncio
 import os
 import json
-from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone, date
-from pathlib import Path
-from broker import get_engine
 
-from portfolio_store import load_positions, save_positions, clear_positions, update_prices
-from capital_governor import CapitalGovernor
-from pm_growth import PMGrowth
-from pm_neutral import PMNeutral
-from pm_defensive import PMDefensive
-
-# ── DARWIN TRACKING ───────────────────────────────────────────────
-try:
-    from darwin_engine.trade_tracker import register_open, register_close
-    DARWIN_TRACKING = True
-except ImportError:
-    DARWIN_TRACKING = False
-# ─────────────────────────────────────────────────────────────────
-
-logger = logging.getLogger("trading_orchestrator")
+CL_TIMEZONE      = pytz.timezone("America/Santiago")
+logger           = logging.getLogger("capital_governor")
 logging.basicConfig(level=logging.INFO)
 
-DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
-ALPHA_FILE    = DATA_PATH / "alpha_last.json"
-ANCHOR_FILE   = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
-CHAMPION_FILE = DATA_PATH / "darwin" / "champion.json"
+LOOKBACK_DAYS    = 252
+CONFIDENCE_LEVEL = 0.95
+MARKET_BENCHMARK = "SPY"
 
-# [CB1] Archivo SOD (Start-Of-Day equity)
-SOD_FILE = DATA_PATH / "circuit_breaker_sod.json"
+ES_BLOCK_THRESHOLD = float(os.getenv("ES_BLOCK_THRESHOLD", "0.20"))
+MAX_POSITION_PCT   = float(os.getenv("MAX_POSITION_PCT",   "0.05"))
 
-# Umbral de drawdown diario para activar el breaker (default 5%)
-CIRCUIT_BREAKER_DD_PCT = float(os.getenv("CIRCUIT_BREAKER_DD_PCT", "0.05"))
+# [F6] Umbrales VIX
+VIX_NORMAL   = float(os.getenv("VIX_NORMAL",   "20"))
+VIX_HIGH     = float(os.getenv("VIX_HIGH",     "25"))
+VIX_EXTREME  = float(os.getenv("VIX_EXTREME",  "35"))
 
+# [F6] Umbral de correlación para penalizar
+CORR_THRESHOLD = float(os.getenv("CORR_THRESHOLD", "0.70"))
 
-def _load_active_genome_ids() -> tuple:
-    """
-    Lee el genome_id real del campeón desde disco.
-    Retorna (executor_genome_id, predictor_genome_id).
-    """
-    try:
-        if CHAMPION_FILE.exists():
-            data    = json.loads(CHAMPION_FILE.read_text())
-            exec_id = data.get("genome_id", "executor_v1")
-            pred_id = data.get("predictor_genome_id", "predictor_v1")
-            return exec_id, pred_id
-    except Exception as e:
-        logger.warning(f"⚠️ No se pudo leer champion.json: {e} → usando defaults")
-    return "executor_v1", "predictor_v1"
+DATA_PATH = os.getenv("DATA_PATH", "/data")
 
 
-class TradingOrchestrator:
+@dataclass
+class CapitalState:
+    volatility_annual: float
+    var_95_annual: float
+    expected_shortfall_95_annual: float
+    effective_es: float
+    portfolio_weight: float
+    beta_vs_spy: float
+    total_value: float
+    cash_reserve: float
+    timestamp_utc: str
+    timestamp_cl: str
+    data_quality: str
 
-    def __init__(self):
-        self.broker            = get_engine()
-        self.daily_limit       = int(os.getenv("MAX_ORDERS_DAY", "15"))
-        self._fallback_capital = float(os.getenv("FIXED_CAPITAL", "1000000"))
-        self.fixed_capital     = self._fallback_capital
+    def to_dict(self):
+        return asdict(self)
 
-        self.alpha_growth      = float(os.getenv("ALPHA_GROWTH",    "0.65"))
-        self.alpha_neutral     = float(os.getenv("ALPHA_NEUTRAL",   "0.75"))
-        self.alpha_defensive   = float(os.getenv("ALPHA_DEFENSIVE", "0.85"))
-        self.alpha_elite       = float(os.getenv("ALPHA_ELITE",     "0.88"))
-        self.alpha_hold_shield = float(os.getenv("ALPHA_SHIELD",    "0.75"))
-        self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
-        self.governor = None
-        logger.info(f"🚀 v4.5 CIRCUIT-BREAKER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
-
-    # =========================================================
-    # CAPITAL
-    # =========================================================
-    async def _get_real_capital(self) -> float:
-        try:
-            account = await self.broker.get_account()
-            equity  = float(account.equity)
-            if equity > 0:
-                logger.info(f"💰 Capital real Alpaca: ${equity:,.0f}")
-                return equity
-        except Exception as e:
-            logger.warning(f"⚠️ No se pudo leer equity: {e} → fallback ${self._fallback_capital:,.0f}")
-        return self._fallback_capital
-
-    async def _refresh_governor(self) -> CapitalGovernor:
-        self.fixed_capital = await self._get_real_capital()
-        gov = CapitalGovernor(fixed_capital=self.fixed_capital)
-        logger.info(f"🏛 Governor refrescado | capital=${self.fixed_capital:,.0f}")
-        return gov
-
-    # =========================================================
-    # [CB1] CIRCUIT BREAKER
-    # =========================================================
-    async def _circuit_breaker_check(self, current_equity: float) -> Dict[str, Any]:
-        """
-        [CB1] Compara equity actual vs equity inicio de día (SOD).
-        Si drawdown diario > CIRCUIT_BREAKER_DD_PCT → bloquea aperturas.
-        Los cierres NO se bloquean nunca.
-
-        SOD se guarda en disco al primer run del día.
-        Se resetea automáticamente cada día de mercado.
-        """
-        today_str = date.today().isoformat()
-
-        # Leer o crear SOD
-        sod_equity = None
-        try:
-            if SOD_FILE.exists():
-                sod_data = json.loads(SOD_FILE.read_text())
-                if sod_data.get("date") == today_str:
-                    sod_equity = float(sod_data["equity"])
-                    logger.info(f"🔋 SOD cargado | fecha={today_str} equity=${sod_equity:,.0f}")
-        except Exception as e:
-            logger.warning(f"⚠️ Error leyendo SOD: {e}")
-
-        # Si no hay SOD de hoy, guardar equity actual como SOD
-        if sod_equity is None:
-            sod_equity = current_equity
-            try:
-                SOD_FILE.parent.mkdir(parents=True, exist_ok=True)
-                SOD_FILE.write_text(json.dumps({
-                    "date":   today_str,
-                    "equity": sod_equity,
-                    "saved_at": datetime.now(timezone.utc).isoformat(),
-                }))
-                logger.info(f"🔋 SOD nuevo | fecha={today_str} equity=${sod_equity:,.0f}")
-            except Exception as e:
-                logger.warning(f"⚠️ Error guardando SOD: {e}")
-
-        # Calcular drawdown diario
-        if sod_equity > 0:
-            daily_dd = (sod_equity - current_equity) / sod_equity
+class CapitalGovernor:
+    def __init__(self, fixed_capital: Optional[float] = None):
+        if fixed_capital is not None and fixed_capital > 0:
+            self.fixed_capital = fixed_capital
         else:
-            daily_dd = 0.0
-
-        breaker_active = daily_dd > CIRCUIT_BREAKER_DD_PCT
-
-        if breaker_active:
-            logger.error(
-                f"🛑 CIRCUIT BREAKER ACTIVO | "
-                f"DD={daily_dd:.2%} > {CIRCUIT_BREAKER_DD_PCT:.0%} | "
-                f"SOD=${sod_equity:,.0f} actual=${current_equity:,.0f} | "
-                f"APERTURAS BLOQUEADAS — cierres permitidos"
-            )
-        else:
-            logger.info(
-                f"✅ Circuit breaker OK | "
-                f"DD={daily_dd:.2%} < {CIRCUIT_BREAKER_DD_PCT:.0%} | "
-                f"SOD=${sod_equity:,.0f}"
-            )
-
-        return {
-            "active":         breaker_active,
-            "daily_dd":       round(daily_dd, 4),
-            "threshold":      CIRCUIT_BREAKER_DD_PCT,
-            "sod_equity":     sod_equity,
-            "current_equity": current_equity,
-        }
-
-    # =========================================================
-    # HELPERS
-    # =========================================================
-    def _load_anchor_tickers(self) -> set:
-        try:
-            data    = json.loads(ANCHOR_FILE.read_text())
-            tickers = {a["ticker"].upper() for a in data if "ticker" in a}
-            logger.info(f"⚓ Anchor universe cargado: {len(tickers)} tickers")
-            return tickers
-        except Exception as e:
-            logger.warning(f"⚠️ No se pudo cargar anchor_universe.json: {e}")
-            return set()
-
-    def _load_intraday_signals(self) -> Dict[str, Dict]:
-        try:
-            from intraday_tracker import get_entry_signals_today
-            signals = get_entry_signals_today()
-            if signals:
-                listos = [t for t, s in signals.items() if s.get("entrar_ahora")]
-                logger.info(
-                    f"📡 Intraday signals | {len(signals)} evaluados | "
-                    f"listos para entrar: {listos}"
-                )
-            return signals
-        except Exception as e:
-            logger.warning(f"⚠️ Intraday signals no disponibles: {e}")
-            return {}
-
-    def _get_broker_positions_tickers(self) -> set:
-        try:
-            broker_data = self.broker.get_positions()
-            if not broker_data:
-                logger.warning("⚠️ Broker devolvió 0 posiciones directas")
-                return set()
-            if isinstance(broker_data, dict):
-                tickers = {t.upper() for t in broker_data.keys()}
-            elif isinstance(broker_data, list):
-                tickers = {
-                    str(p.get("ticker", p.get("symbol", ""))).upper()
-                    for p in broker_data
-                    if p.get("ticker") or p.get("symbol")
-                }
+            real = os.getenv("REAL_CAPITAL")
+            if real:
+                try:
+                    self.fixed_capital = float(real)
+                except ValueError:
+                    self.fixed_capital = float(os.getenv("FIXED_CAPITAL", 1_000_000))
             else:
-                tickers = set()
-            logger.info(f"📋 Broker positions (Alpaca directo): {sorted(tickers)}")
-            return tickers
-        except Exception as e:
-            logger.warning(f"⚠️ _get_broker_positions_tickers error: {e}")
-            return set()
+                self.fixed_capital = float(os.getenv("FIXED_CAPITAL", 1_000_000))
 
-    def _enrich_positions_with_price(self, positions: List[Dict]) -> List[Dict]:
-        broker_price_map = {}
-        try:
-            broker_data = self.broker.get_positions()
-            if not broker_data:
-                logger.warning("⚠️ Broker devolvió 0 posiciones → leyendo desde disco")
-            for ticker, data in (broker_data or {}).items():
-                cp = data.get("current_price") or data.get("price_now")
-                if cp and float(cp) > 0:
-                    broker_price_map[ticker.upper()] = float(cp)
+        logger.info(f"🏛 CapitalGovernor v2.9 | Capital: ${self.fixed_capital:,.0f}")
+
+    # =========================================================
+    # NORMALIZADOR
+    # =========================================================
+    @staticmethod
+    def _normalize_positions(positions: List[Dict]) -> List[Dict]:
+        normalized = []
+        for p in positions:
+            pos = dict(p)
+            if "price_now" not in pos or pos["price_now"] is None:
+                qty          = float(pos.get("qty") or 0)
+                market_value = pos.get("market_value")
+                if market_value is not None and qty > 0:
+                    pos["price_now"] = float(market_value) / qty
                 else:
-                    avg = data.get("avg_entry_price")
-                    if avg and float(avg) > 0:
-                        broker_price_map[ticker.upper()] = float(avg)
-                        logger.warning(
-                            f"⚠️ {ticker} current_price=0 → avg_entry: {float(avg):.2f}"
-                        )
-            logger.info(f"💹 Precios Alpaca obtenidos: {len(broker_price_map)} tickers")
-        except Exception as e:
-            logger.warning(f"⚠️ No se pudo obtener precios del broker: {e}")
+                    avg_entry = pos.get("avg_entry_price")
+                    if avg_entry is not None:
+                        pos["price_now"] = float(avg_entry)
+                    else:
+                        logger.warning(f"⚠️ {pos.get('ticker')} sin price_now → saltado")
+                        continue
+            normalized.append(pos)
+        return normalized
 
-        enriched  = []
-        price_map = {}
-
-        for pos in positions:
-            ticker = str(pos.get("ticker", "")).upper()
-            pos    = dict(pos)
-
-            if ticker in broker_price_map:
-                pos["price_now"]  = broker_price_map[ticker]
-                price_map[ticker] = broker_price_map[ticker]
-            elif float(pos.get("entry_price", 0) or 0) > 0:
-                pos["price_now"] = float(pos["entry_price"])
-                logger.warning(
-                    f"⚠️ {ticker} sin precio Alpaca → entry_price: {pos['price_now']:.2f}"
-                )
-            else:
-                pos["price_now"] = 1.0
-                logger.error(f"❌ {ticker} SIN PRECIO → usando 1.0")
-
-            enriched.append(pos)
-
-        if price_map:
-            try:
-                update_prices(price_map)
-            except Exception as e:
-                logger.warning(f"⚠️ update_prices falló: {e}")
-
-        return enriched
-
-    def _enrich_opens_with_price_and_shares(self, opens: List[Dict]) -> List[Dict]:
+    # =========================================================
+    # [F7] LEER VIX DESDE MARKET CONTEXT
+    # =========================================================
+    def _get_vix_level(self) -> float:
+        """
+        [F7] Lee VIX desde market_context.json — ya calculado por
+        market_state_evaluator. No llama yfinance extra.
+        Fallback a VIX_NORMAL si no está disponible.
+        """
         try:
-            from market_data_cache import get_last_price_from_cache
-        except ImportError:
-            get_last_price_from_cache = None
-
-        enriched = []
-
-        for o in opens:
-            ticker = o.get("ticker", "").upper()
-
-            if o.get("shares", 0) > 0 and (o.get("entry_price") or o.get("price_now")):
-                enriched.append(o)
-                continue
-
-            price = None
-            if get_last_price_from_cache:
-                try:
-                    price = get_last_price_from_cache(ticker)
-                except Exception:
-                    pass
-
-            if not price or float(price) <= 0:
-                price = o.get("entry_price") or o.get("price_now")
-
-            if not price or float(price) <= 0:
-                logger.warning(f"⚠️ {ticker} sin precio → saltado")
-                continue
-
-            price      = float(price)
-            target_pct = float(o.get("target_pct", 0.05))
-            shares     = int((self.fixed_capital * target_pct) // price)
-
-            if shares <= 0:
-                logger.warning(
-                    f"⚠️ {ticker} shares=0 price={price:.2f} "
-                    f"capital={self.fixed_capital:,.0f} → saltado"
-                )
-                continue
-
-            o              = dict(o)
-            o["entry_price"] = price
-            o["shares"]      = shares
-            enriched.append(o)
-            logger.info(
-                f"💡 {ticker} enriquecido: {shares}s @ ${price:.2f} "
-                f"(target={target_pct:.1%} → ${shares * price:,.0f})"
-            )
-
-        logger.info(f"📦 Opens enriquecidos: {len(enriched)}/{len(opens)} válidos")
-        return enriched
-
-    async def _cancel_pending_orders(self, tickers: List[str]):
-        if not hasattr(self.broker, "cancel_orders_for_ticker"):
-            if hasattr(self.broker, "cancel_all_orders"):
-                try:
-                    await self.broker.cancel_all_orders()
-                except Exception as e:
-                    logger.warning(f"⚠️ cancel_all_orders falló: {e}")
-            return
-
-        for ticker in tickers:
-            try:
-                result = self.broker.cancel_orders_for_ticker(ticker)
-                if asyncio.iscoroutine(result):
-                    await result
-                logger.info(f"🗑 Órdenes canceladas para {ticker}")
-            except Exception as e:
-                logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
+            ctx_path = os.path.join(DATA_PATH, "market_context.json")
+            if os.path.exists(ctx_path):
+                ctx = json.loads(open(ctx_path).read())
+                vix = ctx.get("vix") or ctx.get("vix_level") or ctx.get("volatility_index")
+                if vix and float(vix) > 0:
+                    logger.info(f"📊 VIX desde market_context: {float(vix):.1f}")
+                    return float(vix)
+        except Exception as e:
+            logger.debug(f"_get_vix_level fallback: {e}")
+        logger.info(f"📊 VIX no disponible → usando neutral {VIX_NORMAL}")
+        return VIX_NORMAL
 
     # =========================================================
-    # RUN PRINCIPAL v4.5
+    # [F6] FACTOR VIX
     # =========================================================
-        async def run(
+    def _vix_factor(self, vix: float) -> float:
+        """
+        [F6] Reduce tamaño de posición según nivel de VIX.
+        VIX <= 20 → 1.0 (normal)
+        VIX 20-25 → 0.8 (precaución)
+        VIX 25-35 → 0.5 (alto)
+        VIX > 35  → 0.3 (extremo)
+        """
+        if vix >= VIX_EXTREME:
+            factor = 0.3
+        elif vix >= VIX_HIGH:
+            factor = 0.5
+        elif vix >= VIX_NORMAL:
+            factor = 0.8
+        else:
+            factor = 1.0
+
+        if factor < 1.0:
+            logger.info(f"📉 VIX factor={factor:.1f} | VIX={vix:.1f}")
+        return factor
+
+    # =========================================================
+    # [F8] PENALIZACIÓN POR CORRELACIÓN
+    # =========================================================
+    def _compute_correlation_penalty(
         self,
-        market_ctx: Dict[str, Any],
-        signals: Dict = None,
-        anchor_universe: List = None
-    ) -> Dict:
+        candidate_ticker: str,
+        existing_positions: List[Dict],
+    ) -> float:
+        """
+        [F8] Penaliza candidatos muy correlacionados con posiciones existentes.
+        Correlación > CORR_THRESHOLD → reducción proporcional.
+        Fallback a 1.0 (sin penalización) si falla.
+        """
+        if not existing_positions:
+            return 1.0
 
-        self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.5 CIRCUIT-BREAKER+DARWIN | Capital ${self.fixed_capital:,.0f}")
-
-        anchor_tickers = self._load_anchor_tickers()
-
-        # [FIX] Leer genome_id real del campeón una sola vez por run
-        executor_genome_id, predictor_genome_id = _load_active_genome_ids()
-        logger.info(f"🧬 Genomas activos | executor={executor_genome_id} predictor={predictor_genome_id}")
-
-        # [CB1] Circuit breaker — chequear antes de cualquier ejecución
-        cb_result = await self._circuit_breaker_check(self.fixed_capital)
-        breaker_active = cb_result["active"]
-
-        if hasattr(self.broker, "sync_positions_from_broker"):
-            sync_result = self.broker.sync_positions_from_broker()
-            if asyncio.iscoroutine(sync_result):
-                await sync_result
-
-        positions = load_positions()
-
-        if len(positions) == 0:
-            logger.warning("⚠️ positions.json vacío → fallback broker")
-            if hasattr(self.broker, "get_positions"):
-                raw = self.broker.get_positions()
-                if isinstance(raw, dict):
-                    positions = list(raw.values())
-                elif isinstance(raw, list):
-                    positions = raw
-                else:
-                    positions = []
-                if positions:
-                    save_positions(positions)
-                    logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
-
-        positions = self._enrich_positions_with_price(positions)
-
-        broker_real_tickers = self._get_broker_positions_tickers()
-        broker_positions    = load_positions()
-        disk_tickers        = {p["ticker"].upper() for p in broker_positions}
-        real_positions      = broker_real_tickers | disk_tickers
-        portfolio_tickers   = real_positions
-
-        logger.info(
-            f"📊 Portfolio | broker={len(broker_real_tickers)} "
-            f"disco={len(disk_tickers)} union={len(real_positions)} | "
-            f"Mode: {market_ctx.get('market_mode', 'neutral')}"
-        )
-
-        mode = market_ctx.get("market_mode", "neutral")
-
-        alpha_data = self._load_last_alpha()
-        alpha_map  = {
-            t.upper(): d
-            for t, d in alpha_data.get("results", {}).items()
-            if isinstance(d, dict)
-        }
-
-        intraday_signals = self._load_intraday_signals()
-
-        pm_decisions = await self._get_pm_decisions(
-            mode, positions, signals or {}, anchor_universe
-        )
-
-        closes = []
-        opens  = []
-
-        for decision in pm_decisions:
-            if decision.get("action") == "CLOSE":
-                ticker = decision.get("ticker", "").upper()
-                reason = decision.get("reason", "")
-
-                if ticker not in real_positions:
-                    logger.warning(f"⚠️ SKIP CLOSE {ticker} → no existe en broker")
-                    continue
-
-                if "hold" in reason.lower():
-                    logger.info(f"🛡 SKIP CLOSE {ticker} — HOLD preventivo: {reason}")
-                    continue
-
-                alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
-                if alpha_score >= self.alpha_hold_shield:
-                    logger.info(f"🛡 SHIELD BLOCK {ticker} | alpha={alpha_score:.3f}")
-                    continue
-
-                closes.append({"action": "CLOSE", "ticker": ticker, "reason": reason})
-
-        for ticker in portfolio_tickers:
-            alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
-            if alpha_score <= self.alpha_kill:
-                if ticker not in real_positions:
-                    continue
-                closes.append({
-                    "action": "CLOSE",
-                    "ticker": ticker,
-                    "reason": f"ALPHA_KILL_{alpha_score:.3f}",
-                })
-                logger.warning(f"💀 KILL {ticker} | alpha={alpha_score:.3f}")
-
-        closes = list({c["ticker"]: c for c in closes}.values())
-
-        # =========================================================
-        # PASO 2: Ejecutar CIERRES (siempre — breaker no los bloquea)
-        # =========================================================
-        close_successes = []
-        if closes:
-            await self._cancel_pending_orders([c["ticker"] for c in closes])
-            await asyncio.sleep(0.5)
-
-            for order in closes[:self.daily_limit]:
-                try:
-                    result = await asyncio.wait_for(
-                        self.broker.execute_decision(order), timeout=30
-                    )
-                    close_successes.append(order["ticker"])
-                    logger.info(f"⚰️ CLOSED {order['ticker']}")
-
-                    # ── DARWIN: registrar cierre ──────────────────
-                    if DARWIN_TRACKING:
-                        try:
-                            alpha_at_close = alpha_map.get(
-                                order["ticker"], {}
-                            ).get("alpha_score", 0.0)
-
-                            exit_price = 0.0
-                            if result and hasattr(result, "filled_avg_price") and result.filled_avg_price:
-                                exit_price = float(result.filled_avg_price)
-                            elif result and isinstance(result, dict):
-                                exit_price = float(
-                                    result.get("filled_avg_price")
-                                    or result.get("fill_price")
-                                    or result.get("price")
-                                    or 0
-                                )
-
-                            if exit_price <= 0:
-                                exit_price = next(
-                                    (
-                                        float(p.get("price_now") or p.get("entry_price") or 0)
-                                        for p in positions
-                                        if str(p.get("ticker", "")).upper() == order["ticker"]
-                                    ),
-                                    0.0,
-                                )
-
-                            logger.info(f"📝 Darwin close {order['ticker']} @ ${exit_price:.2f}")
-                            register_close(
-                                ticker      = order["ticker"],
-                                exit_price  = exit_price,
-                                reason      = order.get("reason", "UNKNOWN"),
-                                alpha_score = alpha_at_close,
-                            )
-                        except Exception as _te:
-                            logger.warning(f"⚠️ darwin close {order['ticker']}: {_te}")
-                    # ─────────────────────────────────────────────
-
-                    try:
-                        from positions_meta import remove_entry
-                        remove_entry(order["ticker"])
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.8)
-                except Exception as e:
-                    logger.error(f"❌ CLOSE ERROR {order.get('ticker')}: {e}")
-
-        # =========================================================
-        # PASO 3: Refrescar capital + portfolio post-cierres
-        # =========================================================
-        self.governor = await self._refresh_governor()
-
-        broker_real_post  = self._get_broker_positions_tickers()
-        portfolio_tickers = broker_real_post | (disk_tickers - set(close_successes))
-        logger.info(
-            f"🔄 Portfolio post-cierres | "
-            f"broker={len(broker_real_post)} | "
-            f"efectivos={sorted(portfolio_tickers)}"
-        )
-
-        # [CB1] Si breaker activo → saltar aperturas completamente
-        if breaker_active:
-            logger.error(
-                f"🛑 CIRCUIT BREAKER — aperturas omitidas | "
-                f"DD={cb_result['daily_dd']:.2%} | "
-                f"cierres ejecutados={len(close_successes)}"
-            )
-            return {
-                "status":             "circuit_breaker",
-                "mode":               mode,
-                "executed":           len(close_successes),
-                "closes_executed":    len(close_successes),
-                "opens_executed":     0,
-                "elite_executed":     0,
-                "queue_size":         0,
-                "real_capital":       round(self.fixed_capital, 2),
-                "circuit_breaker":    cb_result,
-                "darwin_tracking":    DARWIN_TRACKING,
-                "results":            [],
-                "decisions":          pm_decisions,
-            }
-
-        # =========================================================
-        # PASO 4: Construir cola de APERTURAS
-        # =========================================================
-        for decision in pm_decisions:
-            if decision.get("action") in ["OPEN", "ROTATE"]:
-                opens.append(decision)
-
-        threshold = self._alpha_threshold(mode)
-
-        for ticker, data in alpha_map.items():
-            score = data.get("alpha_score", 0)
-            if ticker not in portfolio_tickers and score >= threshold:
-                opens.append({
-                    "action":     "OPEN",
-                    "ticker":     ticker,
-                    "target_pct": 0.05,
-                    "reason":     f"ALPHA_INJECT_{score:.3f}",
-                    "alpha":      score,
-                })
-
-        # ── FILTRO INTRADAY ──────────────────────────────────────
-        if intraday_signals:
-            filtered_opens = []
-            for o in opens:
-                ticker    = o.get("ticker", "").upper()
-                is_anchor = (
-                    o.get("is_anchor")
-                    or o.get("reason", "").startswith("ANCHOR")
-                    or ticker in anchor_tickers
-                )
-                if is_anchor:
-                    filtered_opens.append(o)
-                    continue
-                signal = intraday_signals.get(ticker)
-                if signal is None:
-                    filtered_opens.append(o)
-                    continue
-                if signal.get("entrar_ahora", False):
-                    logger.info(
-                        f"📡 INTRADAY PASS {ticker} | "
-                        f"score={signal.get('entry_score')} "
-                        f"ratio={signal.get('tracking_ratio')}"
-                    )
-                else:
-                    logger.info(
-                        f"⏳ INTRADAY ESPERA {ticker} | "
-                        f"score={signal.get('entry_score')} | "
-                        f"{signal.get('razon', '')}"
-                    )
-                filtered_opens.append(o)
-            opens = filtered_opens
-        # ────────────────────────────────────────────────────────
-
-        opens_dict   = {o["ticker"].upper(): o for o in opens}
-        unique_opens = self._enrich_opens_with_price_and_shares(list(opens_dict.values()))
-
-        anchor_opens = [
-            o for o in unique_opens
-            if o.get("is_anchor")
-            or o.get("reason", "").startswith("ANCHOR")
-            or o.get("ticker", "").upper() in anchor_tickers
+        existing_tickers = [
+            p.get("ticker", "").upper()
+            for p in existing_positions
+            if p.get("ticker")
         ]
-        normal_opens       = [o for o in unique_opens if o not in anchor_opens]
-        close_tickers_list = [c["ticker"] for c in closes]
 
-        sized_anchors = self.governor.adjust_sizing_after_closes(
-            positions, close_tickers_list, anchor_opens
-        ) if anchor_opens else []
-        sized_normals = self.governor.adjust_sizing(
-            positions, normal_opens
-        ) if normal_opens else []
-        sized_opens = sized_anchors + sized_normals
+        if not existing_tickers:
+            return 1.0
 
-        logger.info(
-            f"📐 Sizing | anchors={len(sized_anchors)} "
-            f"normals={len(sized_normals)} total={len(sized_opens)}"
-        )
+        all_tickers = list(set([candidate_ticker.upper()] + existing_tickers))
 
-        final_queue = []
-        elite_count = 0
+        try:
+            data = yf.download(
+                all_tickers, period="1mo",
+                auto_adjust=True, progress=False, threads=True
+            )
+            if data.empty:
+                return 1.0
 
-        for cmd in sized_opens:
-            ticker    = cmd["ticker"].upper()
-            score     = alpha_map.get(ticker, {}).get("alpha_score", 0)
-            is_anchor = ticker in anchor_tickers
+            prices  = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
+            returns = prices.pct_change().dropna()
 
-            if score >= self.alpha_elite:
-                elite_count += 1
-                logger.info(f"🔥 ELITE {ticker} {score:.3f}")
-                final_queue.append(cmd)
-            elif is_anchor and score > 0:
-                logger.info(f"⚓ ANCHOR PASS {ticker} alpha={score:.3f}")
-                final_queue.append(cmd)
-            elif score >= threshold:
-                final_queue.append(cmd)
-            else:
-                logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f}")
+            if candidate_ticker.upper() not in returns.columns:
+                return 1.0
 
-        # =========================================================
-        # PASO 5: Ejecutar APERTURAS
-        # =========================================================
-        results          = []
-        executed_opens   = 0
-        remaining_orders = self.daily_limit - len(close_successes)
+            cand_returns = returns[candidate_ticker.upper()]
+            correlations = []
 
-        for order in final_queue[:max(0, remaining_orders)]:
-            try:
-                result = await asyncio.wait_for(
-                    self.broker.execute_decision(order), timeout=30
+            for t in existing_tickers:
+                if t in returns.columns:
+                    corr = float(cand_returns.corr(returns[t]))
+                    if not np.isnan(corr):
+                        correlations.append(abs(corr))
+
+            if not correlations:
+                return 1.0
+
+            avg_corr = float(np.mean(correlations))
+            max_corr = float(np.max(correlations))
+
+            if max_corr > CORR_THRESHOLD:
+                # Penalización proporcional al exceso de correlación
+                excess   = max_corr - CORR_THRESHOLD
+                penalty  = max(0.3, 1.0 - excess * 2)
+                logger.info(
+                    f"🔗 Correlación {candidate_ticker} | "
+                    f"avg={avg_corr:.2f} max={max_corr:.2f} → penalty={penalty:.2f}"
                 )
-                results.append({"ticker": order["ticker"], "status": "success"})
-                executed_opens += 1
+                return penalty
 
-                # ── DARWIN: registrar apertura con genome_id real ─
-                if DARWIN_TRACKING:
-                    try:
-                        register_open(
-                            ticker              = order["ticker"],
-                            entry_price         = float(order.get("entry_price") or 0),
-                            shares              = int(order.get("shares") or 0),
-                            reason              = order.get("reason", "UNKNOWN"),
-                            alpha_score         = float(order.get("alpha") or 0),
-                            executor_genome_id  = executor_genome_id,
-                            predictor_genome_id = predictor_genome_id,
-                        )
-                        logger.info(
-                            f"📝 TRADE OPEN registrado | {order['ticker']} | "
-                            f"entrada=${order.get('entry_price', 0):.2f}"
-                        )
-                    except Exception as _te:
-                        logger.warning(f"⚠️ darwin open {order['ticker']}: {_te}")
-                # ─────────────────────────────────────────────────
+            return 1.0
 
-                # Solo registrar entry_date si fill confirmado
-                if result.get("status") == "executed":
-                    try:
-                        from positions_meta import set_entry_date
-                        set_entry_date(order["ticker"])
-                        logger.info(f"📅 entry_date registrado: {order['ticker']}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ entry_date no registrado {order['ticker']}: {e}")
-
-                await asyncio.sleep(0.8)
-                self.governor = await self._refresh_governor()
-
-            except Exception as e:
-                logger.error(f"❌ EXECUTION ERROR for {order.get('ticker')}: {e}")
-                results.append({
-                    "ticker": order.get("ticker"),
-                    "status": "error",
-                    "error":  str(e),
-                })
-
-        # =========================================================
-        # PASO 6: Limpiar store si cierres OK
-        # =========================================================
-        if close_successes:
-            all_closes_ok = len(close_successes) == len(closes)
-            try:
-                broker_after = self.broker.get_positions()
-                if isinstance(broker_after, dict):
-                    broker_after = list(broker_after.values())
-                broker_empty = len(broker_after) == 0
-            except Exception:
-                broker_empty = False
-
-            if all_closes_ok and broker_empty:
-                logger.info("🧹 Todos los cierres OK + broker vacío → clear_positions()")
-                clear_positions()
-            else:
-                logger.info("📂 Cierres parciales → manteniendo store")
-
-        total_executed = len(close_successes) + executed_opens
-        logger.info(
-            f"✅ EXECUTED {total_executed} | "
-            f"Cierres={len(close_successes)} Aperturas={executed_opens} | "
-            f"Elite={elite_count} | Capital final=${self.fixed_capital:,.0f} | "
-            f"Darwin={'ON' if DARWIN_TRACKING else 'OFF'}"
-        )
-
-        return {
-            "status":             "success",
-            "mode":               mode,
-            "executed":           total_executed,
-            "closes_executed":    len(close_successes),
-            "opens_executed":     executed_opens,
-            "elite_executed":     elite_count,
-            "queue_size":         len(final_queue),
-            "real_capital":       round(self.fixed_capital, 2),
-            "alpha_timestamp":    alpha_data.get("timestamp"),
-            "intraday_evaluated": len(intraday_signals),
-            "darwin_tracking":    DARWIN_TRACKING,
-            "circuit_breaker":    cb_result,
-            "results":            results,
-            "decisions":          pm_decisions,
-        }
-
-    # =========================================================
-    # PREVIEW EXECUTABILITY
-    # =========================================================
-    async def preview_executability(self, market_ctx: Dict) -> Dict:
-        positions  = self._enrich_positions_with_price(load_positions())
-        alpha_data = self._load_last_alpha()
-        alpha_map  = {
-            t.upper(): d
-            for t, d in alpha_data.get("results", {}).items()
-            if isinstance(d, dict)
-        }
-        mode      = market_ctx.get("market_mode", "neutral")
-        threshold = self._alpha_threshold(mode)
-
-        rows = []
-        for ticker, data in alpha_map.items():
-            score = data.get("alpha_score", 0)
-            rows.append({
-                "ticker":     ticker,
-                "alpha":      score,
-                "executable": score >= threshold,
-                "mode":       mode,
-                "threshold":  threshold,
-            })
-
-        rows.sort(key=lambda x: x["alpha"] or 0, reverse=True)
-        return {"mode": mode, "threshold": threshold, "rows": rows}
-
-    # =========================================================
-    # HELPERS INTERNOS
-    # =========================================================
-    def _load_last_alpha(self) -> Dict:
-        if not ALPHA_FILE.exists():
-            raise RuntimeError("❌ alpha_last.json no encontrado.")
-        try:
-            data = json.loads(ALPHA_FILE.read_text())
         except Exception as e:
-            raise RuntimeError(f"❌ alpha_last.json corrupto: {e}")
-        logger.info(
-            f"🧠 Alpha loaded | ts={data.get('timestamp')} | "
-            f"universe={data.get('universe_size')}"
+            logger.debug(f"_compute_correlation_penalty fallback: {e}")
+            return 1.0
+
+    # =========================================================
+    # EVALUATE
+    # =========================================================
+    def evaluate(self, positions: List[Dict]) -> CapitalState:
+        if not positions:
+            raise ValueError("❌ Portfolio vacío")
+
+        positions = self._normalize_positions(positions)
+
+        for i, p in enumerate(positions):
+            required = ["ticker", "qty", "price_now"]
+            if not all(k in p for k in required):
+                raise ValueError(f"❌ Pos {i} campos faltantes: {list(p.keys())}")
+            if p["qty"] <= 0 or p["price_now"] <= 0:
+                raise ValueError(f"❌ Pos {i} qty/price inválidos: qty={p['qty']} price={p['price_now']}")
+
+        tickers                = list({p["ticker"].upper() for p in positions})
+        tickers_with_benchmark = tickers + [MARKET_BENCHMARK]
+
+        logger.info(f"📊 {len(tickers)} tickers vs {MARKET_BENCHMARK}")
+
+        data = yf.download(
+            tickers_with_benchmark, period="1y",
+            auto_adjust=True, progress=False, threads=True
         )
-        return data
+        if data.empty:
+            raise RuntimeError("❌ yfinance vacío")
 
-    def _alpha_threshold(self, mode: str) -> float:
-        return {
-            "growth":    self.alpha_growth,
-            "defensive": self.alpha_defensive,
-        }.get(mode, self.alpha_neutral)
+        prices = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data["Close"]
+        prices = prices.dropna(axis=1, thresh=len(prices) * 0.8)
 
-    async def _get_pm_decisions(
+        if len(prices) < LOOKBACK_DAYS * 0.5:
+            raise RuntimeError(f"❌ Datos insuficientes: {len(prices)}d")
+
+        returns     = prices.pct_change().dropna()
+        total_value = sum(p["qty"] * p["price_now"] for p in positions)
+
+        weights = {
+            p["ticker"].upper(): (p["qty"] * p["price_now"]) / total_value
+            for p in positions
+            if p["ticker"].upper() in prices.columns
+        }
+
+        valid_tickers = list(weights.keys())
+        if not valid_tickers:
+            raise RuntimeError("❌ Sin tickers válidos en yfinance")
+
+        w             = np.array([weights[t] for t in valid_tickers])
+        asset_returns = returns[valid_tickers]
+        cov_matrix    = asset_returns.cov() * 252
+        portfolio_vol = np.sqrt(w.T @ cov_matrix.values @ w)
+        portfolio_returns = asset_returns @ w
+
+        var_daily  = portfolio_returns.quantile(1 - CONFIDENCE_LEVEL)
+        var_annual = abs(var_daily) * np.sqrt(252)
+
+        tail     = portfolio_returns[portfolio_returns <= var_daily]
+        es_daily = tail.mean() if len(tail) > 0 else var_daily * 1.2
+        es_annual = abs(es_daily) * np.sqrt(252)
+
+        beta = 1.0
+        if MARKET_BENCHMARK in returns.columns:
+            spy_ret = returns[MARKET_BENCHMARK]
+            beta    = np.cov(portfolio_returns, spy_ret)[0, 1] / np.var(spy_ret)
+
+        cash_reserve     = self.fixed_capital - total_value
+        portfolio_weight = total_value / self.fixed_capital if self.fixed_capital > 0 else 0
+        effective_es     = es_annual * portfolio_weight
+
+        days         = len(prices)
+        data_quality = (
+            "EXCELLENT" if days >= LOOKBACK_DAYS        else
+            "GOOD"      if days >= LOOKBACK_DAYS * 0.75 else
+            "WARNING"   if days >= LOOKBACK_DAYS * 0.5  else
+            "POOR"
+        )
+
+        now_utc = datetime.utcnow()
+        now_cl  = now_utc.astimezone(CL_TIMEZONE)
+
+        logger.info(
+            f"🏛 Vol:{portfolio_vol:.1%} VaR:{var_annual:.1%} "
+            f"ES:{es_annual:.1%} EffES:{effective_es:.1%} "
+            f"Weight:{portfolio_weight:.1%} Beta:{beta:.2f} "
+            f"Cash:${cash_reserve:,.0f} Quality:{data_quality}"
+        )
+
+        return CapitalState(
+            volatility_annual=round(float(portfolio_vol), 4),
+            var_95_annual=round(float(var_annual), 4),
+            expected_shortfall_95_annual=round(float(es_annual), 4),
+            effective_es=round(float(effective_es), 4),
+            portfolio_weight=round(float(portfolio_weight), 4),
+            beta_vs_spy=round(float(beta), 3),
+            total_value=round(float(total_value), 2),
+            cash_reserve=round(float(cash_reserve), 2),
+            timestamp_utc=now_utc.isoformat(),
+            timestamp_cl=now_cl.isoformat(),
+            data_quality=data_quality,
+        )
+        
+    # =========================================================
+    # ADJUST SIZING — con VIX y correlación [F6][F8]
+    # =========================================================
+    def adjust_sizing(
         self,
-        mode: str,
-        positions: List[Dict],
-        signals: Dict,
-        anchor: List,
+        current_positions: List[Dict],
+        candidates: List[Dict],
+        use_dynamic: bool = True,
     ) -> List[Dict]:
-        decisions = []
+        """
+        [F6][F8] use_dynamic=True: aplica factor VIX y penalización
+        por correlación sobre el sizing base.
+        """
+        if not current_positions:
+            logger.info("📭 Portfolio vacío → sizing conservador")
+            safety_buffer = self.fixed_capital * 0.10
+            return self._size_candidates_dynamic(
+                candidates, self.fixed_capital - safety_buffer,
+                es=0.0, current_positions=[], use_dynamic=use_dynamic,
+            )
+
         try:
-            if mode == "growth":
-                pm = PMGrowth(self.fixed_capital)
-                for pos in positions:
-                    d = pm.evaluate_position(pos, signals.get(pos["ticker"]))
-                    if isinstance(d, dict):
-                        decisions.append(d)
-            elif mode == "defensive":
-                pm  = PMDefensive()
-                raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
-    
+            normalized = self._normalize_positions(current_positions)
+            state      = self.evaluate(normalized)
+        except Exception as e:
+            logger.error(f"❌ Error evaluando riesgo: {e}")
+            return []
+
+        if state.effective_es > ES_BLOCK_THRESHOLD:
+            logger.warning(
+                f"🛑 RIESGO EXTREMO: EffES {state.effective_es:.2%} > "
+                f"{ES_BLOCK_THRESHOLD:.0%}. Bloqueando aperturas."
+            )
+            return []
+
+        safety_buffer          = self.fixed_capital * 0.10
+        effective_buying_power = max(0, state.cash_reserve - safety_buffer)
+
+        logger.info(
+            f"💰 Cash Reserve: ${state.cash_reserve:,.0f} | "
+            f"Buffer: ${safety_buffer:,.0f} | "
+            f"Power: ${effective_buying_power:,.0f} | "
+            f"EffES: {state.effective_es:.2%}"
+        )
+
+        return self._size_candidates_dynamic(
+            candidates, effective_buying_power,
+            es=state.effective_es,
+            current_positions=current_positions,
+            use_dynamic=use_dynamic,
+        )
+
+    # =========================================================
+    # ADJUST SIZING AFTER CLOSES
+    # =========================================================
+    def adjust_sizing_after_closes(
+        self,
+        current_positions: List[Dict],
+        closes: List[str],
+        candidates: List[Dict],
+        use_dynamic: bool = True,
+    ) -> List[Dict]:
+        if not candidates:
+            return []
+
+        closes_upper    = {c.upper() for c in closes}
+        positions_after = [
+            p for p in current_positions
+            if p.get("ticker", "").upper() not in closes_upper
+        ]
+
+        logger.info(
+            f"🔮 Simulando portfolio post-cierre | "
+            f"antes={len(current_positions)} cierres={len(closes_upper)} "
+            f"después={len(positions_after)}"
+        )
+
+        if not positions_after:
+            logger.info("✅ Portfolio vacío post-cierre → capital libre")
+            safety_buffer = self.fixed_capital * 0.10
+            buying_power  = self.fixed_capital - safety_buffer
+            return self._size_candidates_dynamic(
+                candidates, buying_power,
+                es=0.0, current_positions=[],
+                use_dynamic=use_dynamic,
+            )
+
+        try:
+            normalized = self._normalize_positions(positions_after)
+            state      = self.evaluate(normalized)
+        except Exception as e:
+            logger.error(f"❌ Error evaluando riesgo post-cierre: {e}")
+            return []
+
+        logger.info(
+            f"📊 ES post-cierre: {state.expected_shortfall_95_annual:.2%} | "
+            f"EffES post-cierre: {state.effective_es:.2%} | "
+            f"Cash post-cierre: ${state.cash_reserve:,.0f}"
+        )
+
+        if state.effective_es > ES_BLOCK_THRESHOLD:
+            logger.warning(f"🛑 EffES post-cierre aún alto: {state.effective_es:.2%}. Bloqueando.")
+            return []
+
+        safety_buffer = self.fixed_capital * 0.10
+        buying_power  = max(0, state.cash_reserve - safety_buffer)
+
+        logger.info(f"💰 Buying power para anclas: ${buying_power:,.0f}")
+
+        return self._size_candidates_dynamic(
+            candidates, buying_power,
+            es=state.effective_es,
+            current_positions=positions_after,
+            use_dynamic=use_dynamic,
+        )
+
+    # =========================================================
+    # SIZE CANDIDATES DYNAMIC [F6][F7][F8]
+    # =========================================================
+    def _size_candidates_dynamic(
+        self,
+        candidates: List[Dict],
+        buying_power: float,
+        es: float,
+        current_positions: List[Dict],
+        use_dynamic: bool = True,
+    ) -> List[Dict]:
+        """
+        [F6][F7][F8] Sizing con factor VIX + penalización correlación.
+        use_dynamic=False → comportamiento idéntico a v2.8 (sin ajustes).
+        """
+        # Factor de riesgo por ES
+        if es > 0.10:
+            risk_factor = 0.5
+        elif es > 0.05:
+            risk_factor = 0.8
+        else:
+            risk_factor = 1.0
+
+        # [F7] VIX desde market_context
+        vix        = self._get_vix_level() if use_dynamic else VIX_NORMAL
+        vix_factor = self._vix_factor(vix) if use_dynamic else 1.0
+
+        max_per_position = self.fixed_capital * MAX_POSITION_PCT
+
+        adjusted        = []
+        remaining_power = buying_power
+
+        for cand in candidates:
+            ticker           = cand.get("ticker", "").upper()
+            price            = cand.get("entry_price") or cand.get("price_now")
+            requested_shares = cand.get("shares", 0)
+
+            if not price or price <= 0 or requested_shares <= 0:
+                logger.warning(f"⚠️ {ticker} saltado: precio/shares inválidos")
+                continue
+
+            # [F8] Penalización por correlación con posiciones existentes
+            corr_penalty = (
+                self._compute_correlation_penalty(ticker, current_positions)
+                if use_dynamic and current_positions
+                else 1.0
+            )
+
+            # Shares máximos por posición
+            max_shares_by_position = int(max_per_position // price)
+
+            # Shares máximos por cash disponible
+            max_shares_by_cash = int(remaining_power // price)
+
+            # Factor combinado: ES × VIX × correlación
+            combined_factor = risk_factor * vix_factor * corr_penalty
+
+            final_shares = int(
+                min(requested_shares, max_shares_by_cash, max_shares_by_position)
+                * combined_factor
+            )
+
+            if final_shares > 0:
+                cand = dict(cand)
+                cand["shares"] = final_shares
+                cand.setdefault("meta", {})["governor_adj"] = {
+                    "original_shares":      requested_shares,
+                    "risk_factor":          risk_factor,
+                    "vix_factor":           vix_factor,
+                    "corr_penalty":         corr_penalty,
+                    "combined_factor":      round(combined_factor, 3),
+                    "vix_level":            vix,
+                    "max_by_position":      max_shares_by_position,
+                    "max_per_position_usd": round(max_per_position, 2),
+                    "fixed_capital_used":   round(self.fixed_capital, 2),
+                    "effective_es":         round(es, 4),
+                }
+                adjusted.append(cand)
+                remaining_power -= final_shares * price
+                logger.info(
+                    f"✅ {ticker}: {final_shares}s @ ${price:.2f} "
+                    f"(original: {requested_shares}, max_pos: {max_shares_by_position}, "
+                    f"vix_f: {vix_factor:.1f}, corr_f: {corr_penalty:.2f})"
+                )
+            else:
+                logger.warning(
+                    f"❌ {ticker}: Rechazado — cash={max_shares_by_cash}s "
+                    f"pos_limit={max_shares_by_position}s "
+                    f"factor={combined_factor:.2f} remaining=${remaining_power:,.0f}"
+                )
+
+        return adjusted
+
+    # =========================================================
+    # BACKWARD COMPAT — alias sin dynamic para llamadas legacy
+    # =========================================================
+    def _size_candidates(
+        self,
+        candidates: List[Dict],
+        buying_power: float,
+        es: float,
+    ) -> List[Dict]:
+        """Alias v2.8 — llama al nuevo método sin ajustes dinámicos."""
+        return self._size_candidates_dynamic(
+            candidates, buying_power, es,
+            current_positions=[], use_dynamic=False,
+        )
+
+
+# =========================================================
+# MAIN — test local
+# =========================================================
+if __name__ == "__main__":
+    positions = [
+        {"ticker": "GLW", "qty": 248, "price_now": 159.95},
+        {"ticker": "VZ",  "qty": 845, "price_now": 47.27},
+    ]
+
+    gov   = CapitalGovernor(fixed_capital=89_203)
+    state = gov.evaluate(positions)
+    print("🏛 CAPITAL GOVERNOR v2.9")
+    print(json.dumps(state.to_dict(), indent=2))
+
+    candidates = [
+        {"ticker": "CAT", "entry_price": 769.57, "shares": 64},
+        {"ticker": "FDX", "entry_price": 369.80, "shares": 135},
+    ]
+    sized = gov.adjust_sizing(positions, candidates)
+    print("\n📐 Sizing dinámico con VIX + correlación:")
+    for s in sized:
+        adj = s.get("meta", {}).get("governor_adj", {})
+        print(f"  {s['ticker']}: {s['shares']} shares | factor={adj.get('combined_factor')}")
+        
