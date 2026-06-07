@@ -1,9 +1,21 @@
+# =========================================================
+# trading_orchestrator.py — v4.5 CIRCUIT BREAKER
+# =========================================================
+# FIX v4.5:
+#   [CB1] Circuit breaker global — chequeo pre-ejecución que
+#         pausa APERTURAS si el drawdown diario supera el 5%.
+#         Guarda equity de inicio de día en disco (SOD_FILE).
+#         Los CIERRES siempre se ejecutan aunque el breaker
+#         esté activo — nunca bloquea reducción de riesgo.
+#         Umbral configurable via env CIRCUIT_BREAKER_DD_PCT.
+# =========================================================
+
 import logging
 import asyncio
 import os
 import json
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 from broker import get_engine
 
@@ -24,23 +36,26 @@ except ImportError:
 logger = logging.getLogger("trading_orchestrator")
 logging.basicConfig(level=logging.INFO)
 
-DATA_PATH    = Path(os.getenv("DATA_PATH", "/data"))
-ALPHA_FILE   = DATA_PATH / "alpha_last.json"
-ANCHOR_FILE  = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
+DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
+ALPHA_FILE    = DATA_PATH / "alpha_last.json"
+ANCHOR_FILE   = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
 CHAMPION_FILE = DATA_PATH / "darwin" / "champion.json"
+
+# [CB1] Archivo SOD (Start-Of-Day equity)
+SOD_FILE = DATA_PATH / "circuit_breaker_sod.json"
+
+# Umbral de drawdown diario para activar el breaker (default 5%)
+CIRCUIT_BREAKER_DD_PCT = float(os.getenv("CIRCUIT_BREAKER_DD_PCT", "0.05"))
 
 
 def _load_active_genome_ids() -> tuple:
     """
-    [FIX] Lee el genome_id real del campeón desde disco.
-    Antes estaba hardcodeado como "executor_v1" / "predictor_v1"
-    → el campeón nunca acumulaba trades → siempre insufficient_data
-    → nunca se promovía ningún candidato.
+    Lee el genome_id real del campeón desde disco.
     Retorna (executor_genome_id, predictor_genome_id).
     """
     try:
         if CHAMPION_FILE.exists():
-            data = json.loads(CHAMPION_FILE.read_text())
+            data    = json.loads(CHAMPION_FILE.read_text())
             exec_id = data.get("genome_id", "executor_v1")
             pred_id = data.get("predictor_genome_id", "predictor_v1")
             return exec_id, pred_id
@@ -65,8 +80,11 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.4 ALPHA-CONSUMER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.5 CIRCUIT-BREAKER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
 
+    # =========================================================
+    # CAPITAL
+    # =========================================================
     async def _get_real_capital(self) -> float:
         try:
             account = await self.broker.get_account()
@@ -84,6 +102,78 @@ class TradingOrchestrator:
         logger.info(f"🏛 Governor refrescado | capital=${self.fixed_capital:,.0f}")
         return gov
 
+    # =========================================================
+    # [CB1] CIRCUIT BREAKER
+    # =========================================================
+    async def _circuit_breaker_check(self, current_equity: float) -> Dict[str, Any]:
+        """
+        [CB1] Compara equity actual vs equity inicio de día (SOD).
+        Si drawdown diario > CIRCUIT_BREAKER_DD_PCT → bloquea aperturas.
+        Los cierres NO se bloquean nunca.
+
+        SOD se guarda en disco al primer run del día.
+        Se resetea automáticamente cada día de mercado.
+        """
+        today_str = date.today().isoformat()
+
+        # Leer o crear SOD
+        sod_equity = None
+        try:
+            if SOD_FILE.exists():
+                sod_data = json.loads(SOD_FILE.read_text())
+                if sod_data.get("date") == today_str:
+                    sod_equity = float(sod_data["equity"])
+                    logger.info(f"🔋 SOD cargado | fecha={today_str} equity=${sod_equity:,.0f}")
+        except Exception as e:
+            logger.warning(f"⚠️ Error leyendo SOD: {e}")
+
+        # Si no hay SOD de hoy, guardar equity actual como SOD
+        if sod_equity is None:
+            sod_equity = current_equity
+            try:
+                SOD_FILE.parent.mkdir(parents=True, exist_ok=True)
+                SOD_FILE.write_text(json.dumps({
+                    "date":   today_str,
+                    "equity": sod_equity,
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                }))
+                logger.info(f"🔋 SOD nuevo | fecha={today_str} equity=${sod_equity:,.0f}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error guardando SOD: {e}")
+
+        # Calcular drawdown diario
+        if sod_equity > 0:
+            daily_dd = (sod_equity - current_equity) / sod_equity
+        else:
+            daily_dd = 0.0
+
+        breaker_active = daily_dd > CIRCUIT_BREAKER_DD_PCT
+
+        if breaker_active:
+            logger.error(
+                f"🛑 CIRCUIT BREAKER ACTIVO | "
+                f"DD={daily_dd:.2%} > {CIRCUIT_BREAKER_DD_PCT:.0%} | "
+                f"SOD=${sod_equity:,.0f} actual=${current_equity:,.0f} | "
+                f"APERTURAS BLOQUEADAS — cierres permitidos"
+            )
+        else:
+            logger.info(
+                f"✅ Circuit breaker OK | "
+                f"DD={daily_dd:.2%} < {CIRCUIT_BREAKER_DD_PCT:.0%} | "
+                f"SOD=${sod_equity:,.0f}"
+            )
+
+        return {
+            "active":         breaker_active,
+            "daily_dd":       round(daily_dd, 4),
+            "threshold":      CIRCUIT_BREAKER_DD_PCT,
+            "sod_equity":     sod_equity,
+            "current_equity": current_equity,
+        }
+
+    # =========================================================
+    # HELPERS
+    # =========================================================
     def _load_anchor_tickers(self) -> set:
         try:
             data    = json.loads(ANCHOR_FILE.read_text())
@@ -160,7 +250,7 @@ class TradingOrchestrator:
             pos    = dict(pos)
 
             if ticker in broker_price_map:
-                pos["price_now"] = broker_price_map[ticker]
+                pos["price_now"]  = broker_price_map[ticker]
                 price_map[ticker] = broker_price_map[ticker]
             elif float(pos.get("entry_price", 0) or 0) > 0:
                 pos["price_now"] = float(pos["entry_price"])
@@ -252,9 +342,9 @@ class TradingOrchestrator:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
-    # RUN PRINCIPAL v4.4
-        # =========================================================
-    async def run(
+    # RUN PRINCIPAL v4.5
+    # =========================================================
+        async def run(
         self,
         market_ctx: Dict[str, Any],
         signals: Dict = None,
@@ -262,13 +352,17 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.4 ALPHA-CONSUMER+DARWIN | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.5 CIRCUIT-BREAKER+DARWIN | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
         # [FIX] Leer genome_id real del campeón una sola vez por run
         executor_genome_id, predictor_genome_id = _load_active_genome_ids()
         logger.info(f"🧬 Genomas activos | executor={executor_genome_id} predictor={predictor_genome_id}")
+
+        # [CB1] Circuit breaker — chequear antes de cualquier ejecución
+        cb_result = await self._circuit_breaker_check(self.fixed_capital)
+        breaker_active = cb_result["active"]
 
         if hasattr(self.broker, "sync_positions_from_broker"):
             sync_result = self.broker.sync_positions_from_broker()
@@ -358,7 +452,7 @@ class TradingOrchestrator:
         closes = list({c["ticker"]: c for c in closes}.values())
 
         # =========================================================
-        # PASO 2: Ejecutar CIERRES
+        # PASO 2: Ejecutar CIERRES (siempre — breaker no los bloquea)
         # =========================================================
         close_successes = []
         if closes:
@@ -434,6 +528,31 @@ class TradingOrchestrator:
             f"efectivos={sorted(portfolio_tickers)}"
         )
 
+        # [CB1] Si breaker activo → saltar aperturas completamente
+        if breaker_active:
+            logger.error(
+                f"🛑 CIRCUIT BREAKER — aperturas omitidas | "
+                f"DD={cb_result['daily_dd']:.2%} | "
+                f"cierres ejecutados={len(close_successes)}"
+            )
+            return {
+                "status":             "circuit_breaker",
+                "mode":               mode,
+                "executed":           len(close_successes),
+                "closes_executed":    len(close_successes),
+                "opens_executed":     0,
+                "elite_executed":     0,
+                "queue_size":         0,
+                "real_capital":       round(self.fixed_capital, 2),
+                "circuit_breaker":    cb_result,
+                "darwin_tracking":    DARWIN_TRACKING,
+                "results":            [],
+                "decisions":          pm_decisions,
+            }
+
+        # =========================================================
+        # PASO 4: Construir cola de APERTURAS
+        # =========================================================
         for decision in pm_decisions:
             if decision.get("action") in ["OPEN", "ROTATE"]:
                 opens.append(decision)
@@ -530,7 +649,7 @@ class TradingOrchestrator:
                 logger.warning(f"⛔ REJECT {ticker} alpha={score:.3f}")
 
         # =========================================================
-        # PASO 4: Ejecutar APERTURAS
+        # PASO 5: Ejecutar APERTURAS
         # =========================================================
         results          = []
         executed_opens   = 0
@@ -547,7 +666,6 @@ class TradingOrchestrator:
                 # ── DARWIN: registrar apertura con genome_id real ─
                 if DARWIN_TRACKING:
                     try:
-                        # [FIX] Usar genome_id del campeón real, no hardcodeado
                         register_open(
                             ticker              = order["ticker"],
                             entry_price         = float(order.get("entry_price") or 0),
@@ -559,8 +677,7 @@ class TradingOrchestrator:
                         )
                         logger.info(
                             f"📝 TRADE OPEN registrado | {order['ticker']} | "
-                            f"entrada=${order.get('entry_price', 0):.2f} | "
-                            f"dominante=? | horizonte=?d"
+                            f"entrada=${order.get('entry_price', 0):.2f}"
                         )
                     except Exception as _te:
                         logger.warning(f"⚠️ darwin open {order['ticker']}: {_te}")
@@ -587,7 +704,7 @@ class TradingOrchestrator:
                 })
 
         # =========================================================
-        # PASO 5: Limpiar store si cierres OK
+        # PASO 6: Limpiar store si cierres OK
         # =========================================================
         if close_successes:
             all_closes_ok = len(close_successes) == len(closes)
@@ -625,10 +742,14 @@ class TradingOrchestrator:
             "alpha_timestamp":    alpha_data.get("timestamp"),
             "intraday_evaluated": len(intraday_signals),
             "darwin_tracking":    DARWIN_TRACKING,
+            "circuit_breaker":    cb_result,
             "results":            results,
             "decisions":          pm_decisions,
         }
 
+    # =========================================================
+    # PREVIEW EXECUTABILITY
+    # =========================================================
     async def preview_executability(self, market_ctx: Dict) -> Dict:
         positions  = self._enrich_positions_with_price(load_positions())
         alpha_data = self._load_last_alpha()
@@ -654,6 +775,9 @@ class TradingOrchestrator:
         rows.sort(key=lambda x: x["alpha"] or 0, reverse=True)
         return {"mode": mode, "threshold": threshold, "rows": rows}
 
+    # =========================================================
+    # HELPERS INTERNOS
+    # =========================================================
     def _load_last_alpha(self) -> Dict:
         if not ALPHA_FILE.exists():
             raise RuntimeError("❌ alpha_last.json no encontrado.")
@@ -691,17 +815,4 @@ class TradingOrchestrator:
             elif mode == "defensive":
                 pm  = PMDefensive()
                 raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
-                if isinstance(raw, list):
-                    decisions.extend(
-                        [r if isinstance(r, dict) else r.to_dict() for r in raw]
-                    )
-                elif isinstance(raw, dict):
-                    decisions.extend(raw.get("decisions", []))
-            else:
-                pm  = PMNeutral()
-                raw = pm.evaluate_portfolio(positions)
-                decisions.extend(raw.get("decisions", []))
-        except Exception as e:
-            logger.error(f"PM error: {e}")
-        return decisions
-        
+    
