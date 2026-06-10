@@ -1,5 +1,5 @@
 # =========================================================
-# pipeline_router.py — PIPELINE ROUTER v2.4
+# pipeline_router.py — PIPELINE ROUTER v2.5
 # =========================================================
 # v2.2: [F7] Intraday tracker como paso 10.5
 # v2.3: [F8] Intraday evaluator como paso 4.6
@@ -7,6 +7,10 @@
 #        Libera memoria entre model runner, evaluator y alpha engine
 #        para evitar crash "Ran out of memory (used over 512MB)"
 #        Cada paso corre uno a uno sin acumular en memoria.
+# v2.5: [F10] Lock anti-doble ejecución
+#        Evita que un reinicio de Render o un segundo trigger del
+#        scheduler lancen dos pipelines en paralelo, causando
+#        condiciones de carrera en /data y consumo doble de RAM.
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -34,6 +38,14 @@ from regime_threshold_learner import run_learning_cycle
 
 router = APIRouter()
 logger = logging.getLogger("pipeline")
+
+# =========================================================
+# [F10] LOCK ANTI-DOBLE EJECUCIÓN
+# =========================================================
+# Variable global que indica si hay un pipeline corriendo.
+# Si el scheduler o Render disparan un segundo request mientras
+# el primero aún está en curso, se retorna status="skipped".
+_pipeline_running = False
 
 
 # =========================================================
@@ -95,6 +107,7 @@ def _alpha_done_today(data_path: Path) -> bool:
 # =========================================================
 
 async def _run_pipeline_logic(request: Request):
+    global _pipeline_running
 
     start_ts = datetime.utcnow().isoformat()
     logger.info("=" * 60)
@@ -287,6 +300,8 @@ async def _run_pipeline_logic(request: Request):
         traceback.print_exc()
 
     finally:
+        # [F10] Liberar lock siempre, incluso si el pipeline falló
+        _pipeline_running = False
         gc.collect()  # [F9] limpieza final siempre
         end_ts = datetime.utcnow().isoformat()
         logger.info("=" * 60)
@@ -300,13 +315,26 @@ async def _run_pipeline_logic(request: Request):
 
 @router.post("/internal/pipeline/run")
 async def run_pipeline(request: Request):
+    global _pipeline_running
+
     if request.headers.get("X-PIPELINE-KEY") != os.getenv("PIPELINE_KEY"):
         raise HTTPException(403, "Invalid pipeline key")
 
+    # [F10] Si ya hay un pipeline corriendo, ignorar el request
+    if _pipeline_running:
+        logger.warning("⚠️ [F10] Pipeline ya en ejecución — request ignorado")
+        return {
+            "status":    "skipped",
+            "reason":    "pipeline_already_running",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    # [F10] Marcar como activo ANTES de lanzar la tarea
+    _pipeline_running = True
     asyncio.create_task(_run_pipeline_logic(request))
 
     return {
         "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
             }
-        
+    
