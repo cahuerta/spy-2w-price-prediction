@@ -12,10 +12,12 @@
 #   [D1] universe(): kill switch retornaba executable=True — corregido
 #   [D2] executability_preview(): capital real de Alpaca
 #   [D3] universe(): agregado tickers.json como fuente principal
-#        Antes solo leía alpha_last.json → universe vacío cuando
-#        el pipeline no corre (fin de semana, etc.)
-#        Ahora: tickers.json (fuente principal) + alpha_last.json
-#        (enriquece con alpha reciente) + positions (posiciones abiertas)
+#   [D4] latest_snapshot(): enriquece historical con evaluaciones
+#        limpias reales desde /data/evaluations/.
+#        Antes: historical.hit_rate_mean siempre null (campo del
+#        modelo que nunca se calculaba en producción).
+#        Ahora: lee evaluaciones con legacy_bad_horizon=False,
+#        price_real válido, hit_sign no nulo → hit_rate real.
 # =========================================================
 
 import os
@@ -133,6 +135,59 @@ async def _get_real_capital() -> float:
         logger.warning(f"⚠️ No se pudo leer equity Alpaca: {e} → usando env")
     return float(os.getenv("FIXED_CAPITAL", 1_000_000))
 
+
+# =========================================================
+# [D4] HELPER — hit rate real desde evaluaciones limpias
+# =========================================================
+def _get_real_hit_rate(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    [D4] Lee evaluaciones limpias del ticker y calcula hit_rate real.
+    Solo usa evaluaciones con:
+      - legacy_bad_horizon=False (evaluadas con horizonte correcto)
+      - price_real no None (tienen precio real de Alpaca)
+      - hit_sign no None (se pudo calcular dirección)
+
+    Retorna dict compatible con el campo 'historical' del frontend,
+    o None si no hay evaluaciones limpias suficientes.
+    """
+    eval_dir = Path(DATA_PATH) / "evaluations" / ticker.upper()
+    if not eval_dir.exists():
+        return None
+
+    hits:   list = []
+    errors: list = []
+
+    for f in eval_dir.glob("*.json"):
+        ev = load_json(f)
+        if not ev:
+            continue
+        # Filtro estricto: solo evaluaciones limpias
+        if ev.get("legacy_bad_horizon") is True:
+            continue
+        if ev.get("price_real") is None:
+            continue
+        if ev.get("alpaca_unsupported") is True:
+            continue
+        if ev.get("hit_sign") is None:
+            continue
+
+        hits.append(1.0 if ev["hit_sign"] else 0.0)
+        err = ev.get("error_return_pct")
+        if err is not None:
+            errors.append(float(err))
+
+    if not hits:
+        return None
+
+    return {
+        "hit_rate_mean": round(sum(hits) / len(hits), 4),
+        "mae_mean":      round(sum(errors) / len(errors), 4) if errors else None,
+        "rmse_mean":     None,
+        "n_windows":     len(hits),
+        "source":        "evaluations_v2",  # distingue del campo legacy null
+    }
+
+
 # =========================================================
 # STATUS
 # =========================================================
@@ -203,6 +258,7 @@ async def prediction_summary(
 
 # =========================================================
 # LATEST
+# [D4] Enriquece historical con evaluaciones limpias reales
 # =========================================================
 @router.get("/latest/{ticker}")
 async def latest_snapshot(ticker: str):
@@ -218,6 +274,24 @@ async def latest_snapshot(ticker: str):
     last = load_json(files[-1])
     if not last:
         raise HTTPException(404, "Invalid prediction file")
+
+    # [D4] Enriquecer historical con hit_rate real de evaluaciones limpias
+    real_metrics = _get_real_hit_rate(ticker)
+    if real_metrics:
+        # Preservar campos que el modelo sí calcula (pca_dims, n_features)
+        existing = last.get("historical") or {}
+        real_metrics["pca_dims"]   = existing.get("pca_dims")
+        real_metrics["n_features"] = existing.get("n_features")
+        last["historical"] = real_metrics
+        logger.debug(
+            f"[D4] {ticker} hit_rate={real_metrics['hit_rate_mean']:.1%} "
+            f"n={real_metrics['n_windows']} evaluaciones limpias"
+        )
+    else:
+        # Sin evaluaciones limpias — mantener estructura pero indicar fuente
+        existing = last.get("historical") or {}
+        existing["source"] = "model_legacy"
+        last["historical"] = existing
 
     return {"ticker": ticker, "latest": last}
 
@@ -302,8 +376,6 @@ async def executability_preview():
 # =========================================================
 # UNIVERSE
 # [D3] tickers.json como fuente principal del universo completo
-#      alpha_last.json enriquece con datos recientes
-#      positions agrega posiciones abiertas aunque no estén en tickers
 # =========================================================
 @router.get("/universe")
 async def universe():
@@ -313,17 +385,14 @@ async def universe():
     TICKERS_FILE    = Path(DATA_PATH) / "tickers.json"
     market_ctx_path = Path(DATA_PATH) / "market_context.json"
 
-    # Fuente 1: universo completo de tickers evaluados históricamente
     try:
         tickers_universe = set(json.loads(TICKERS_FILE.read_text()) or [])
     except Exception:
         tickers_universe = set()
 
-    # Fuente 2: alpha reciente (puede ser subset del universo)
     alpha_data = load_json(ALPHA_FILE) or {}
     alpha_map  = alpha_data.get("results", {})
 
-    # Fuente 3: posiciones abiertas en broker
     positions_list = load_positions()
     positions = {
         p.get("ticker", "").upper(): p
@@ -336,7 +405,6 @@ async def universe():
     thresholds        = {"growth": 0.65, "neutral": 0.75, "defensive": 0.85}
     current_threshold = thresholds.get(mode, 0.75)
 
-    # Unión de las tres fuentes
     universe_tickers = tickers_universe | set(alpha_map.keys()) | set(positions.keys())
 
     rows = []
@@ -392,4 +460,3 @@ async def real_execution():
     except Exception as e:
         logger.error(f"Error en endpoint real-execution: {e}")
         raise HTTPException(500, str(e))
-    
