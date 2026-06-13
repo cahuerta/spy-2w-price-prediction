@@ -87,14 +87,16 @@ def run_predictor_h1(ticker: str):
     _alpha    = ALPHA_H1
     _max_pca  = MAX_PCA_COMPONENTS
     _clip_ret = CLIP_RET
+    _decay    = 0.0               # [SW1] default neutro — sin cambio de comportamiento
     _feature_override = None
 
     if DARWIN_PREDICTOR:
         try:
             genome    = load_active_genome(HORIZON)
-            _alpha    = genome.model_params.get("alpha_ridge", ALPHA_H1)
-            _max_pca  = genome.model_params.get("max_pca",     MAX_PCA_COMPONENTS)
-            _clip_ret = genome.model_params.get("clip_ret",    CLIP_RET)
+            _alpha    = genome.model_params.get("alpha_ridge",         ALPHA_H1)
+            _max_pca  = genome.model_params.get("max_pca",             MAX_PCA_COMPONENTS)
+            _clip_ret = genome.model_params.get("clip_ret",            CLIP_RET)
+            _decay    = genome.model_params.get("sample_weight_decay", 0.0)  # [SW1]
             if genome.data.get("n_evaluations", 0) >= 20:
                 _feature_override = genome.features
         except Exception:
@@ -141,7 +143,15 @@ def run_predictor_h1(ticker: str):
         ("pca",    PCA(n_components=dynamic_pca)),
         ("ridge",  Ridge(alpha=_alpha))
     ])
-    model.fit(X, y)
+
+    # [SW1] Sample weights exponenciales — Darwin controla _decay
+    # _decay=0.0 → todos los días pesan igual (comportamiento actual, sin cambio)
+    # _decay>0.0 → datos recientes pesan más (Darwin lo activa si detecta bias)
+    if _decay > 0.0:
+        sw = np.exp(np.linspace(-_decay, 0, len(y)))
+        model.fit(X, y, ridge__sample_weight=sw)
+    else:
+        model.fit(X, y)
 
     last_features = feat[feature_cols].iloc[-1:]
     if last_features.isna().any().any():
@@ -172,6 +182,7 @@ def run_predictor_h1(ticker: str):
             "pca_components": dynamic_pca,
             "features_count": len(feature_cols),
             "genome_active":  DARWIN_PREDICTOR,
+            "weight_decay":   _decay,   # [SW1] trazabilidad
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -184,7 +195,6 @@ if __name__ == "__main__":
         path = os.path.join(DATA_OUTPUT_DIR, f"{ticker}_H1.json")
         with open(path, "w") as f:
             json.dump(result, f, indent=2, default=str)
-        print(f"✅ H1 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | {result['return_pct']}% | conf={result['confidence']}")
+        print(f"✅ H1 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | {result['return_pct']}% | conf={result['confidence']} | decay={_decay}")
     else:
         print("❌ Datos insuficientes")
-    
