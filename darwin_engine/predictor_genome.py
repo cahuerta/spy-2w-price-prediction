@@ -1,8 +1,6 @@
 """
 darwin_engine/predictor_genome.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ARCHIVO NUEVO — darwin_engine/predictor_genome.py
-
 Genoma evolucionable para cada predictor H1-H10.
 
 Cada H tiene su propio genoma independiente que controla:
@@ -10,13 +8,21 @@ Cada H tiene su propio genoma independiente que controla:
   - Parámetros del modelo (Ridge alpha, PCA components)
   - Parámetros de features (ventanas RSI, EMA, volatilidad, lags)
   - Clip del retorno predicho
+  - sample_weight_decay [SW1]: cuánto peso dar a datos recientes
 
 Los predictores leen su genoma activo al ejecutarse.
 Si no existe genoma → usan sus parámetros originales (sin romper nada).
 
-Ruta en repo: darwin_engine/predictor_genome.py
-Genomas guardados en: predictor_genomes/H{n}/champion.json
-                                         H{n}/shadow/genome_v{n}.json
+FIXES:
+  [SW1] sample_weight_decay agregado a BASE_MODEL_PARAMS H1-H9.
+        H10 excluido — ya tiene walk-forward que cumple la misma función.
+        Valor inicial 0.0 = comportamiento idéntico al actual.
+        Darwin lo muta cuando detecta bias_score alto (bias temporal).
+
+  [SW2] bias_score agregado al genome como métrica de diagnóstico.
+        bias_score = fracción de predicciones positivas que fallaron.
+        GOOGL: 15/16 = 0.94 → bias alcista severo en caída.
+        Darwin usa este score para decidir si mutar sample_weight_decay.
 """
 
 import json
@@ -29,15 +35,14 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger("predictor_genome")
 
-DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
-REPO_PATH     = Path(os.getenv("REPO_PATH", "/opt/render/project/src"))
-GENOME_BASE   = REPO_PATH / "predictor_genomes"
+DATA_PATH   = Path(os.getenv("DATA_PATH", "/data"))
+REPO_PATH   = Path(os.getenv("REPO_PATH", "/opt/render/project/src"))
+GENOME_BASE = REPO_PATH / "predictor_genomes"
 
 # ══════════════════════════════════════════════════════
 # FEATURE POOLS — todos los genes posibles
 # ══════════════════════════════════════════════════════
 
-# Features disponibles para evolución
 FEATURE_POOL = {
     # Retornos y lags
     "ret_lag_1":   {"type": "lag", "lag": 1},
@@ -46,41 +51,32 @@ FEATURE_POOL = {
     "ret_lag_5":   {"type": "lag", "lag": 5},
     "ret_lag_10":  {"type": "lag", "lag": 10},
     "ret_lag_20":  {"type": "lag", "lag": 20},
-
     # Volatilidad realizada
     "rv_10":  {"type": "rv", "window": 10},
     "rv_20":  {"type": "rv", "window": 20},
     "rv_25":  {"type": "rv", "window": 25},
     "rv_60":  {"type": "rv", "window": 60},
-
     # Rango precio
     "range":  {"type": "range"},
-
     # Cambio de volumen
     "vol_chg": {"type": "vol_chg"},
-
     # RSI Z-score
     "rsi_z_14_60":  {"type": "rsi_z", "rsi_window": 14, "norm_window": 60},
     "rsi_z_7_30":   {"type": "rsi_z", "rsi_window": 7,  "norm_window": 30},
     "rsi_z_21_90":  {"type": "rsi_z", "rsi_window": 21, "norm_window": 90},
-
     # EMA slope
     "ema_slope_20_5":  {"type": "ema_slope", "span": 20, "shift": 5},
     "ema_slope_50_10": {"type": "ema_slope", "span": 50, "shift": 10},
     "ema_slope_10_3":  {"type": "ema_slope", "span": 10, "shift": 3},
-
-    # Trend slope (regresión lineal)
+    # Trend slope
     "slope_10":  {"type": "slope", "window": 10},
     "slope_25":  {"type": "slope", "window": 25},
     "slope_50":  {"type": "slope", "window": 50},
-
-    # Hurst (para horizontes largos)
+    # Hurst
     "hurst_60":  {"type": "hurst", "window": 60},
     "hurst_120": {"type": "hurst", "window": 120},
 }
 
-# Features base por horizonte (punto de partida evolutivo)
-# Basado en lo que cada H usa actualmente
 BASE_FEATURES_BY_HORIZON = {
     1:  ["range", "rv_10", "rsi_z_7_30",  "ema_slope_10_3",  "slope_10",
          "ret_lag_1", "ret_lag_2", "ret_lag_3"],
@@ -106,19 +102,28 @@ BASE_FEATURES_BY_HORIZON = {
          "ret_lag_10", "ret_lag_20"],
 }
 
-# Parámetros del modelo base por horizonte
+# [SW1] sample_weight_decay agregado a H1-H9
+# H10 excluido — ya tiene walk-forward propio
 BASE_MODEL_PARAMS = {
-    1:  {"alpha_ridge": 0.5, "max_pca": 8,  "clip_ret": 0.05, "period": "1y"},
-    2:  {"alpha_ridge": 0.5, "max_pca": 8,  "clip_ret": 0.06, "period": "1y"},
-    3:  {"alpha_ridge": 0.6, "max_pca": 10, "clip_ret": 0.07, "period": "1y"},
-    4:  {"alpha_ridge": 0.7, "max_pca": 10, "clip_ret": 0.08, "period": "2y"},
-    5:  {"alpha_ridge": 0.7, "max_pca": 12, "clip_ret": 0.09, "period": "2y"},
-    6:  {"alpha_ridge": 0.8, "max_pca": 12, "clip_ret": 0.10, "period": "2y"},
-    7:  {"alpha_ridge": 0.8, "max_pca": 14, "clip_ret": 0.11, "period": "2y"},
-    8:  {"alpha_ridge": 0.9, "max_pca": 14, "clip_ret": 0.12, "period": "max"},
-    9:  {"alpha_ridge": 1.0, "max_pca": 16, "clip_ret": 0.13, "period": "max"},
-    10: {"alpha_ridge": 1.0, "max_pca": 16, "clip_ret": 0.15, "period": "max"},
+    1:  {"alpha_ridge": 0.5, "max_pca": 8,  "clip_ret": 0.05, "period": "1y",  "sample_weight_decay": 0.0},
+    2:  {"alpha_ridge": 0.5, "max_pca": 8,  "clip_ret": 0.06, "period": "1y",  "sample_weight_decay": 0.0},
+    3:  {"alpha_ridge": 0.6, "max_pca": 10, "clip_ret": 0.07, "period": "1y",  "sample_weight_decay": 0.0},
+    4:  {"alpha_ridge": 0.7, "max_pca": 10, "clip_ret": 0.08, "period": "2y",  "sample_weight_decay": 0.0},
+    5:  {"alpha_ridge": 0.7, "max_pca": 12, "clip_ret": 0.09, "period": "2y",  "sample_weight_decay": 0.0},
+    6:  {"alpha_ridge": 0.8, "max_pca": 12, "clip_ret": 0.10, "period": "2y",  "sample_weight_decay": 0.0},
+    7:  {"alpha_ridge": 0.8, "max_pca": 14, "clip_ret": 0.11, "period": "2y",  "sample_weight_decay": 0.0},
+    8:  {"alpha_ridge": 0.9, "max_pca": 14, "clip_ret": 0.12, "period": "max", "sample_weight_decay": 0.0},
+    9:  {"alpha_ridge": 1.0, "max_pca": 16, "clip_ret": 0.13, "period": "max", "sample_weight_decay": 0.0},
+    10: {"alpha_ridge": 1.0, "max_pca": 16, "clip_ret": 0.15, "period": "max"},  # H10 sin decay
 }
+
+# [SW2] Límites de mutación para sample_weight_decay
+# Darwin puede mutar entre 0.0 (sin ponderación) y 3.0 (recientes ~20x más peso)
+DECAY_LIMITS = (0.0, 3.0)
+
+# Umbral de bias_score para activar mutación de decay
+# Si fracción de pred+ que falló >= 0.70 → modelo tiene bias temporal severo
+BIAS_SCORE_THRESHOLD = 0.70
 
 
 # ══════════════════════════════════════════════════════
@@ -136,22 +141,22 @@ class PredictorGenome:
 
     def _build_default(self, horizon: int) -> Dict:
         return {
-            "genome_id":    f"H{horizon}_v1",
-            "horizon":      horizon,
-            "generation":   1,
-            "parent_ids":   [],
-            "fitness":      None,
-            "hit_rate":     None,
-            "n_evaluations": 0,
-            "created_at":   datetime.now(timezone.utc).isoformat(),
-
-            # Genes principales
-            "features":     deepcopy(BASE_FEATURES_BY_HORIZON.get(horizon, [])),
-            "model_params": deepcopy(BASE_MODEL_PARAMS.get(horizon, {
-                "alpha_ridge": 0.8,
-                "max_pca":     12,
-                "clip_ret":    0.10,
-                "period":      "2y",
+            "genome_id":      f"H{horizon}_v1",
+            "horizon":        horizon,
+            "generation":     1,
+            "parent_ids":     [],
+            "fitness":        None,
+            "hit_rate":       None,
+            "bias_score":     None,   # [SW2] fracción pred+ que falló
+            "n_evaluations":  0,
+            "created_at":     datetime.now(timezone.utc).isoformat(),
+            "features":       deepcopy(BASE_FEATURES_BY_HORIZON.get(horizon, [])),
+            "model_params":   deepcopy(BASE_MODEL_PARAMS.get(horizon, {
+                "alpha_ridge":         0.8,
+                "max_pca":             12,
+                "clip_ret":            0.10,
+                "period":              "2y",
+                "sample_weight_decay": 0.0,
             })),
         }
 
@@ -184,6 +189,26 @@ class PredictorGenome:
     @hit_rate.setter
     def hit_rate(self, value: float):
         self.data["hit_rate"] = value
+
+    @property
+    def bias_score(self) -> Optional[float]:
+        """[SW2] Fracción de predicciones positivas que fallaron."""
+        return self.data.get("bias_score")
+
+    @bias_score.setter
+    def bias_score(self, value: float):
+        self.data["bias_score"] = value
+
+    @property
+    def sample_weight_decay(self) -> float:
+        """[SW1] Decay actual del genome. 0.0 = sin ponderación temporal."""
+        return self.model_params.get("sample_weight_decay", 0.0)
+
+    @property
+    def has_temporal_bias(self) -> bool:
+        """[SW2] True si el bias_score supera el umbral crítico."""
+        bs = self.bias_score
+        return bs is not None and bs >= BIAS_SCORE_THRESHOLD
 
     @property
     def generation(self) -> int:
@@ -225,6 +250,11 @@ class PredictorGenome:
         if path.exists():
             try:
                 data = json.loads(path.read_text())
+                # [SW1] Migración silenciosa: genomas antiguos sin sample_weight_decay
+                if "model_params" in data and "sample_weight_decay" not in data["model_params"]:
+                    if horizon < 10:  # H10 no necesita el campo
+                        data["model_params"]["sample_weight_decay"] = 0.0
+                        logger.info(f"🔄 H{horizon} migrado: sample_weight_decay=0.0 agregado")
                 logger.info(f"✅ Champion H{horizon} cargado: {data.get('genome_id')}")
                 return cls.from_dict(data)
             except Exception as e:
@@ -249,9 +279,12 @@ class PredictorGenome:
         return genomes
 
     def describe(self) -> str:
+        decay = self.model_params.get("sample_weight_decay", "N/A")
+        bias  = f"{self.bias_score:.2f}" if self.bias_score is not None else "?"
         return (
             f"PredictorGenome [H{self.horizon}] {self.genome_id} "
             f"gen={self.generation} fit={self.fitness} hit={self.hit_rate} "
+            f"bias={bias} decay={decay} "
             f"features={len(self.features)} "
             f"alpha={self.model_params.get('alpha_ridge')} "
             f"pca={self.model_params.get('max_pca')}"
@@ -262,61 +295,114 @@ class PredictorGenome:
 
 
 # ══════════════════════════════════════════════════════
-# API PÚBLICA — usada por predictor_hN.py
+# API PÚBLICA
 # ══════════════════════════════════════════════════════
 
 def load_active_genome(horizon: int) -> PredictorGenome:
-    """
-    Carga el genoma campeón para un horizonte dado.
-    Si no existe → crea y guarda el default.
-
-    Llamar al inicio de run_predictor_hN():
-        genome = load_active_genome(6)
-        feature_cols = genome.features
-        alpha        = genome.model_params["alpha_ridge"]
-    """
     return PredictorGenome.load_champion(horizon)
 
 
 def get_feature_cols(horizon: int) -> List[str]:
-    """Shortcut para obtener solo las features del campeón."""
     return load_active_genome(horizon).features
 
 
 def get_model_params(horizon: int) -> Dict:
-    """Shortcut para obtener solo los parámetros del modelo."""
     return load_active_genome(horizon).model_params
 
 
 # ══════════════════════════════════════════════════════
-# EVALUACIÓN DE HIT RATE — actualiza fitness del genome
+# ACTUALIZACIÓN DE MÉTRICAS — llamada después de cada ciclo
 # ══════════════════════════════════════════════════════
 
 def update_genome_hit_rate(horizon: int, new_hit_rate: float, n_evals: int) -> None:
-    """
-    Actualiza el hit rate del genoma campeón con datos frescos del evaluator.
-    Llamar desde el evaluator o desde predictor_arena después de cada ciclo.
-    """
+    """Actualiza hit_rate del campeón con datos frescos del evaluator."""
     genome = PredictorGenome.load_champion(horizon)
     genome.hit_rate = round(new_hit_rate, 4)
     genome.data["n_evaluations"] = n_evals
     genome.data["hit_rate_updated_at"] = datetime.now(timezone.utc).isoformat()
     genome.save_as_champion()
-    logger.info(
-        f"📊 H{horizon} hit_rate actualizado: {new_hit_rate:.2%} "
-        f"({n_evals} evaluaciones)"
-    )
+    logger.info(f"📊 H{horizon} hit_rate={new_hit_rate:.2%} ({n_evals} evals)")
+
+
+def update_genome_bias_score(horizon: int, bias_score: float) -> None:
+    """
+    [SW2] Actualiza el bias_score del campeón.
+
+    bias_score = predicciones_positivas_que_fallaron / total_predicciones_positivas
+
+    Ejemplos:
+      GOOGL H2: 15 pred+ fallaron de 16 pred+ → bias_score = 0.94
+      AMAT  H2: 2  pred+ fallaron de 20 pred+ → bias_score = 0.10
+
+    Darwin llama a esta función después de cada ciclo de evaluación.
+    Si bias_score >= BIAS_SCORE_THRESHOLD → predictor_mutator muta decay.
+    """
+    genome = PredictorGenome.load_champion(horizon)
+    genome.bias_score = round(bias_score, 4)
+    genome.data["bias_score_updated_at"] = datetime.now(timezone.utc).isoformat()
+    genome.save_as_champion()
+    status = "⚠️ BIAS ALTO" if bias_score >= BIAS_SCORE_THRESHOLD else "✅ OK"
+    logger.info(f"🎯 H{horizon} bias_score={bias_score:.2f} {status}")
 
 
 # ══════════════════════════════════════════════════════
-# INICIALIZAR TODOS LOS GENOMAS (primera vez)
+# CÁLCULO DE BIAS SCORE desde evaluaciones en disco
+# ══════════════════════════════════════════════════════
+
+def calc_bias_score_from_evals(ticker: str, horizon: int, min_evals: int = 10) -> Optional[float]:
+    """
+    [SW2] Calcula bias_score leyendo evaluaciones limpias del ticker.
+
+    Solo usa evaluaciones con:
+      - legacy_bad_horizon=False
+      - price_real no None
+      - weak_signal=False (tiene señal real)
+      - hit_sign no None
+
+    Retorna None si hay menos de min_evals evaluaciones válidas.
+    """
+    eval_dir = DATA_PATH / "evaluations" / ticker.upper()
+    if not eval_dir.exists():
+        return None
+
+    pred_pos_total  = 0  # predicciones positivas con señal
+    pred_pos_failed = 0  # predicciones positivas que fallaron
+
+    for f in eval_dir.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+
+        if d.get("legacy_bad_horizon") is True:
+            continue
+        if d.get("price_real") is None:
+            continue
+        if d.get("weak_signal") is True:
+            continue
+        if d.get("hit_sign") is None:
+            continue
+
+        pred_ret = d.get("predicted_return_pct", 0) or 0
+        hit      = d.get("hit_sign", False)
+
+        if pred_ret > 0.05:  # predicción positiva con señal
+            pred_pos_total += 1
+            if not hit:
+                pred_pos_failed += 1
+
+    if pred_pos_total < min_evals:
+        return None
+
+    return round(pred_pos_failed / pred_pos_total, 4)
+
+
+# ══════════════════════════════════════════════════════
+# INICIALIZAR TODOS LOS GENOMAS
 # ══════════════════════════════════════════════════════
 
 def initialize_all_genomes() -> Dict[str, str]:
-    """
-    Crea los genomas default para H1-H10 si no existen.
-    Llamar una sola vez al hacer deploy.
-    """
+    """Crea los genomas default para H1-H10 si no existen."""
     results = {}
     for h in range(1, 11):
         path = GENOME_BASE / f"H{h}" / "champion.json"
@@ -340,3 +426,4 @@ if __name__ == "__main__":
     for h, status in results.items():
         genome = PredictorGenome.load_champion(int(h[1:]))
         print(f"  {h}: {status} → {genome.describe()}")
+  
