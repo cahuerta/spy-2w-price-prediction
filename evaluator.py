@@ -22,30 +22,36 @@ ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY")
 EVAL_HORIZON  = int(os.getenv("EVAL_HORIZON", "10"))
 PRICE_CACHE: Dict[str, float] = {}
 
+# Umbral mínimo de señal direccional para evaluar hit_sign
+# Predicciones con |pred| < umbral → hit_sign=None (sin señal)
+HIT_SIGN_MIN_PCT = float(os.getenv("HIT_SIGN_MIN_PCT", "0.05"))
+
 # ======================================================
-# FIXES v2.2 — EVALUACIÓN ESTRICTA POR DÍA HÁBIL:
+# FIXES v2.3:
 #
-#   [E1] nth_business_day(start, n): calcula el n-ésimo día
-#        hábil desde start_date, saltando sábados y domingos.
-#        H1 → 1er día hábil siguiente a la predicción.
-#        H7 → 7mo día hábil siguiente. Estricto y correcto.
-#
-#   [E2] get_price_at_date busca el precio exacto en la fecha
-#        objetivo. Si cae en fin de semana o feriado (no hay
-#        datos en Alpaca), toma el cierre del día hábil
-#        anterior más cercano (hasta 5 días hacia atrás).
-#
-#   [E3] evaluate_models evalúa cada Hx usando el precio
-#        real en el n-ésimo día hábil después de la predicción.
-#        Cada H tiene su fecha objetivo estricta e independiente.
-#
+#   [E1] nth_business_day(start, n): días hábiles estrictos.
+#   [E2] get_price_at_date: precio exacto, fallback hábil anterior.
+#   [E3] evaluate_models: cada Hx en su n-ésimo día hábil exacto.
 #   [E4] Tickers sin soporte Alpaca marcados alpaca_unsupported.
-#
-#   [E5] Trazabilidad: evaluation_horizon_days,
-#        evaluation_target_date (día hábil real).
-#
+#   [E5] Trazabilidad: evaluation_horizon_days, evaluation_target_date.
 #   [E6] legacy_bad_horizon=False en evaluaciones nuevas.
 #        evaluate_all recalcula si legacy_bad_horizon != False.
+#
+#   [E7] FIX hit_sign con pred≈0:
+#        np.sign(0.0) = 0 → nunca igual a np.sign(±real) → siempre False.
+#        Esto penalizaba injustamente tickers con predicciones débiles
+#        (MCD, SO, KR, EQIX) dándoles hit_rate artificialmente bajo.
+#        Solución: si |predicted_return| < HIT_SIGN_MIN_PCT → hit_sign=None.
+#        None es excluido del cálculo de rolling_metrics en signals.py.
+#        Impacto medido antes del fix:
+#          SO:   26.9% → 50.0% (sin pred≈0)
+#          KR:   24.1% → 40.6%
+#          EQIX: 24.6% → 37.1%
+#          MCD:  20.3% → 27.5%
+#          BALL: 30.9% → 36.4%
+#        TTWO y GOOGL no mejoran → genuinamente malos predictores.
+#
+#   [E7b] Mismo fix aplicado en evaluate_models para hit_sign de H1-H10.
 # ======================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +64,7 @@ ALPACA_UNSUPPORTED_SUFFIXES = (
 ALPACA_UNSUPPORTED_EXACT = {
     "OR.PA", "AIR.PA", "NOVN.SW", "ENB.TO", "MFC.TO",
     "IBE.MC", "SAN.MC", "DTE.DE", "NESN.SW", "RY.TO",
-    "TTE.PA", "BNP.PA", "ABI.BR", "ASML.AS",
+    "TTE.PA", "BNP.PA", "ABI.BR", "ASML.AS", "BF-B",
 }
 
 
@@ -77,31 +83,17 @@ def nth_business_day(start: date_type, n: int) -> date_type:
     """
     [E1] Retorna el n-ésimo día hábil (lun-vie) después de start.
     start no cuenta — se empieza a contar desde el día siguiente.
-
-    Ejemplos con start=lunes 2026-06-09:
-      n=1 → martes  2026-06-10
-      n=5 → lunes   2026-06-15
-      n=7 → miércoles 2026-06-17
-
-    Ejemplos con start=viernes 2026-06-12:
-      n=1 → lunes   2026-06-15  (salta el fin de semana)
-      n=2 → martes  2026-06-16
     """
     current = start
     count   = 0
     while count < n:
         current += timedelta(days=1)
-        if current.weekday() < 5:  # 0=lunes, 4=viernes
+        if current.weekday() < 5:
             count += 1
     return current
 
 
 def prev_business_day(d: date_type) -> date_type:
-    """
-    Retorna el día hábil anterior o igual a d.
-    Si d es sábado → viernes. Si es domingo → viernes.
-    Si es lunes → lunes (ya es hábil).
-    """
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
@@ -132,6 +124,7 @@ class EvaluationResult:
     evaluated_at: str
     alpaca_unsupported: bool = False
     legacy_bad_horizon: bool = False
+    weak_signal: bool = False        # [E7] True si |pred| < HIT_SIGN_MIN_PCT
     models_diagnostics: Dict[str, Any] = None
     models_summary: Dict[str, Any] = None
 
@@ -169,23 +162,54 @@ def parse_date(s: str):
 
 def _eval_needs_recalculation(eval_path: Path) -> bool:
     """
-    [E6] True si la evaluación debe crearse o recalcularse:
-      - No existe → True
-      - legacy_bad_horizon=False → False (ya está bien)
-      - Cualquier otro caso → True (recalcular)
+    [E6] True si la evaluación debe crearse o recalcularse.
+    También recalcula evaluaciones v2.2 que no tienen el fix E7
+    (no tienen el campo 'weak_signal').
     """
     if not eval_path.exists():
         return True
     try:
         d = json.loads(eval_path.read_text())
-        return d.get("legacy_bad_horizon") is not False
+        # Si está marcada como mala → recalcular
+        if d.get("legacy_bad_horizon") is not False:
+            return True
+        # Si no tiene el campo weak_signal → es v2.2 sin fix E7 → recalcular
+        if "weak_signal" not in d:
+            return True
+        return False
     except Exception:
         return True
 
 
 # ======================================================
+# [E7] HIT SIGN CON UMBRAL DE SEÑAL
+# ======================================================
+
+def _calc_hit_sign(
+    predicted_return: float,
+    real_return: float,
+) -> Tuple[Optional[bool], bool]:
+    """
+    [E7] Calcula hit_sign con umbral de señal mínima.
+
+    Si |predicted_return| < HIT_SIGN_MIN_PCT:
+      - hit_sign = None (señal demasiado débil para evaluar dirección)
+      - weak_signal = True
+      Antes: np.sign(0.0) = 0 → siempre False → hit_rate artificialmente bajo
+
+    Si |predicted_return| >= HIT_SIGN_MIN_PCT:
+      - hit_sign = bool(sign(pred) == sign(real))
+      - weak_signal = False
+
+    Returns: (hit_sign, weak_signal)
+    """
+    if abs(predicted_return) < HIT_SIGN_MIN_PCT:
+        return None, True
+    return bool(np.sign(predicted_return) == np.sign(real_return)), False
+
+
+# ======================================================
 # PRECIO REAL
-# [E2] Estricto: fecha exacta, fallback al hábil anterior
 # ======================================================
 
 _alpaca_client: Optional[StockHistoricalDataClient] = None
@@ -200,11 +224,8 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
 
 def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
     """
-    [E2] Obtiene el precio de cierre en target_date.
-    Si no hay datos (feriado, fin de semana), retrocede hasta
-    5 días hábiles hacia atrás para encontrar el último cierre.
-
-    No avanza hacia adelante — solo busca hacia atrás.
+    [E2] Precio de cierre en target_date.
+    Fallback al día hábil anterior si es feriado o fin de semana.
     """
     key = f"{ticker}_{target_date}"
     if key in PRICE_CACHE:
@@ -215,7 +236,6 @@ def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
 
     try:
         client  = _get_alpaca_client()
-        # Buscar desde 7 días antes de target hasta target
         request = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=TimeFrame.Day,
@@ -228,7 +248,6 @@ def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
 
         bars = bars.reset_index()
         bars["date"] = bars["timestamp"].dt.date
-        # Solo días <= target_date (no adelantar)
         bars = bars[bars["date"] <= target_date]
         if bars.empty:
             return None
@@ -243,7 +262,6 @@ def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
 
 # ======================================================
 # EVALUACIÓN MODELOS H1-H10
-# [E3] Cada Hx evaluado en su n-ésimo día hábil exacto
 # ======================================================
 
 def evaluate_models(
@@ -252,16 +270,9 @@ def evaluate_models(
 ) -> Dict[str, Any]:
     """
     [E3] Para cada horizonte h (1 a 10):
-      1. Calcula el h-ésimo día hábil después de pred_date
-         usando nth_business_day() — estricto, sin tolerancia.
-      2. Obtiene el precio real en esa fecha (con fallback
-         al día hábil anterior si es feriado).
-      3. Busca el archivo de predicción de pred_date y lee
-         price_path[h-1] como precio predicho para ese día.
-      4. Calcula hit_sign, error_pct.
-
-    Cada H tiene su propia fecha objetivo independiente.
-    H1 nunca usa datos de H2 ni viceversa.
+      - h-ésimo día hábil después de pred_date
+      - price_path[h-1] vs precio real en esa fecha
+      - [E7b] hit_sign=None si pred≈0
     """
     models: Dict[str, Any] = {}
     pred_root = Path(DATA_PATH) / "predictions" / ticker
@@ -282,10 +293,7 @@ def evaluate_models(
         if len(curve) < h:
             continue
 
-        # [E3] Fecha objetivo estricta: h-ésimo día hábil
-        target = nth_business_day(pred_date, h)
-
-        # Precio real en esa fecha exacta
+        target     = nth_business_day(pred_date, h)
         price_real = get_price_at_date(ticker, target)
         if not price_real:
             continue
@@ -294,14 +302,18 @@ def evaluate_models(
         pred_ret   = (price_pred / price_now - 1) * 100
         real_ret   = (price_real / price_now - 1) * 100
 
+        # [E7b] Umbral de señal para H diagnósticos
+        h_hit_sign, h_weak = _calc_hit_sign(pred_ret, real_ret)
+
         models[f"H{h}"] = {
-            "target_date": str(target),
-            "pred_price":  round(price_pred, 4),
-            "pred_return": round(pred_ret,   4),
-            "real_price":  round(price_real, 4),
-            "real_return": round(real_ret,   4),
-            "error_pct":   round(abs(pred_ret - real_ret), 4),
-            "hit_sign":    bool(np.sign(pred_ret) == np.sign(real_ret)),
+            "target_date":  str(target),
+            "pred_price":   round(price_pred, 4),
+            "pred_return":  round(pred_ret,   4),
+            "real_price":   round(price_real, 4),
+            "real_return":  round(real_ret,   4),
+            "error_pct":    round(abs(pred_ret - real_ret), 4),
+            "hit_sign":     h_hit_sign,   # None si señal débil
+            "weak_signal":  h_weak,
         }
 
     return models
@@ -328,7 +340,7 @@ def evaluate_prediction(
 ) -> Optional[EvaluationResult]:
     """
     Evalúa la predicción en su horizonte_days-ésimo día hábil.
-    El precio real se obtiene en esa fecha exacta.
+    [E7] hit_sign=None si |predicted_return| < HIT_SIGN_MIN_PCT.
     """
     pred = load_json(prediction_path)
     if "meta" not in pred or "prediction" not in pred:
@@ -339,16 +351,14 @@ def evaluate_prediction(
     ticker = meta["ticker"]
     theta  = float(meta.get("theta", 0.75))
 
-    h_days    = horizon_days or int(meta.get("horizon_days", EVAL_HORIZON))
-    pred_date = parse_date(prediction_path.stem)
+    h_days      = horizon_days or int(meta.get("horizon_days", EVAL_HORIZON))
+    pred_date   = parse_date(prediction_path.stem)
     if pred_date is None:
         return None
 
-    # [E1] Fecha objetivo = h-ésimo día hábil después de pred_date
     target_date = nth_business_day(pred_date, h_days)
     unsupported = _is_alpaca_unsupported(ticker)
 
-    # [E2] Precio real en la fecha objetivo estricta
     real_price       = get_price_at_date(ticker, target_date) if not unsupported else None
     price_now        = float(p.get("price_now", 0))
     price_pred       = float(p.get("price_pred", 0))
@@ -357,10 +367,14 @@ def evaluate_prediction(
 
     real_return = hit_sign = hit_threshold = decision_correct = None
     error_price_pct = error_return_pct = None
+    weak_signal = False
 
     if real_price and price_now > 0:
-        real_return      = (real_price / price_now - 1) * 100.0
-        hit_sign         = bool(np.sign(real_return) == np.sign(predicted_return))
+        real_return = (real_price / price_now - 1) * 100.0
+
+        # [E7] Umbral de señal — excluye pred≈0 del hit_rate
+        hit_sign, weak_signal = _calc_hit_sign(predicted_return, real_return)
+
         hit_threshold    = bool(abs(real_return) >= theta)
         error_price_pct  = abs(price_pred / real_price - 1) * 100.0
         error_return_pct = abs(predicted_return - real_return)
@@ -372,7 +386,6 @@ def evaluate_prediction(
         else:
             decision_correct = abs(real_return) < theta
 
-    # [E3] Evaluación estricta por horizonte de cada H
     models_diag = evaluate_models(ticker, pred_date) if not unsupported else {}
     models_sum  = summarize_models(models_diag)
 
@@ -396,6 +409,7 @@ def evaluate_prediction(
         evaluated_at=datetime.utcnow().isoformat(),
         alpaca_unsupported=unsupported,
         legacy_bad_horizon=False,
+        weak_signal=weak_signal,
         models_diagnostics=models_diag,
         models_summary=models_sum,
     )
@@ -414,8 +428,8 @@ def evaluate_all(
     """
     Para cada predicción:
       1. Calcula su fecha objetivo (nth_business_day)
-      2. Solo evalúa si esa fecha ya pasó (today >= target)
-      3. Recalcula si legacy_bad_horizon != False
+      2. Solo evalúa si esa fecha ya pasó
+      3. Recalcula si legacy_bad_horizon != False o falta weak_signal
     """
     pred_root = Path(DATA_PATH) / "predictions"
     eval_root = Path(DATA_PATH) / "evaluations"
@@ -448,16 +462,13 @@ def evaluate_all(
             except Exception:
                 h_days = horizon
 
-            # [E1] Fecha objetivo = h-ésimo día hábil estricto
             target_date = nth_business_day(pred_date, h_days)
 
-            # Solo evaluar si el horizonte ya venció
             if target_date > today:
                 continue
 
             eval_file = eval_root / td.name / f"{pred_file.stem}.json"
 
-            # [E6] Recalcular si es necesario
             if not _eval_needs_recalculation(eval_file):
                 continue
 
@@ -466,7 +477,7 @@ def evaluate_all(
     if dry_run:
         return {"pending": len(pending)}
 
-    logger.info(f"📊 Evaluator v2.2 | {len(pending)} predicciones a evaluar/recalcular")
+    logger.info(f"📊 Evaluator v2.3 | {len(pending)} predicciones a evaluar/recalcular")
 
     workers = max_workers or MAX_WORKERS
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -492,7 +503,7 @@ def evaluate_all(
         "skipped":   len(results["skipped"]),
         "errors":    len(results["errors"]),
     }
-    logger.info(f"✅ Evaluator v2.2 COMPLETADO | {results['summary']}")
+    logger.info(f"✅ Evaluator v2.3 COMPLETADO | {results['summary']}")
     return results
 
 
