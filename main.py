@@ -1,5 +1,5 @@
 # =========================================================
-# main.py — TRADING SUITE ENTERPRISE v2.9.4 PRODUCCIÓN
+# main.py — TRADING SUITE ENTERPRISE v2.9.5 PRODUCCIÓN
 # =========================================================
 # ✔ Runtime de trading (NO batch)
 # ✔ NO decide mercado
@@ -24,6 +24,12 @@
 #        contra anchor_universe.json — tickers que no existen en el
 #        anchor universe se loggean como advertencia pero NO se agregan
 #        al universe de predicción (evita OPENs silenciosos ignorados).
+#
+# v2.9.5:
+#   [M6] monitor_close: fallback Yahoo Finance para exit_price cuando
+#        broker y positions_snapshot no tienen precio fresco.
+#        Evita exit_price=0 → pnl_real=-100% ficticio en Darwin Engine.
+#        Bug ocurría en cierres intraday_diverging pre-T4.
 # =========================================================
 
 import os
@@ -185,15 +191,15 @@ def load_market_context() -> MarketOrchestrationContext:
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Trading Suite v2.9.4 START")
+    logger.info("🚀 Trading Suite v2.9.5 START")
     merge_tickers_on_startup()
     start_scheduler()
     yield
-    logger.info("🛑 Trading Suite v2.9.4 STOP")
+    logger.info("🛑 Trading Suite v2.9.5 STOP")
 
 app = FastAPI(
     title="Trading Suite Enterprise",
-    version="2.9.4",
+    version="2.9.5",
     lifespan=lifespan,
 )
 
@@ -321,6 +327,7 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
             try:
                 from darwin_engine.trade_tracker import register_close
 
+                # Fallback 1: precio del resultado del broker
                 exit_price = 0.0
                 if result and hasattr(result, "filled_avg_price") and result.filled_avg_price:
                     exit_price = float(result.filled_avg_price)
@@ -332,6 +339,7 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
                         or 0
                     )
 
+                # Fallback 2: precio desde positions_snapshot en disco
                 if exit_price <= 0:
                     exit_price = next(
                         (
@@ -342,15 +350,37 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
                         0.0,
                     )
 
-                alpha_at_close = alpha_map.get(ticker.upper(), 0.0)
-                logger.info(f"📝 Darwin monitor-close {ticker} @ ${exit_price:.2f}")
+                # [M6] Fallback 3: Yahoo Finance directo
+                # Evita exit_price=0 cuando broker y disco no tienen precio fresco.
+                # Bug documentado: intraday_diverging pre-v1.2 generaba pnl=-100% ficticio.
+                if exit_price <= 0:
+                    try:
+                        import yfinance as yf
+                        tk   = yf.Ticker(ticker)
+                        hist = tk.history(period="1d", interval="5m")
+                        if hist is not None and not hist.empty:
+                            exit_price = float(hist["Close"].dropna().iloc[-1])
+                            logger.info(f"📡 [M6] exit_price Yahoo fallback {ticker} @ ${exit_price:.2f}")
+                        else:
+                            logger.warning(f"⚠️ [M6] Yahoo sin datos para {ticker}")
+                    except Exception as _yf:
+                        logger.warning(f"⚠️ [M6] Yahoo fallback {ticker}: {_yf}")
 
-                register_close(
-                    ticker      = ticker,
-                    exit_price  = exit_price,
-                    reason      = reason,
-                    alpha_score = alpha_at_close,
-                )
+                if exit_price <= 0:
+                    logger.error(
+                        f"❌ [M6] exit_price=0 tras 3 fallbacks para {ticker} — "
+                        f"register_close abortado (evita pnl=-100% ficticio en Darwin)"
+                    )
+                else:
+                    alpha_at_close = alpha_map.get(ticker.upper(), 0.0)
+                    logger.info(f"📝 Darwin monitor-close {ticker} @ ${exit_price:.2f}")
+                    register_close(
+                        ticker      = ticker,
+                        exit_price  = exit_price,
+                        reason      = reason,
+                        alpha_score = alpha_at_close,
+                    )
+
             except Exception as _de:
                 logger.warning(f"⚠️ darwin monitor-close {ticker}: {_de}")
 
@@ -596,4 +626,3 @@ if __name__ == "__main__":
         port=config.PORT,
         log_level="error",
     )
-    
