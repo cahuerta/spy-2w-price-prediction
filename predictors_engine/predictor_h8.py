@@ -79,8 +79,8 @@ def make_features_h8(df: pd.DataFrame):
     out["adx_14"] = dx.ewm(alpha=alpha_adx).mean().clip(0, 100)
 
     ema50 = out["Close"].shift(1).ewm(span=50).mean()
-    out["ema50_slope"]     = ((ema50 - ema50.shift(5)) / ema50.shift(5)).clip(-0.1, 0.1)
-    out["trend_strength"]  = out["adx_14"] * np.sign(out["ema50_slope"])
+    out["ema50_slope"]    = ((ema50 - ema50.shift(5)) / ema50.shift(5)).clip(-0.1, 0.1)
+    out["trend_strength"] = out["adx_14"] * np.sign(out["ema50_slope"])
 
     # Features adicionales para evolución
     out["rv_20"]   = past_ret.rolling(20).std().clip(1e-6) * np.sqrt(252)
@@ -104,18 +104,20 @@ def make_features_h8(df: pd.DataFrame):
 def run_predictor_h8(ticker: str):
     raw = get_price_history(ticker=ticker, period="2y", interval="1d")
 
-    # ── DARWIN ────────────────────────────────────────
+    # ── DARWIN: cargar genoma activo ──────────────────
     _alpha    = ALPHA_H8
     _max_pca  = MAX_PCA_COMPONENTS
     _clip_ret = CLIP_RET
+    _decay    = 0.0               # [SW1] default neutro — sin cambio de comportamiento
     _feature_override = None
 
     if DARWIN_PREDICTOR:
         try:
             genome    = load_active_genome(HORIZON)
-            _alpha    = genome.model_params.get("alpha_ridge", ALPHA_H8)
-            _max_pca  = genome.model_params.get("max_pca",     MAX_PCA_COMPONENTS)
-            _clip_ret = genome.model_params.get("clip_ret",    CLIP_RET)
+            _alpha    = genome.model_params.get("alpha_ridge",         ALPHA_H8)
+            _max_pca  = genome.model_params.get("max_pca",             MAX_PCA_COMPONENTS)
+            _clip_ret = genome.model_params.get("clip_ret",            CLIP_RET)
+            _decay    = genome.model_params.get("sample_weight_decay", 0.0)  # [SW1]
             if genome.data.get("n_evaluations", 0) >= 20:
                 _feature_override = genome.features
         except Exception:
@@ -157,7 +159,15 @@ def run_predictor_h8(ticker: str):
         ("pca",    PCA(n_components=dynamic_pca, random_state=42)),
         ("ridge",  Ridge(alpha=_alpha, random_state=42))
     ])
-    model.fit(X, y)
+
+    # [SW1] Sample weights exponenciales — Darwin controla _decay
+    # _decay=0.0 → todos los días pesan igual (comportamiento actual, sin cambio)
+    # _decay>0.0 → datos recientes pesan más (Darwin lo activa si detecta bias)
+    if _decay > 0.0:
+        sw = np.exp(np.linspace(-_decay, 0, len(y)))
+        model.fit(X, y, ridge__sample_weight=sw)
+    else:
+        model.fit(X, y)
 
     last_features = feat[feature_cols].iloc[-1:]
     if last_features.isna().any().any():
@@ -168,8 +178,8 @@ def run_predictor_h8(ticker: str):
     price_today = float(feat["Close"].iloc[-1])
     price_8d    = price_today * np.exp(y_pred_log)
 
-    adx_now    = float(feat["adx_14"].iloc[-1])
-    regime     = "STRONG" if adx_now > 35 else "WEAK" if adx_now < 20 else "NEUTRAL"
+    adx_now = float(feat["adx_14"].iloc[-1])
+    regime  = "STRONG" if adx_now > 35 else "WEAK" if adx_now < 20 else "NEUTRAL"
 
     try:
         coef_std = float(np.std(model.named_steps["ridge"].coef_))
@@ -191,6 +201,7 @@ def run_predictor_h8(ticker: str):
             "alpha":          _alpha,
             "pca_components": dynamic_pca,
             "genome_active":  DARWIN_PREDICTOR,
+            "weight_decay":   _decay,  # [SW1] trazabilidad
         },
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -203,7 +214,6 @@ if __name__ == "__main__":
         path = os.path.join(DATA_OUTPUT_DIR, f"{ticker}_H8.json")
         with open(path, "w") as f:
             json.dump(result, f, indent=2)
-        print(f"✅ H8 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | {result['return_pct']}% | ADX={result['adx']} ({result['regime']})")
+        print(f"✅ H8 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | {result['return_pct']}% | ADX={result['adx']} ({result['regime']}) | decay={_decay}")
     else:
         print("⚠️ H8 sin resultado")
-    
