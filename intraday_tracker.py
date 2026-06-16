@@ -356,12 +356,22 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         else:
             curve_status = "diverging"
 
-    # ─── PnL actual vs precio de entrada original ─────────
+    # ─── PnL actual vs precio de entrada REAL ─────────────
+    # Usa entry_price de positions_meta (precio real pagado).
+    # Fallback a price_now de la curva si no está disponible.
     ret_vs_entrada     = None
     ret_esperado_total = None
 
+    entry_price_real = 0.0
+    try:
+        from positions_meta import get_all
+        meta             = get_all()
+        entry_price_real = float(meta.get(ticker, {}).get("entry_price", 0) or 0)
+    except Exception:
+        pass
+
     if curve:
-        price_now_orig = float(curve.get("price_now", 0))
+        price_now_orig = entry_price_real if entry_price_real > 0 else float(curve.get("price_now", 0))
         path           = curve.get("price_path", [])
         if price_now_orig > 0:
             ret_vs_entrada = round((precio_actual / price_now_orig - 1) * 100, 2)
