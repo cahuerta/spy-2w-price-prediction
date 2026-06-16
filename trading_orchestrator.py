@@ -1,13 +1,20 @@
 # =========================================================
-# trading_orchestrator.py — v4.5 CIRCUIT BREAKER
+# trading_orchestrator.py — v4.6 TRACKER-PM INTEGRATION
 # =========================================================
-# FIX v4.5:
-#   [CB1] Circuit breaker global — chequeo pre-ejecución que
-#         pausa APERTURAS si el drawdown diario supera el 5%.
-#         Guarda equity de inicio de día en disco (SOD_FILE).
-#         Los CIERRES siempre se ejecutan aunque el breaker
-#         esté activo — nunca bloquea reducción de riesgo.
-#         Umbral configurable via env CIRCUIT_BREAKER_DD_PCT.
+# v4.6:
+#   Refactor arquitectural del flujo intraday:
+#   - El tracker ya NO corre con universo propio.
+#   - El PM decide primero qué comprar/vender.
+#   - El tracker recibe EXACTAMENTE esas listas del PM
+#     y evalúa solo timing (ENTRAR/ESPERAR/CERRAR/TRAILING).
+#   - La decisión final sigue siendo del orchestrator + CG.
+#
+#   Cambios respecto a v4.5:
+#   [IT1] _load_intraday_signals() eliminado — era universo propio
+#   [IT2] Tracker se llama DESPUÉS del PM con listas pm_opens/pm_closes
+#   [IT3] Filtro intraday usa sugerencia="ENTRAR" (no "entrar_ahora")
+#   [IT4] Cierres: tracker puede sugerir TRAILING — orchestrator respeta
+#   [IT5] Orden correcto: PM → Tracker → CG → Broker
 # =========================================================
 
 import logging
@@ -49,10 +56,6 @@ CIRCUIT_BREAKER_DD_PCT = float(os.getenv("CIRCUIT_BREAKER_DD_PCT", "0.05"))
 
 
 def _load_active_genome_ids() -> tuple:
-    """
-    Lee el genome_id real del campeón desde disco.
-    Retorna (executor_genome_id, predictor_genome_id).
-    """
     try:
         if CHAMPION_FILE.exists():
             data    = json.loads(CHAMPION_FILE.read_text())
@@ -80,7 +83,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.5 CIRCUIT-BREAKER+DARWIN | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.6 TRACKER-PM INTEGRATION | fallback capital ${self._fallback_capital:,.0f}")
 
     # =========================================================
     # CAPITAL
@@ -106,17 +109,7 @@ class TradingOrchestrator:
     # [CB1] CIRCUIT BREAKER
     # =========================================================
     async def _circuit_breaker_check(self, current_equity: float) -> Dict[str, Any]:
-        """
-        [CB1] Compara equity actual vs equity inicio de día (SOD).
-        Si drawdown diario > CIRCUIT_BREAKER_DD_PCT → bloquea aperturas.
-        Los cierres NO se bloquean nunca.
-
-        SOD se guarda en disco al primer run del día.
-        Se resetea automáticamente cada día de mercado.
-        """
-        today_str = date.today().isoformat()
-
-        # Leer o crear SOD
+        today_str  = date.today().isoformat()
         sod_equity = None
         try:
             if SOD_FILE.exists():
@@ -127,16 +120,14 @@ class TradingOrchestrator:
         except Exception as e:
             logger.warning(f"⚠️ Error leyendo SOD: {e}")
 
-        # Si no hay SOD de hoy, guardar equity actual como SOD
         if sod_equity is None:
             sod_equity = current_equity
             try:
                 SOD_FILE.parent.mkdir(parents=True, exist_ok=True)
-                # [FIX] Escritura atómica via tmp → replace para evitar race condition
                 tmp = SOD_FILE.with_suffix(".tmp")
                 tmp.write_text(json.dumps({
-                    "date":   today_str,
-                    "equity": sod_equity,
+                    "date":     today_str,
+                    "equity":   sod_equity,
                     "saved_at": datetime.now(timezone.utc).isoformat(),
                 }))
                 tmp.replace(SOD_FILE)
@@ -144,25 +135,18 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.warning(f"⚠️ Error guardando SOD: {e}")
 
-        # Calcular drawdown diario
-        if sod_equity > 0:
-            daily_dd = (sod_equity - current_equity) / sod_equity
-        else:
-            daily_dd = 0.0
-
+        daily_dd       = (sod_equity - current_equity) / sod_equity if sod_equity > 0 else 0.0
         breaker_active = daily_dd > CIRCUIT_BREAKER_DD_PCT
 
         if breaker_active:
             logger.error(
-                f"🛑 CIRCUIT BREAKER ACTIVO | "
-                f"DD={daily_dd:.2%} > {CIRCUIT_BREAKER_DD_PCT:.0%} | "
+                f"🛑 CIRCUIT BREAKER ACTIVO | DD={daily_dd:.2%} > {CIRCUIT_BREAKER_DD_PCT:.0%} | "
                 f"SOD=${sod_equity:,.0f} actual=${current_equity:,.0f} | "
                 f"APERTURAS BLOQUEADAS — cierres permitidos"
             )
         else:
             logger.info(
-                f"✅ Circuit breaker OK | "
-                f"DD={daily_dd:.2%} < {CIRCUIT_BREAKER_DD_PCT:.0%} | "
+                f"✅ Circuit breaker OK | DD={daily_dd:.2%} < {CIRCUIT_BREAKER_DD_PCT:.0%} | "
                 f"SOD=${sod_equity:,.0f}"
             )
 
@@ -187,19 +171,51 @@ class TradingOrchestrator:
             logger.warning(f"⚠️ No se pudo cargar anchor_universe.json: {e}")
             return set()
 
-    def _load_intraday_signals(self) -> Dict[str, Dict]:
+    # [IT1] _load_intraday_signals() ELIMINADO — era universo propio del tracker.
+    # En v4.6 el tracker recibe listas del PM via _evaluar_timing_entrada()
+    # y _evaluar_posiciones_abiertas().
+
+    def _evaluar_timing_entrada(self, tickers: List[str]) -> Dict[str, Dict]:
+        """
+        [IT2] Llama al tracker con la lista exacta que el PM decidió comprar.
+        Retorna dict {ticker: señal} con sugerencia ENTRAR/ESPERAR.
+        """
+        if not tickers:
+            return {}
         try:
-            from intraday_tracker import get_entry_signals_today
-            signals = get_entry_signals_today()
-            if signals:
-                listos = [t for t, s in signals.items() if s.get("entrar_ahora")]
-                logger.info(
-                    f"📡 Intraday signals | {len(signals)} evaluados | "
-                    f"listos para entrar: {listos}"
-                )
+            from intraday_tracker import evaluar_timing_entrada
+            signals = evaluar_timing_entrada(tickers)
+            entrar  = [t for t, s in signals.items() if s.get("sugerencia") == "ENTRAR"]
+            esperar = [t for t, s in signals.items() if s.get("sugerencia") == "ESPERAR"]
+            logger.info(
+                f"📡 Tracker entrada | evaluados={len(signals)} | "
+                f"ENTRAR={entrar} | ESPERAR={esperar}"
+            )
             return signals
         except Exception as e:
-            logger.warning(f"⚠️ Intraday signals no disponibles: {e}")
+            logger.warning(f"⚠️ evaluar_timing_entrada no disponible: {e}")
+            return {}
+
+    def _evaluar_posiciones_abiertas(self, tickers: List[str]) -> Dict[str, Dict]:
+        """
+        [IT2] Llama al tracker con la lista exacta de posiciones abiertas del PM.
+        Retorna dict {ticker: señal} con sugerencia MANTENER/CERRAR/TRAILING.
+        """
+        if not tickers:
+            return {}
+        try:
+            from intraday_tracker import evaluar_posiciones_abiertas
+            signals  = evaluar_posiciones_abiertas(tickers)
+            cerrar   = [t for t, s in signals.items() if s.get("sugerencia") == "CERRAR"]
+            trailing = [t for t, s in signals.items() if s.get("sugerencia") == "TRAILING"]
+            mantener = [t for t, s in signals.items() if s.get("sugerencia") == "MANTENER"]
+            logger.info(
+                f"📊 Tracker posiciones | evaluados={len(signals)} | "
+                f"CERRAR={cerrar} | TRAILING={trailing} | MANTENER={mantener}"
+            )
+            return signals
+        except Exception as e:
+            logger.warning(f"⚠️ evaluar_posiciones_abiertas no disponible: {e}")
             return {}
 
     def _get_broker_positions_tickers(self) -> set:
@@ -291,8 +307,6 @@ class TradingOrchestrator:
 
             price = None
 
-            # [F7] Intentar precio actual del broker primero — evita usar precio stale
-            # del PM que puede tener diferencia de segundos vs ejecución real
             try:
                 broker_data = self.broker.get_positions()
                 if broker_data and ticker in broker_data:
@@ -327,7 +341,7 @@ class TradingOrchestrator:
                 )
                 continue
 
-            o              = dict(o)
+            o                = dict(o)
             o["entry_price"] = price
             o["shares"]      = shares
             enriched.append(o)
@@ -356,9 +370,9 @@ class TradingOrchestrator:
                 logger.info(f"🗑 Órdenes canceladas para {ticker}")
             except Exception as e:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
-        
+
     # =========================================================
-    # RUN PRINCIPAL v4.5
+    # RUN PRINCIPAL v4.6
     # =========================================================
     async def run(
         self,
@@ -368,18 +382,15 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.5 CIRCUIT-BREAKER+DARWIN | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.6 TRACKER-PM INTEGRATION | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
-        # [FIX][F9] Leer genome_id real del campeón en cada run()
-        # Garantiza que si Darwin promovió un nuevo campeón entre runs,
-        # los trades nuevos se atribuyen al genoma correcto
         executor_genome_id, predictor_genome_id = _load_active_genome_ids()
         logger.info(f"🧬 Genomas activos | executor={executor_genome_id} predictor={predictor_genome_id}")
 
         # [CB1] Circuit breaker — chequear antes de cualquier ejecución
-        cb_result = await self._circuit_breaker_check(self.fixed_capital)
+        cb_result      = await self._circuit_breaker_check(self.fixed_capital)
         breaker_active = cb_result["active"]
 
         if hasattr(self.broker, "sync_positions_from_broker"):
@@ -390,8 +401,6 @@ class TradingOrchestrator:
         positions = load_positions()
 
         if len(positions) == 0:
-            # [F5] Broker timeout → intentar sync, pero si falla usar disco stale
-            # No quedarse con [] cuando el broker está caído temporalmente
             logger.warning("⚠️ positions.json vacío → fallback broker")
             if hasattr(self.broker, "get_positions"):
                 try:
@@ -406,7 +415,6 @@ class TradingOrchestrator:
                         save_positions(positions)
                         logger.info(f"🔄 Portfolio sincronizado desde broker: {len(positions)} posiciones")
                     else:
-                        # Broker devolvió vacío — leer disco como último recurso
                         from pathlib import Path as _P
                         import json as _j
                         _disk = DATA_PATH / "positions.json"
@@ -452,8 +460,10 @@ class TradingOrchestrator:
             if isinstance(d, dict)
         }
 
-        intraday_signals = self._load_intraday_signals()
-
+        # =========================================================
+        # PASO 1: PM decide primero — cierra y abre
+        # [IT5] Orden correcto: PM → Tracker → CG → Broker
+        # =========================================================
         pm_decisions = await self._get_pm_decisions(
             mode, positions, signals or {}, anchor_universe
         )
@@ -496,23 +506,55 @@ class TradingOrchestrator:
         closes = list({c["ticker"]: c for c in closes}.values())
 
         # =========================================================
+        # [IT4] TRACKER VALIDA CIERRES — considera PnL actual
+        # Sugerencia TRAILING → no cerrar posiciones muy ganadoras
+        # =========================================================
+        close_tickers_pm = [c["ticker"] for c in closes]
+        if close_tickers_pm:
+            tracker_closes = self._evaluar_posiciones_abiertas(close_tickers_pm)
+            closes_filtrados = []
+            for c in closes:
+                ticker   = c["ticker"]
+                señal    = tracker_closes.get(ticker)
+                if señal and señal.get("sugerencia") == "TRAILING":
+                    pnl = señal.get("pnl_actual_pct", 0)
+                    logger.info(
+                        f"🛡 TRAILING BLOCK {ticker} | PnL={pnl:.1f}% → "
+                        f"no cerrar, activar trailing stop"
+                    )
+                    # Marcamos como trailing para que el orchestrator lo monitoree
+                    c = {**c, "trailing": True, "pnl_actual_pct": pnl}
+                    closes_filtrados.append(c)
+                else:
+                    closes_filtrados.append(c)
+            closes = closes_filtrados
+
+        # =========================================================
         # PASO 2: Ejecutar CIERRES (siempre — breaker no los bloquea)
+        # Solo cierra los que NO tienen trailing=True
         # =========================================================
         close_successes = []
-        if closes:
-            await self._cancel_pending_orders([c["ticker"] for c in closes])
+        closes_ejecutar = [c for c in closes if not c.get("trailing")]
+        closes_trailing = [c for c in closes if c.get("trailing")]
+
+        if closes_trailing:
+            logger.info(
+                f"⏳ TRAILING activo en: "
+                f"{[c['ticker'] for c in closes_trailing]} → no se cierran"
+            )
+
+        if closes_ejecutar:
+            await self._cancel_pending_orders([c["ticker"] for c in closes_ejecutar])
             await asyncio.sleep(0.5)
 
-            for order in closes[:self.daily_limit]:
+            for order in closes_ejecutar[:self.daily_limit]:
                 try:
                     result = await asyncio.wait_for(
                         self.broker.execute_decision(order), timeout=30
                     )
-                    # [FIX] close_successes solo cuenta broker OK — Darwin puede fallar por separado
                     close_successes.append(order["ticker"])
                     logger.info(f"⚰️ CLOSED {order['ticker']}")
 
-                    # ── DARWIN: registrar cierre ──────────────────
                     if DARWIN_TRACKING:
                         try:
                             alpha_at_close = alpha_map.get(
@@ -549,7 +591,6 @@ class TradingOrchestrator:
                             )
                         except Exception as _te:
                             logger.warning(f"⚠️ darwin close {order['ticker']}: {_te}")
-                    # ─────────────────────────────────────────────
 
                     try:
                         from positions_meta import remove_entry
@@ -573,7 +614,7 @@ class TradingOrchestrator:
             f"efectivos={sorted(portfolio_tickers)}"
         )
 
-        # [CB1] Si breaker activo → saltar aperturas completamente
+        # [CB1] Si breaker activo → saltar aperturas
         if breaker_active:
             logger.error(
                 f"🛑 CIRCUIT BREAKER — aperturas omitidas | "
@@ -596,7 +637,7 @@ class TradingOrchestrator:
             }
 
         # =========================================================
-        # PASO 4: Construir cola de APERTURAS
+        # PASO 4: Construir cola de APERTURAS desde PM
         # =========================================================
         for decision in pm_decisions:
             if decision.get("action") in ["OPEN", "ROTATE"]:
@@ -615,40 +656,62 @@ class TradingOrchestrator:
                     "alpha":      score,
                 })
 
-        # ── FILTRO INTRADAY ──────────────────────────────────────
-        if intraday_signals:
-            filtered_opens = []
-            for o in opens:
-                ticker    = o.get("ticker", "").upper()
-                is_anchor = (
-                    o.get("is_anchor")
-                    or o.get("reason", "").startswith("ANCHOR")
-                    or ticker in anchor_tickers
-                )
-                if is_anchor:
-                    filtered_opens.append(o)
-                    continue
-                signal = intraday_signals.get(ticker)
-                if signal is None:
-                    filtered_opens.append(o)
-                    continue
-                if signal.get("entrar_ahora", False):
-                    logger.info(
-                        f"📡 INTRADAY PASS {ticker} | "
-                        f"score={signal.get('entry_score')} "
-                        f"ratio={signal.get('tracking_ratio')}"
-                    )
-                    filtered_opens.append(o)
-                else:
-                    # [FIX] Signal negativa → NO añadir a filtered_opens
-                    logger.info(
-                        f"⏳ INTRADAY ESPERA {ticker} | "
-                        f"score={signal.get('entry_score')} | "
-                        f"{signal.get('razon', '')}"
-                    )
-            opens = filtered_opens
-        # ────────────────────────────────────────────────────────
+        # =========================================================
+        # [IT2][IT3] TRACKER VALIDA TIMING DE ENTRADAS
+        # Recibe EXACTAMENTE la lista que el PM decidió comprar.
+        # Anclas pasan directo — tracker no bloquea anclas.
+        # =========================================================
+        pm_open_tickers = [
+            o["ticker"].upper() for o in opens
+            if not (
+                o.get("is_anchor")
+                or o.get("reason", "").startswith("ANCHOR")
+                or o.get("ticker", "").upper() in anchor_tickers
+            )
+        ]
 
+        tracker_entradas = self._evaluar_timing_entrada(pm_open_tickers)
+
+        filtered_opens = []
+        for o in opens:
+            ticker    = o.get("ticker", "").upper()
+            is_anchor = (
+                o.get("is_anchor")
+                or o.get("reason", "").startswith("ANCHOR")
+                or ticker in anchor_tickers
+            )
+            if is_anchor:
+                # Anclas siempre pasan — tracker no las bloquea
+                filtered_opens.append(o)
+                continue
+
+            señal = tracker_entradas.get(ticker)
+
+            if señal is None:
+                # Sin señal del tracker → pasar (sin datos no bloqueamos)
+                filtered_opens.append(o)
+                continue
+
+            if señal.get("sugerencia") == "ENTRAR":
+                logger.info(
+                    f"📡 INTRADAY PASS {ticker} | "
+                    f"score={señal.get('entry_score')} "
+                    f"ratio={señal.get('tracking_ratio')}"
+                )
+                filtered_opens.append(o)
+            else:
+                # [IT3] ESPERAR → no entra hoy
+                logger.info(
+                    f"⏳ INTRADAY ESPERA {ticker} | "
+                    f"score={señal.get('entry_score')} | "
+                    f"{señal.get('razon', '')}"
+                )
+
+        opens = filtered_opens
+
+        # =========================================================
+        # PASO 4b: CG sizing
+        # =========================================================
         opens_dict   = {o["ticker"].upper(): o for o in opens}
         unique_opens = self._enrich_opens_with_price_and_shares(list(opens_dict.values()))
 
@@ -659,7 +722,7 @@ class TradingOrchestrator:
             or o.get("ticker", "").upper() in anchor_tickers
         ]
         normal_opens       = [o for o in unique_opens if o not in anchor_opens]
-        close_tickers_list = [c["ticker"] for c in closes]
+        close_tickers_list = [c["ticker"] for c in closes_ejecutar]
 
         sized_anchors = self.governor.adjust_sizing_after_closes(
             positions, close_tickers_list, anchor_opens
@@ -709,7 +772,6 @@ class TradingOrchestrator:
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
 
-                # ── DARWIN: registrar apertura con genome_id real ─
                 if DARWIN_TRACKING:
                     try:
                         register_open(
@@ -727,9 +789,7 @@ class TradingOrchestrator:
                         )
                     except Exception as _te:
                         logger.warning(f"⚠️ darwin open {order['ticker']}: {_te}")
-                # ─────────────────────────────────────────────────
 
-                # Solo registrar entry_date si fill confirmado
                 if result.get("status") == "executed":
                     try:
                         from positions_meta import set_entry_date
@@ -753,7 +813,7 @@ class TradingOrchestrator:
         # PASO 6: Limpiar store si cierres OK
         # =========================================================
         if close_successes:
-            all_closes_ok = len(close_successes) == len(closes)
+            all_closes_ok = len(close_successes) == len(closes_ejecutar)
             try:
                 broker_after = self.broker.get_positions()
                 if isinstance(broker_after, dict):
@@ -772,7 +832,8 @@ class TradingOrchestrator:
         logger.info(
             f"✅ EXECUTED {total_executed} | "
             f"Cierres={len(close_successes)} Aperturas={executed_opens} | "
-            f"Elite={elite_count} | Capital final=${self.fixed_capital:,.0f} | "
+            f"Trailing={len(closes_trailing)} | Elite={elite_count} | "
+            f"Capital final=${self.fixed_capital:,.0f} | "
             f"Darwin={'ON' if DARWIN_TRACKING else 'OFF'}"
         )
 
@@ -782,11 +843,12 @@ class TradingOrchestrator:
             "executed":           total_executed,
             "closes_executed":    len(close_successes),
             "opens_executed":     executed_opens,
+            "trailing_activo":    [c["ticker"] for c in closes_trailing],
             "elite_executed":     elite_count,
             "queue_size":         len(final_queue),
             "real_capital":       round(self.fixed_capital, 2),
             "alpha_timestamp":    alpha_data.get("timestamp"),
-            "intraday_evaluated": len(intraday_signals),
+            "intraday_evaluated": len(tracker_entradas),
             "darwin_tracking":    DARWIN_TRACKING,
             "circuit_breaker":    cb_result,
             "results":            results,
@@ -874,4 +936,3 @@ class TradingOrchestrator:
         except Exception as e:
             logger.error(f"PM error: {e}")
         return decisions
-        
