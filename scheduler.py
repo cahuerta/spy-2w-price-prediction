@@ -1,4 +1,5 @@
-# scheduler.py
+# scheduler.py — v2.0
+# =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
 # Responsabilidades:
@@ -17,8 +18,16 @@
 # EJECUCIONES DIARIAS:
 #   11:30 → APERTURA  — predicción + alpha + trading (abre Y cierra)
 #   15:30 → CIERRE    — solo cierra posiciones divergentes
+#   12:00-15:00 → Monitor horario (cada hora) — vigila posiciones abiertas
 #   17:05 → Darwin resolve trades
 #   18:00 viernes → Darwin evolución
+#
+# v2.0 — Monitor horario actualizado para intraday_tracker v3.0:
+#   - run_intraday_tracker() eliminado — usaba universo propio
+#   - Ahora usa evaluar_posiciones_abiertas(tickers) con lista real
+#   - Solo sugiere cierre cuando sugerencia="CERRAR"
+#   - TRAILING → no cierra, deja correr posiciones ganadoras
+# =========================================================
 
 import os
 import time
@@ -49,7 +58,7 @@ MONITOR_HORA_FIN    = int(os.getenv("MONITOR_HORA_FIN",    "15"))
 # ══════════════════════════════════════════════════════
 
 def _trigger_pipeline(motivo: str, close_only: bool = False):
-    ts = datetime.now(CHILE_TZ).isoformat()
+    ts   = datetime.now(CHILE_TZ).isoformat()
     tipo = "🔴 CIERRE" if close_only else "🟢 APERTURA"
     print(f"{'='*55}")
     print(f"{tipo} [{motivo}] | {ts}")
@@ -74,25 +83,47 @@ def _trigger_pipeline(motivo: str, close_only: bool = False):
 
 # ══════════════════════════════════════════════════════
 # MONITOR HORARIO (Yahoo Finance)
+# v2.0 — usa evaluar_posiciones_abiertas() del tracker v3.0
+#   El tracker recibe la lista real de posiciones abiertas.
+#   Solo dispara cierre defensivo cuando sugerencia="CERRAR".
+#   TRAILING → no cierra, deja correr posiciones ganadoras.
 # ══════════════════════════════════════════════════════
 
 def _trigger_monitor(motivo: str):
     print(f"📡 Monitor horario [{motivo}]")
     try:
-        from intraday_tracker import run_intraday_tracker
-        result = run_intraday_tracker()
+        from intraday_tracker import evaluar_posiciones_abiertas
+        from positions_meta import get_all
 
-        n_pos = len(result.get("monitor_posiciones", []))
+        # Obtener tickers de posiciones abiertas reales
+        meta    = get_all()
+        tickers = list(meta.keys())
+
+        if not tickers:
+            print("✅ Monitor OK | sin posiciones abiertas")
+            return
+
+        result = evaluar_posiciones_abiertas(tickers)
+        n_pos  = len(result)
         print(f"✅ Monitor OK | posiciones={n_pos}")
 
-        diverging = [
-            p for p in result.get("monitor_posiciones", [])
-            if p.get("curve_status") == "diverging"
-        ]
-        if diverging:
-            tickers = [p["ticker"] for p in diverging]
-            print(f"⚠️  DIVERGING: {tickers} → disparando cierre defensivo")
-            _trigger_defensive_close(tickers)
+        # Clasificar sugerencias
+        cerrar   = [t for t, s in result.items() if s.get("sugerencia") == "CERRAR"]
+        trailing = [t for t, s in result.items() if s.get("sugerencia") == "TRAILING"]
+        mantener = [t for t, s in result.items() if s.get("sugerencia") == "MANTENER"]
+
+        if mantener:
+            print(f"✅ MANTENER: {mantener}")
+
+        if trailing:
+            # Posiciones ganadoras divergentes — no cerrar, proteger con trailing
+            for t in trailing:
+                pnl = result[t].get("pnl_actual_pct", 0)
+                print(f"🛡 TRAILING {t} | PnL={pnl:.1f}% → no cerrar, dejar correr")
+
+        if cerrar:
+            print(f"⚠️  CERRAR: {cerrar} → disparando cierre defensivo")
+            _trigger_defensive_close(cerrar)
 
     except Exception as e:
         print(f"❌ Monitor error: {e}")
@@ -205,7 +236,7 @@ def _loop():
         # ── 🟢 APERTURA: 11:30 — predice + abre + cierra ──
         if (
             _es_dia_habil(ahora)
-            and ahora.hour  == HORA_APERTURA
+            and ahora.hour   == HORA_APERTURA
             and MIN_APERTURA <= ahora.minute < MIN_APERTURA + 5
             and apertura_hoy != fecha_hoy
         ):
@@ -216,11 +247,10 @@ def _loop():
             apertura_hoy = fecha_hoy
 
         # ── 🔴 CIERRE: 15:30 — solo cierra posiciones ─────
-        # Solo si la apertura ya corrió hoy
         if (
             _es_dia_habil(ahora)
             and ahora.hour  == HORA_CIERRE
-            and MIN_CIERRE <= ahora.minute < MIN_CIERRE + 5
+            and MIN_CIERRE  <= ahora.minute < MIN_CIERRE + 5
             and cierre_hoy  != fecha_hoy
             and apertura_hoy == fecha_hoy
         ):
@@ -230,7 +260,10 @@ def _loop():
             )
             cierre_hoy = fecha_hoy
 
-        # ── 📡 MONITOR HORARIO: 12:00-15:00 Yahoo ─────────
+        # ── 📡 MONITOR HORARIO: 12:00-15:00 cada hora ─────
+        # Corre cada hora entre apertura y cierre.
+        # Evalúa posiciones abiertas y cierra solo las que
+        # el tracker sugiere CERRAR (no TRAILING ni MANTENER).
         if (
             _es_dia_habil(ahora)
             and _en_horario_monitor(ahora)
@@ -254,7 +287,7 @@ def _loop():
         # ── 🧬 Darwin: ciclo evolutivo viernes 18:00 ──────
         if (
             ahora.weekday() == 4
-            and ahora.hour  == 18
+            and ahora.hour   == 18
             and ahora.minute < 10
             and darwin_evolution_hoy != fecha_hoy
         ):
@@ -286,4 +319,3 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
-        
