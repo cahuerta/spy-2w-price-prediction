@@ -1,5 +1,5 @@
 # =========================================================
-# pipeline_router.py — PIPELINE ROUTER v2.5
+# pipeline_router.py — PIPELINE ROUTER v2.6
 # =========================================================
 # v2.2: [F7] Intraday tracker como paso 10.5
 # v2.3: [F8] Intraday evaluator como paso 4.6
@@ -11,6 +11,10 @@
 #        Evita que un reinicio de Render o un segundo trigger del
 #        scheduler lancen dos pipelines en paralelo, causando
 #        condiciones de carrera en /data y consumo doble de RAM.
+# v2.6: [F11] Fix intraday tracker paso 10.5
+#        run_intraday_tracker() eliminado en tracker v3.0.
+#        Reemplazado por evaluar_posiciones_abiertas(tickers)
+#        que recibe la lista exacta del portfolio actual.
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -279,18 +283,31 @@ async def _run_pipeline_logic(request: Request):
         gc.collect()  # [F9] liberar después del commit
 
         # ── 10.5 INTRADAY TRACKER ─────────────────────────
+        # [F11] v3.0: run_intraday_tracker() eliminado.
+        # El tracker ya no genera universo propio — recibe la lista
+        # exacta de posiciones abiertas del portfolio actual.
         logger.info("📡 [10.5/10] Intraday tracker...")
         try:
-            from intraday_tracker import run_intraday_tracker
-            loop         = asyncio.get_event_loop()
-            tracker_out  = await loop.run_in_executor(None, run_intraday_tracker)
-            entrar       = tracker_out.get("entrar_ahora", [])
-            n_candidatos = tracker_out.get("candidatos", 0)
-            n_posiciones = len(tracker_out.get("monitor_posiciones", []))
-            logger.info(
-                f"✅ Tracker OK | candidatos={n_candidatos} "
-                f"entrar={entrar} posiciones={n_posiciones}"
-            )
+            from intraday_tracker import evaluar_posiciones_abiertas
+            from portfolio_store import load_positions
+
+            loop             = asyncio.get_event_loop()
+            tickers_abiertos = [p["ticker"] for p in load_positions()]
+
+            if tickers_abiertos:
+                tracker_out = await loop.run_in_executor(
+                    None, evaluar_posiciones_abiertas, tickers_abiertos
+                )
+                cerrar   = [t for t, s in tracker_out.items() if s.get("sugerencia") == "CERRAR"]
+                trailing = [t for t, s in tracker_out.items() if s.get("sugerencia") == "TRAILING"]
+                mantener = [t for t, s in tracker_out.items() if s.get("sugerencia") == "MANTENER"]
+                logger.info(
+                    f"✅ Tracker OK | posiciones={len(tracker_out)} "
+                    f"cerrar={cerrar} trailing={trailing} mantener={mantener}"
+                )
+            else:
+                logger.info("✅ Tracker OK | sin posiciones abiertas")
+
         except Exception as e:
             logger.warning(f"⚠️ Intraday tracker falló (no crítico): {e}")
 
@@ -336,5 +353,5 @@ async def run_pipeline(request: Request):
     return {
         "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
-            }
+    }
     
