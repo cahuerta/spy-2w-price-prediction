@@ -1,5 +1,5 @@
 # =========================================================
-# intraday_tracker.py — INTRADAY TRACKER v3.0
+# intraday_tracker.py — INTRADAY TRACKER v3.1
 # =========================================================
 # v3.0 — Refactor arquitectural:
 #   El tracker ya NO genera su propio universo.
@@ -8,7 +8,7 @@
 #   Solo evalúa timing y retorna SUGERENCIAS.
 #   La decisión final sigue siendo del orchestrator/CG.
 #
-#   Cambios principales:
+#   Cambios principales v3.0:
 #   - Eliminado: _get_compra_candidates() — universo propio
 #   - Eliminado: run_intraday_tracker() — corría solo
 #   - Nuevo: evaluar_timing_entrada(tickers) — recibe lista del PM
@@ -16,6 +16,29 @@
 #   - Cierre: considera PnL actual antes de sugerir cerrar
 #     (no cierra posiciones ganadoras por divergencia de curva)
 #   - Retorna sugerencias, nunca decisiones finales
+#
+# v3.1 — Contexto de curva futura (informativo para el PM):
+#   El tracker ahora analiza la curva COMPLETA desde dia_actual
+#   en adelante y agrega contexto al resultado para que el PM
+#   pueda tomar decisiones más informadas. NO cambia sugerencias.
+#
+#   Nuevos campos en resultado (posiciones abiertas):
+#   - curva_futura: dict con análisis desde dia_actual en adelante
+#     · slope_futura: "sube" | "baja" | "plana"
+#     · ret_desde_hoy_a_peak_pct: retorno esperado hasta el máximo
+#     · ret_desde_hoy_a_final_pct: retorno esperado al día final
+#     · dias_hasta_peak: días restantes hasta el máximo de la curva
+#     · precio_peak_esperado: precio máximo esperado en la curva
+#     · precio_final_esperado: precio al día final de la curva
+#     · en_zona_valle: True si precio actual está bajo lower_band hoy
+#       (señal de potencial buy-the-dip para el PM)
+#
+#   Nuevos campos en resultado (timing entrada):
+#   - curva_futura: igual que arriba pero desde día 1
+#     · en_zona_valle: True si precio actual < lower_band día 1
+#       (potencial entrada táctica en caída)
+#
+#   ARQUITECTURA: El tracker SOLO informa. El PM decide.
 # =========================================================
 
 import os
@@ -176,6 +199,92 @@ def _get_ret_final_esperado(curve: Dict) -> Optional[float]:
 
 
 # =========================================================
+# ANÁLISIS DE CURVA FUTURA — NUEVO v3.1
+# =========================================================
+
+def _analizar_curva_futura(
+    curve: Dict,
+    dia_actual: int,
+    precio_actual: float,
+) -> Optional[Dict]:
+    """
+    Analiza la curva de predicción desde dia_actual en adelante.
+    Retorna contexto informativo para que el PM tome mejores decisiones.
+
+    IMPORTANTE: Esta función solo INFORMA. No toma decisiones.
+    El PM es quien decide qué hacer con este contexto.
+
+    Retorna dict con:
+    - slope_futura: "sube" | "baja" | "plana"
+    - ret_desde_hoy_a_peak_pct: retorno esperado desde precio actual hasta el peak
+    - ret_desde_hoy_a_final_pct: retorno esperado desde precio actual hasta día final
+    - dias_hasta_peak: días restantes hasta el máximo de la curva
+    - precio_peak_esperado: precio máximo en los días restantes
+    - precio_final_esperado: precio al último día de la curva
+    - dias_restantes: cuántos días quedan en la curva desde hoy
+    - en_zona_valle: True si precio actual está bajo lower_band de hoy
+      (señal potencial de compra en caída, informativo para el PM)
+    - curva_segmento: lista de precios esperados desde dia_actual al final
+    """
+    if not curve or not precio_actual or precio_actual <= 0:
+        return None
+
+    path = curve.get("price_path", [])
+    if not path or len(path) < 2:
+        return None
+
+    # Segmento de la curva desde dia_actual en adelante
+    # dia_actual es 1-based; idx es 0-based
+    idx_inicio = max(0, min(dia_actual - 1, len(path) - 1))
+    segmento   = path[idx_inicio:]  # precios desde hoy hasta el final
+
+    if not segmento:
+        return None
+
+    precio_final_esperado = float(segmento[-1])
+    dias_restantes        = len(segmento)
+
+    # Peak: máximo en el segmento futuro
+    idx_peak_rel          = int(np.argmax(segmento))
+    precio_peak_esperado  = float(segmento[idx_peak_rel])
+    dias_hasta_peak       = idx_peak_rel  # 0 = ya estamos en el peak
+
+    # Retornos esperados desde precio actual
+    ret_a_peak  = round((precio_peak_esperado  / precio_actual - 1) * 100, 2) if precio_actual > 0 else None
+    ret_a_final = round((precio_final_esperado / precio_actual - 1) * 100, 2) if precio_actual > 0 else None
+
+    # Slope: tendencia general del segmento futuro
+    # Comparamos promedio primera mitad vs segunda mitad
+    mid = max(1, len(segmento) // 2)
+    avg_first = float(np.mean(segmento[:mid]))
+    avg_last  = float(np.mean(segmento[mid:]))
+    diff_pct  = (avg_last - avg_first) / avg_first * 100 if avg_first > 0 else 0.0
+
+    if diff_pct > 1.0:
+        slope_futura = "sube"
+    elif diff_pct < -1.0:
+        slope_futura = "baja"
+    else:
+        slope_futura = "plana"
+
+    # ¿Precio actual está en zona de valle? (bajo lower_band del día actual)
+    lower_hoy = _get_band_for_day(curve, dia_actual, "lower_band")
+    en_zona_valle = bool(lower_hoy and precio_actual < lower_hoy)
+
+    return {
+        "slope_futura":             slope_futura,
+        "ret_desde_hoy_a_peak_pct": ret_a_peak,
+        "ret_desde_hoy_a_final_pct": ret_a_final,
+        "dias_hasta_peak":          dias_hasta_peak,
+        "precio_peak_esperado":     round(precio_peak_esperado, 4),
+        "precio_final_esperado":    round(precio_final_esperado, 4),
+        "dias_restantes":           dias_restantes,
+        "en_zona_valle":            en_zona_valle,
+        "curva_segmento":           [round(p, 4) for p in segmento],
+    }
+
+
+# =========================================================
 # POSICIONES ABIERTAS — desde positions_meta
 # =========================================================
 
@@ -222,6 +331,9 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
     Evalúa si es buen momento intraday para entrar a un ticker.
     El ticker YA fue decidido por el PM — aquí solo evaluamos timing.
     Retorna sugerencia, NO decisión final.
+
+    v3.1: agrega curva_futura con contexto desde día 1 en adelante,
+    incluyendo en_zona_valle para señales de buy-the-dip.
     """
     precio_actual = _get_current_price(ticker)
     if not precio_actual:
@@ -304,7 +416,14 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
     if curve and curve.get("analysis"):
         result["curve_analysis"] = curve["analysis"]
 
+    # ── v3.1: contexto de curva futura desde día 1 ──────────
+    # Informativo para el PM. No afecta sugerencia.
+    curva_futura = _analizar_curva_futura(curve, 1, precio_actual) if curve else None
+    if curva_futura:
+        result["curva_futura"] = curva_futura
+
     return result
+
 
 # =========================================================
 # EVALUAR POSICIÓN ABIERTA VS CURVA
@@ -316,6 +435,12 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
     Considera PnL actual: no sugiere cerrar posiciones ganadoras
     solo por divergencia de curva (evita cortar ganancias como AMAT +18%).
     Retorna sugerencia, NO decisión final.
+
+    v3.1: agrega curva_futura con contexto desde dia_actual en adelante.
+    El PM puede usar slope_futura, en_zona_valle y ret_desde_hoy_a_peak_pct
+    para decidir si un cierre divergente tiene sentido estratégico
+    (ej: diverging + PnL positivo + slope_futura=baja → PM puede cerrar
+    tomando ganancia antes de caída esperada).
     """
     precio_actual   = _get_current_price(ticker)
     precio_esperado = _get_expected_price_for_day(ticker, dia_actual)
@@ -383,12 +508,16 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
     # PROBLEMA ANTERIOR (v2.x):
     #   diverging → CERRAR siempre, aunque PnL sea +18%
     #
-    # LÓGICA v3.0:
+    # LÓGICA v3.0/v3.1:
     #   diverging + PnL negativo          → CERRAR (proteger capital)
     #   diverging + PnL < TRAILING_PNL    → CERRAR (ganancia pequeña, riesgo reversión)
     #   diverging + PnL >= TRAILING_PNL   → TRAILING (proteger ganancia, no cortar)
     #   lagging                           → MANTENER (esperar recuperación)
     #   on_track / ahead                  → MANTENER
+    #
+    # NOTA v3.1: la curva_futura (slope, peak, valle) se agrega al resultado
+    # como contexto informativo para que el PM refine la decisión.
+    # El tracker NO cambia su sugerencia basándose en curva_futura.
     # ──────────────────────────────────────────────────────
 
     pnl = ret_vs_entrada if ret_vs_entrada is not None else 0.0
@@ -454,6 +583,19 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
             result["best_exit_day"]    = best_exit
             result["dias_para_salida"] = max(0, best_exit - dia_actual)
 
+    # ── v3.1: contexto de curva futura desde dia_actual ─────
+    # Informativo para el PM. NO modifica sugerencia del tracker.
+    # Campos clave para el PM:
+    #   slope_futura="baja" + sugerencia="CERRAR" + pnl>0
+    #     → PM puede confirmar cierre tomando ganancia antes de caída
+    #   slope_futura="sube" + sugerencia="CERRAR" + pnl>0
+    #     → PM puede reconsiderar y mantener (modelo erró hoy, destino alcista)
+    #   en_zona_valle=True
+    #     → PM podría considerar no cerrar o incluso promediar a la baja
+    curva_futura = _analizar_curva_futura(curve, dia_actual, precio_actual) if curve else None
+    if curva_futura:
+        result["curva_futura"] = curva_futura
+
     return result
 
 
@@ -475,7 +617,7 @@ def evaluar_timing_entrada(tickers: List[str]) -> Dict[str, Dict]:
     fecha_str = ahora.date().isoformat()
     hora_str  = ahora.strftime("%H:%M")
 
-    logger.info(f"📡 Tracker entrada v3.0 | {fecha_str} {hora_str} UTC | tickers={tickers}")
+    logger.info(f"📡 Tracker entrada v3.1 | {fecha_str} {hora_str} UTC | tickers={tickers}")
 
     resultado: Dict[str, Dict] = {}
 
@@ -490,7 +632,7 @@ def evaluar_timing_entrada(tickers: List[str]) -> Dict[str, Dict]:
     # Guardar snapshot
     _guardar_snapshot(fecha_str, hora_str, "entradas", resultado)
 
-    entrar = [t for t, s in resultado.items() if s.get("sugerencia") == "ENTRAR"]
+    entrar  = [t for t, s in resultado.items() if s.get("sugerencia") == "ENTRAR"]
     esperar = [t for t, s in resultado.items() if s.get("sugerencia") == "ESPERAR"]
     logger.info(f"📡 Timing entrada | ENTRAR={entrar} | ESPERAR={esperar}")
 
@@ -511,7 +653,7 @@ def evaluar_posiciones_abiertas(tickers: List[str]) -> Dict[str, Dict]:
     fecha_str = ahora.date().isoformat()
     hora_str  = ahora.strftime("%H:%M")
 
-    logger.info(f"📊 Tracker posiciones v3.0 | {fecha_str} {hora_str} UTC | tickers={tickers}")
+    logger.info(f"📊 Tracker posiciones v3.1 | {fecha_str} {hora_str} UTC | tickers={tickers}")
 
     posiciones = _get_open_positions_with_date(tickers_filter=tickers)
     resultado: Dict[str, Dict] = {}
@@ -549,7 +691,7 @@ def _guardar_snapshot(fecha_str: str, hora_str: str, tipo: str, data: Dict) -> N
     snapshot      = _load_json(snapshot_path)
     if hora_str not in snapshot:
         snapshot[hora_str] = {}
-    snapshot[hora_str][tipo]      = data
+    snapshot[hora_str][tipo]        = data
     snapshot[hora_str]["timestamp"] = datetime.now(timezone.utc).isoformat()
     _save_json(snapshot_path, snapshot)
     logger.info(
@@ -564,7 +706,7 @@ def _guardar_snapshot(fecha_str: str, hora_str: str, tipo: str, data: Dict) -> N
 def get_entry_signals_today() -> Dict[str, Dict]:
     """
     Compatibilidad legacy. Retorna las últimas señales de entrada del día.
-    NOTA: en v3.0 el orchestrator llama evaluar_timing_entrada() directamente.
+    NOTA: en v3.x el orchestrator llama evaluar_timing_entrada() directamente.
     """
     fecha_str     = datetime.now(timezone.utc).date().isoformat()
     snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
@@ -585,7 +727,7 @@ def get_entry_signals_today() -> Dict[str, Dict]:
 def get_position_status_today() -> Dict[str, Dict]:
     """
     Compatibilidad legacy. Retorna el último estado de posiciones del día.
-    NOTA: en v3.0 el orchestrator llama evaluar_posiciones_abiertas() directamente.
+    NOTA: en v3.x el orchestrator llama evaluar_posiciones_abiertas() directamente.
     """
     fecha_str     = datetime.now(timezone.utc).date().isoformat()
     snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
