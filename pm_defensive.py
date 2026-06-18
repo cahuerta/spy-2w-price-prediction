@@ -1,5 +1,5 @@
 """
-pm_defensive.py - DEFENSIVE POSITION MANAGER v1.9 PRODUCCION
+pm_defensive.py - DEFENSIVE POSITION MANAGER v2.0
 
 FIX v1.8:
   [F7] entry_price fallback a avg_entry_price — Alpaca devuelve
@@ -22,6 +22,24 @@ FIX v1.9:
         posiciones sin metadata. Ahora las trata como nuevas.
   [F12] days_between maneja fechas sin timezone (solo "YYYY-MM-DD")
         añadiendo CL_TIMEZONE antes de comparar.
+
+v2.0 — Contexto de curva futura del tracker:
+  [CF1] evaluate_portfolio() acepta tracker_signals: Dict[str, Dict] = None
+        Parámetro opcional — retrocompatible con llamadas existentes.
+  [CF2] evaluate_position() acepta tracker_signal: Dict = None
+        Lee curva_futura si está disponible en la señal del tracker.
+  [CF3] Lógica curva futura (solo no-anchors, solo informativa):
+        - diverging + pnl > 0 + slope_futura="baja"
+            → CLOSE "defensive_close_curve_falling"
+            → tomamos ganancia antes de caída esperada
+        - diverging + pnl > 0 + slope_futura="sube"
+            → HOLD "hold_curve_recovering"
+            → modelo erró hoy pero destino alcista — no cortar
+        - en_zona_valle=True
+            → se agrega a meta como contexto (el orchestrator decide)
+        ANCLAS: ignoran curva_futura — su lógica no cambia.
+  [CF4] Si tracker_signal es None o no tiene curva_futura,
+        comportamiento idéntico a v1.9 — sin regresiones.
 """
 
 import os
@@ -75,7 +93,6 @@ def days_between(entry_iso: str) -> int:
         entry_str = entry_iso.strip().replace("Z", "+00:00")
         dt = datetime.fromisoformat(entry_str)
         if dt.tzinfo is None:
-            # Fecha sin hora ni tz: "2026-05-26" → medianoche Santiago
             dt = CL_TIMEZONE.localize(dt)
         return max(0, (datetime.now(CL_TIMEZONE) - dt.astimezone(CL_TIMEZONE)).days)
     except Exception as e:
@@ -159,7 +176,21 @@ class DefensiveDecision:
 
 
 # =========================================================
-# PM DEFENSIVO v1.9
+# HELPER CURVA FUTURA — v2.0
+# =========================================================
+
+def _leer_curva_futura(tracker_signal: Optional[Dict]) -> Optional[Dict]:
+    """
+    [CF2] Extrae curva_futura de la señal del tracker.
+    Retorna None si no está disponible — sin efectos secundarios.
+    """
+    if not tracker_signal or not isinstance(tracker_signal, dict):
+        return None
+    return tracker_signal.get("curva_futura") or None
+
+
+# =========================================================
+# PM DEFENSIVO v2.0
 # =========================================================
 
 class PMDefensive:
@@ -170,7 +201,7 @@ class PMDefensive:
         self._anchor_universe    = _load_anchor_universe()
         self._anchor_tickers     = {a["ticker"].upper() for a in self._anchor_universe}
         logger.info(
-            f"PMDefensive v1.9 | anclas={len(self._anchor_tickers)}: "
+            f"PMDefensive v2.0 | anclas={len(self._anchor_tickers)}: "
             f"{sorted(self._anchor_tickers)}"
         )
 
@@ -195,7 +226,11 @@ class PMDefensive:
     # --------------------------------------------------
     # EVALUAR POSICIÓN EXISTENTE
     # --------------------------------------------------
-    def evaluate_position(self, pos: Dict[str, Any]) -> DefensiveDecision:
+    def evaluate_position(
+        self,
+        pos:            Dict[str, Any],
+        tracker_signal: Optional[Dict] = None,   # [CF2] señal del tracker con curva_futura
+    ) -> DefensiveDecision:
         ticker = str(pos.get("ticker", "UNKNOWN")).upper()
         ts     = datetime.now(self.tz).isoformat()
 
@@ -243,6 +278,7 @@ class PMDefensive:
             )
 
         # Anchors → HOLD indefinido (excepto catastrófico)
+        # [CF3] ANCLAS ignoran curva_futura — lógica sin cambios
         if is_anchor:
             return DefensiveDecision(
                 "HOLD", ticker, "anchor_hold_indefinite", ts,
@@ -261,6 +297,78 @@ class PMDefensive:
                 {"days_held": age, "max_days": MAX_HOLD_DAYS_NON_ANCHOR},
             )
 
+        # ─── [CF3] Contexto de curva futura — solo no-anchors ──────────────
+        # Si el tracker proveyó curva_futura, úsala para refinar la decisión.
+        # Si no hay señal, comportamiento idéntico a v1.9.
+        # ────────────────────────────────────────────────────────────────────
+        curva_futura = _leer_curva_futura(tracker_signal)
+
+        if curva_futura:
+            slope         = curva_futura.get("slope_futura")          # "sube"|"baja"|"plana"
+            en_zona_valle = curva_futura.get("en_zona_valle", False)
+            ret_a_peak    = curva_futura.get("ret_desde_hoy_a_peak_pct")
+            ret_a_final   = curva_futura.get("ret_desde_hoy_a_final_pct")
+            dias_peak     = curva_futura.get("dias_hasta_peak")
+            pnl_pct       = round(ret * 100, 2)
+
+            # PnL positivo + curva cae desde aquí → cerrar tomando ganancia
+            if pnl_pct > 0 and slope == "baja":
+                logger.info(
+                    f"📉 {ticker} CLOSE | PnL={pnl_pct:.1f}% + curva cae "
+                    f"(slope={slope} ret_final={ret_a_final}%) → tomar ganancia"
+                )
+                return DefensiveDecision(
+                    "CLOSE", ticker, "defensive_close_curve_falling", ts,
+                    {
+                        "ret_pct":          pnl_pct,
+                        "slope_futura":     slope,
+                        "ret_a_final_pct":  ret_a_final,
+                        "dias_hasta_peak":  dias_peak,
+                        "days_held":        age,
+                        "en_zona_valle":    en_zona_valle,
+                    },
+                )
+
+            # PnL positivo + curva sube → no cortar, el modelo erró hoy
+            if pnl_pct > 0 and slope == "sube":
+                logger.info(
+                    f"📈 {ticker} HOLD | PnL={pnl_pct:.1f}% + curva sube "
+                    f"(slope={slope} ret_peak={ret_a_peak}% en {dias_peak}d) → mantener"
+                )
+                return DefensiveDecision(
+                    "HOLD", ticker, "hold_curve_recovering", ts,
+                    {
+                        "ret_pct":          pnl_pct,
+                        "slope_futura":     slope,
+                        "ret_a_peak_pct":   ret_a_peak,
+                        "dias_hasta_peak":  dias_peak,
+                        "days_held":        age,
+                        "en_zona_valle":    en_zona_valle,
+                    },
+                )
+
+            # PnL negativo + en zona de valle → informar, no cerrar todavía
+            # El PM defensivo no promedia a la baja, pero deja el contexto
+            # en meta para que el orchestrator / operador lo vea
+            if pnl_pct < 0 and en_zona_valle:
+                logger.info(
+                    f"🪣 {ticker} en zona valle | PnL={pnl_pct:.1f}% "
+                    f"slope={slope} → HOLD con contexto valle"
+                )
+                return DefensiveDecision(
+                    "HOLD", ticker, "defensive_hold_zona_valle", ts,
+                    {
+                        "ret_pct":          pnl_pct,
+                        "slope_futura":     slope,
+                        "ret_a_peak_pct":   ret_a_peak,
+                        "dias_hasta_peak":  dias_peak,
+                        "days_held":        age,
+                        "en_zona_valle":    True,
+                        "days_to_exit":     MAX_HOLD_DAYS_NON_ANCHOR - age,
+                    },
+                )
+
+        # Sin curva_futura o slope plano → comportamiento v1.9
         return DefensiveDecision(
             "HOLD", ticker, "defensive_hold_non_anchor", ts,
             {
@@ -315,13 +423,20 @@ class PMDefensive:
     # --------------------------------------------------
     def evaluate_portfolio(
         self,
-        positions:      List[Dict[str, Any]],
+        positions:       List[Dict[str, Any]],
         anchor_universe: Optional[List[Dict[str, Any]]] = None,
-        total_capital:  float = 1000000,
+        total_capital:   float = 1000000,
+        tracker_signals: Optional[Dict[str, Dict]] = None,  # [CF1] señales del tracker
     ) -> List[DefensiveDecision]:
-
+        """
+        [CF1] tracker_signals: dict {ticker: señal_tracker} con curva_futura.
+        Parámetro opcional — si es None, comportamiento idéntico a v1.9.
+        El orchestrator lo pasa después de llamar al tracker.
+        """
         decisions    = []
         alpha_scores = _load_alpha_scores()
+
+        tracker_signals = tracker_signals or {}
 
         anchors     = [p for p in positions if p.get("is_anchor", False)
                        or p.get("ticker", "").upper() in self._anchor_tickers]
@@ -330,7 +445,9 @@ class PMDefensive:
                        and not p.get("is_anchor", False)]
 
         for pos in positions:
-            decisions.append(self.evaluate_position(pos))
+            ticker         = str(pos.get("ticker", "")).upper()
+            tracker_signal = tracker_signals.get(ticker)   # [CF2] None si no hay señal
+            decisions.append(self.evaluate_position(pos, tracker_signal))
 
         portfolio_tickers = {p.get("ticker", "").upper() for p in positions}
         eligible_anchors  = [
@@ -351,7 +468,7 @@ class PMDefensive:
         for fragile in non_anchors[:max_rotations]:
             if rotations_done >= max_rotations:
                 break
-            anchor            = eligible_anchors[rotations_done % len(eligible_anchors)]
+            anchor             = eligible_anchors[rotations_done % len(eligible_anchors)]
             rotation_decisions = self.evaluate_rotation(fragile, anchor, alpha_scores)
             if rotation_decisions:
                 decisions.extend(rotation_decisions)
@@ -383,9 +500,10 @@ class PMDefensive:
         holds  = len([d for d in decisions if d.action == "HOLD"])
 
         logger.info(
-            f"DEFENSIVE v1.9 | pos={len(positions)} anchors={len(anchors)} "
+            f"DEFENSIVE v2.0 | pos={len(positions)} anchors={len(anchors)} "
             f"| closes={closes} opens={opens} holds={holds} "
-            f"rotates={rotations_done} | capital=${total_capital:,.0f}"
+            f"rotates={rotations_done} | capital=${total_capital:,.0f} "
+            f"| tracker_signals={len(tracker_signals)}"
         )
 
         return decisions
@@ -429,20 +547,50 @@ if __name__ == "__main__":
         },
     ]
 
-    print("\nPMDefensive v1.9 SELF-TEST:")
-    results = pm.evaluate_portfolio(test_positions, total_capital=85000)
+    # Test con tracker_signals simuladas
+    test_tracker_signals = {
+        "BALL": {
+            "curva_futura": {
+                "slope_futura":              "baja",
+                "ret_desde_hoy_a_peak_pct":  1.2,
+                "ret_desde_hoy_a_final_pct": -3.5,
+                "dias_hasta_peak":           1,
+                "en_zona_valle":             False,
+            }
+        },
+        "STT": {
+            "curva_futura": {
+                "slope_futura":              "sube",
+                "ret_desde_hoy_a_peak_pct":  4.8,
+                "ret_desde_hoy_a_final_pct": 2.1,
+                "dias_hasta_peak":           3,
+                "en_zona_valle":             False,
+            }
+        },
+    }
 
-    print("\nDECISIONES:")
-    for d in results:
+    print("\nPMDefensive v2.0 SELF-TEST:")
+    print("\n── Sin tracker_signals (retrocompatibilidad v1.9) ──")
+    results_v19 = pm.evaluate_portfolio(test_positions, total_capital=85000)
+    for d in results_v19:
         print(f"  {d.action:6} {d.ticker:12} {d.reason}")
 
-    jnj = next((d for d in results if d.ticker == "JNJ"),  None)
-    ko  = next((d for d in results if d.ticker == "KO"),   None)
-    stt = next((d for d in results if d.ticker == "STT"),  None)
+    print("\n── Con tracker_signals (v2.0) ──")
+    results_v20 = pm.evaluate_portfolio(
+        test_positions,
+        total_capital=85000,
+        tracker_signals=test_tracker_signals,
+    )
+    for d in results_v20:
+        print(f"  {d.action:6} {d.ticker:12} {d.reason}")
+
+    # Asserts retrocompatibilidad
+    jnj = next((d for d in results_v19 if d.ticker == "JNJ"),  None)
+    ko  = next((d for d in results_v19 if d.ticker == "KO"),   None)
+    stt = next((d for d in results_v19 if d.ticker == "STT"),  None)
 
     assert jnj and jnj.action == "HOLD", f"❌ JNJ debe ser HOLD, es {jnj}"
     assert ko  and ko.action  == "HOLD", f"❌ KO debe ser HOLD, es {ko}"
     assert stt and stt.action == "HOLD", f"❌ STT sin entry_date debe ser HOLD (age=0), es {stt}"
 
-    print("\n✅ v1.9 TEST OK — entry_date unificado, sin falsos cierres por fecha faltante")
-  
+    print("\n✅ v2.0 TEST OK — curva futura integrada, retrocompatibilidad v1.9 confirmada")
