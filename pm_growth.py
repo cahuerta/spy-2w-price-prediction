@@ -1,5 +1,5 @@
 # =========================================================
-# pm_growth.py — GROWTH POSITION MANAGER v2.6.4
+# pm_growth.py — GROWTH POSITION MANAGER v2.7.0
 # =========================================================
 # ✔ PM GROWTH PURO (market_mode == growth)
 # ✔ Decision engine (NO ejecuta órdenes)
@@ -17,6 +17,23 @@
 #        para visibilidad. Razones diferenciadas:
 #        "stop_loss_no_signal" / "trailing_stop_no_signal" /
 #        "no_signal_hold_warned".
+#
+# v2.7.0 — Contexto de curva futura del tracker:
+#   [CF1] evaluate_position() acepta tracker_signal: Dict = None
+#         Parámetro keyword opcional — retrocompatible.
+#         El orchestrator lo pasa cuando tiene señales del tracker.
+#   [CF2] Lógica curva futura (aplica DESPUÉS de stops de emergencia
+#         y DESPUÉS de stop_loss/trailing_stop — stops tienen prioridad):
+#         - pnl > 0 + slope="baja" → CLOSE "growth_close_curve_falling"
+#           (tomar ganancia antes de caída esperada)
+#         - pnl > 0 + slope="sube" → no aplicar time_decay ni
+#           confidence_decay (destino alcista — no cortar por tiempo)
+#         - en_zona_valle=True → se agrega a meta como contexto
+#         Trailing stop y stop loss NUNCA se sobreescriben.
+#   [CF3] Si tracker_signal es None o no tiene curva_futura,
+#         comportamiento idéntico a v2.6.4 — sin regresiones.
+#   [CF4] _decision() acepta curva_futura_meta opcional para
+#         incluir contexto de curva en el meta del resultado.
 # =========================================================
 
 import os
@@ -88,6 +105,21 @@ def calculate_position_size(
     shares = int(risk_amount / (entry_price * stop_distance))
     return max(1, shares)
 
+
+# =========================================================
+# HELPER CURVA FUTURA — v2.7.0
+# =========================================================
+
+def _leer_curva_futura(tracker_signal: Optional[Dict]) -> Optional[Dict]:
+    """
+    [CF1] Extrae curva_futura de la señal del tracker.
+    Retorna None si no está disponible — sin efectos secundarios.
+    """
+    if not tracker_signal or not isinstance(tracker_signal, dict):
+        return None
+    return tracker_signal.get("curva_futura") or None
+
+
 # =========================================================
 # PM GROWTH
 # =========================================================
@@ -101,7 +133,7 @@ class PMGrowth:
         self.fixed_capital = fixed_capital
         self.tz = CL_TIMEZONE
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
-        logger.info("📈 PMGrowth v2.6.4 inicializado")
+        logger.info("📈 PMGrowth v2.7.0 inicializado")
 
     # --------------------------------------------------
     # CAPABILITIES
@@ -136,11 +168,11 @@ class PMGrowth:
                     else "FAIR"
                 )
                 data = {
-                    "usable":           True,
-                    "mispricing_pct":   mis,
+                    "usable":            True,
+                    "mispricing_pct":    mis,
                     "margin_safety_pct": f.get("margin_safety_pct"),
-                    "state":            state,
-                    "model":            f.get("model"),
+                    "state":             state,
+                    "model":             f.get("model"),
                 }
 
             self._fundamental_cache[key] = {"data": data, "timestamp": now}
@@ -154,8 +186,9 @@ class PMGrowth:
     # --------------------------------------------------
     def evaluate_position(
         self,
-        pos: Dict[str, Any],
-        signal: Dict[str, Any],
+        pos:            Dict[str, Any],
+        signal:         Dict[str, Any],
+        tracker_signal: Optional[Dict] = None,   # [CF1] señal del tracker con curva_futura
     ) -> Dict[str, Any]:
         """
         Evalúa posición existente.
@@ -164,6 +197,10 @@ class PMGrowth:
         [G1] Si signal=None: evalúa trailing_stop y stop_loss de
              emergencia antes de hacer HOLD — evita posiciones
              huérfanas cuando el predictor falla.
+
+        [CF1] tracker_signal=None: comportamiento idéntico a v2.6.4.
+              Si tiene curva_futura, se usa para refinar decisiones
+              de time_decay y confidence_decay (no toca stops).
         """
         ticker = str(pos.get("ticker", "")).upper()
         entry  = float(pos.get("entry_price", 0))
@@ -171,7 +208,8 @@ class PMGrowth:
         peak   = float(pos.get("peak_price", entry))
         age    = days_between(str(pos.get("entry_time", "")))
 
-        fundamental = self._get_fundamental_context(ticker)
+        fundamental  = self._get_fundamental_context(ticker)
+        curva_futura = _leer_curva_futura(tracker_signal)
 
         # [G1] Sin signal — evaluar stops de emergencia antes de HOLD
         if not signal:
@@ -191,7 +229,10 @@ class PMGrowth:
                     )
 
                 if price <= trail_stop:
-                    logger.warning(f"💀 {ticker} trailing_stop_no_signal | price={price:.2f} trail={trail_stop:.2f}")
+                    logger.warning(
+                        f"💀 {ticker} trailing_stop_no_signal | "
+                        f"price={price:.2f} trail={trail_stop:.2f}"
+                    )
                     return self._decision(
                         "CLOSE", ticker, "trailing_stop_no_signal", fundamental,
                         {"trail_price": round(trail_stop, 2)},
@@ -205,7 +246,7 @@ class PMGrowth:
         conf = float(signal.get("confidence", 0.0))
         ret  = pct_change(price, entry)
 
-        # ---- TRAILING STOP ----
+        # ---- TRAILING STOP — prioridad máxima, nunca se sobreescribe ----
         trail_stop = peak * (1 - TRAILING_STOP_PCT)
         if price <= trail_stop:
             return self._decision(
@@ -213,7 +254,7 @@ class PMGrowth:
                 {"trail_price": round(trail_stop, 2)},
             )
 
-        # ---- STOP LOSS ----
+        # ---- STOP LOSS — prioridad máxima, nunca se sobreescribe ----
         if price <= entry * (1 - STOP_LOSS_PCT):
             return self._decision("CLOSE", ticker, "stop_loss", fundamental)
 
@@ -221,11 +262,61 @@ class PMGrowth:
         if ret >= TAKE_PROFIT_PCT:
             return self._decision("CLOSE", ticker, "take_profit", fundamental)
 
-        # ---- TIME DECAY ----
+        # ── [CF2] Curva futura: cierre estratégico antes de caída ──────────
+        # Se evalúa después de stops duros y take_profit.
+        # Trailing/stop_loss nunca se tocan — tienen prioridad absoluta.
+        # ───────────────────────────────────────────────────────────────────
+        if curva_futura:
+            slope         = curva_futura.get("slope_futura")
+            en_zona_valle = curva_futura.get("en_zona_valle", False)
+            ret_a_peak    = curva_futura.get("ret_desde_hoy_a_peak_pct")
+            ret_a_final   = curva_futura.get("ret_desde_hoy_a_final_pct")
+            dias_peak     = curva_futura.get("dias_hasta_peak")
+            pnl_pct       = round(ret * 100, 2)
+
+            # PnL positivo + curva cae → cerrar tomando ganancia
+            if pnl_pct > 0 and slope == "baja":
+                logger.info(
+                    f"📉 {ticker} CLOSE | PnL={pnl_pct:.1f}% + curva cae "
+                    f"(slope={slope} ret_final={ret_a_final}%) → tomar ganancia"
+                )
+                return self._decision(
+                    "CLOSE", ticker, "growth_close_curve_falling", fundamental,
+                    {
+                        "ret_pct":         pnl_pct,
+                        "slope_futura":    slope,
+                        "ret_a_final_pct": ret_a_final,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age,
+                        "en_zona_valle":   en_zona_valle,
+                    },
+                )
+
+            # PnL positivo + curva sube → no aplicar time_decay ni confidence_decay
+            # El destino es alcista — no cortar por tiempo o confianza baja
+            if pnl_pct > 0 and slope == "sube":
+                logger.info(
+                    f"📈 {ticker} HOLD | PnL={pnl_pct:.1f}% + curva sube "
+                    f"(ret_peak={ret_a_peak}% en {dias_peak}d) → omitir time/confidence"
+                )
+                return self._decision(
+                    "HOLD", ticker, "hold_curve_recovering", fundamental,
+                    {
+                        "ret_pct":         pnl_pct,
+                        "slope_futura":    slope,
+                        "ret_a_peak_pct":  ret_a_peak,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age,
+                        "en_zona_valle":   en_zona_valle,
+                        "confidence":      conf,
+                    },
+                )
+
+        # ---- TIME DECAY — después de curva (puede ser anulado si slope=sube) ----
         if age >= MAX_HOLD_DAYS:
             return self._decision("CLOSE", ticker, "time_decay", fundamental)
 
-        # ---- CONFIDENCE DECAY ----
+        # ---- CONFIDENCE DECAY — después de curva ----
         if conf < MIN_CONFIDENCE_HOLD:
             return self._decision("CLOSE", ticker, "confidence_decay", fundamental)
 
@@ -233,23 +324,29 @@ class PMGrowth:
         if price > peak:
             pos["peak_price"] = price
 
-        return self._decision(
-            "HOLD", ticker, "healthy", fundamental,
-            {
-                "ret_pct":    round(ret * 100, 2),
-                "days":       age,
-                "confidence": conf,
-            },
-        )
+        # ---- HOLD — agrega contexto de curva si disponible ----
+        hold_extra = {
+            "ret_pct":    round(ret * 100, 2),
+            "days":       age,
+            "confidence": conf,
+        }
+        if curva_futura:
+            hold_extra["slope_futura"]    = curva_futura.get("slope_futura")
+            hold_extra["en_zona_valle"]   = curva_futura.get("en_zona_valle", False)
+            hold_extra["ret_a_peak_pct"]  = curva_futura.get("ret_desde_hoy_a_peak_pct")
+            hold_extra["dias_hasta_peak"] = curva_futura.get("dias_hasta_peak")
+
+        return self._decision("HOLD", ticker, "healthy", fundamental, hold_extra)
 
     # --------------------------------------------------
     # ROTATION (GROWTH ONLY)
     # --------------------------------------------------
     def evaluate_rotation(
         self,
-        open_positions: List[Dict[str, Any]],
-        new_candidate: Dict[str, Any],
-        latest_signals: Dict[str, Dict[str, Any]],
+        open_positions:  List[Dict[str, Any]],
+        new_candidate:   Dict[str, Any],
+        latest_signals:  Dict[str, Dict[str, Any]],
+        tracker_signals: Optional[Dict[str, Dict]] = None,  # [CF1] señales del tracker
     ) -> Optional[Dict[str, Any]]:
 
         new_ticker = str(new_candidate.get("ticker", "")).upper()
@@ -263,10 +360,14 @@ class PMGrowth:
         if fund.get("usable") and fund.get("state") == "OVERVALUED":
             return None
 
-        close_ticker = None
+        tracker_signals = tracker_signals or {}
+        close_ticker    = None
+
         for pos in open_positions:
-            sig = latest_signals.get(pos.get("ticker", "").upper())
-            d   = self.evaluate_position(pos, sig)
+            t   = pos.get("ticker", "").upper()
+            sig = latest_signals.get(t)
+            ts  = tracker_signals.get(t)         # [CF1] señal tracker para este ticker
+            d   = self.evaluate_position(pos, sig, tracker_signal=ts)
             if d["action"] == "HOLD":
                 close_ticker = pos["ticker"]
                 break
@@ -289,9 +390,9 @@ class PMGrowth:
     # --------------------------------------------------
     def calculate_new_position(
         self,
-        ticker: str,
+        ticker:      str,
         entry_price: float,
-        stop_price: Optional[float] = None,
+        stop_price:  Optional[float] = None,
     ) -> Dict[str, Any]:
 
         risk_amount = self.fixed_capital * MAX_RISK_PER_TRADE_PCT
@@ -312,11 +413,11 @@ class PMGrowth:
     # --------------------------------------------------
     def _decision(
         self,
-        action: str,
-        ticker: str,
-        reason: str,
+        action:      str,
+        ticker:      str,
+        reason:      str,
         fundamental: Dict[str, Any],
-        extra: Optional[Dict[str, Any]] = None,
+        extra:       Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
 
         return {
@@ -330,32 +431,75 @@ class PMGrowth:
             },
         }
 
+
 # =========================================================
 # SELF TEST
 # =========================================================
 if __name__ == "__main__":
     pm = PMGrowth()
 
-    pos = {
+    pos_healthy = {
         "ticker":      "AAPL",
         "entry_price": 150.0,
         "price_now":   155.0,
         "peak_price":  158.0,
         "entry_time":  "2026-01-01T00:00:00Z",
     }
-
     signal = {"confidence": 0.65}
 
-    print("🧪 Con signal:", pm.evaluate_position(pos, signal))
-    print("🧪 Sin signal (healthy):", pm.evaluate_position(pos, None))
+    print("🧪 Con signal (sin tracker):", pm.evaluate_position(pos_healthy, signal))
+    print("🧪 Sin signal (healthy):",     pm.evaluate_position(pos_healthy, None))
 
     pos_down = {
         "ticker":      "AAPL",
         "entry_price": 150.0,
-        "price_now":   141.0,  # -6% → stop loss
+        "price_now":   141.0,   # -6% → stop loss
         "peak_price":  155.0,
         "entry_time":  "2026-01-01T00:00:00Z",
     }
     print("🧪 Sin signal (stop loss):", pm.evaluate_position(pos_down, None))
-    print("✅ PMGrowth v2.6.4 READY")
-        
+
+    # [CF2] Test curva futura: pnl positivo + curva cae → CLOSE
+    pos_ganador = {
+        "ticker":      "NVDA",
+        "entry_price": 100.0,
+        "price_now":   107.0,   # +7% (en take_profit 10%)
+        "peak_price":  108.0,
+        "entry_time":  "2026-06-10T00:00:00Z",
+    }
+    tracker_baja = {
+        "curva_futura": {
+            "slope_futura":              "baja",
+            "ret_desde_hoy_a_peak_pct":  0.8,
+            "ret_desde_hoy_a_final_pct": -5.3,
+            "dias_hasta_peak":           1,
+            "en_zona_valle":             False,
+        }
+    }
+    tracker_sube = {
+        "curva_futura": {
+            "slope_futura":              "sube",
+            "ret_desde_hoy_a_peak_pct":  6.2,
+            "ret_desde_hoy_a_final_pct": 4.1,
+            "dias_hasta_peak":           4,
+            "en_zona_valle":             False,
+        }
+    }
+
+    res_baja = pm.evaluate_position(pos_ganador, signal, tracker_signal=tracker_baja)
+    res_sube = pm.evaluate_position(pos_ganador, signal, tracker_signal=tracker_sube)
+
+    print(f"\n🧪 [CF2] curva baja: {res_baja['action']} — {res_baja['reason']}")
+    print(f"🧪 [CF2] curva sube: {res_sube['action']} — {res_sube['reason']}")
+
+    assert res_baja["action"] == "CLOSE" and res_baja["reason"] == "growth_close_curve_falling", \
+        f"❌ Esperado CLOSE growth_close_curve_falling, got {res_baja}"
+    assert res_sube["action"] == "HOLD"  and res_sube["reason"] == "hold_curve_recovering", \
+        f"❌ Esperado HOLD hold_curve_recovering, got {res_sube}"
+
+    # [CF3] Retrocompatibilidad — sin tracker_signal igual que v2.6.4
+    res_orig = pm.evaluate_position(pos_healthy, signal)
+    assert res_orig["action"] == "HOLD" and res_orig["reason"] == "healthy", \
+        f"❌ Retrocompatibilidad rota: {res_orig}"
+
+    print("\n✅ PMGrowth v2.7.0 READY — curva futura integrada, retrocompatibilidad v2.6.4 confirmada")
