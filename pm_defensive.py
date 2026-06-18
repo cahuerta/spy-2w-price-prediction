@@ -1,5 +1,5 @@
 """
-pm_defensive.py - DEFENSIVE POSITION MANAGER v2.0
+pm_defensive.py - DEFENSIVE POSITION MANAGER v2.0 PRODUCCION
 
 FIX v1.8:
   [F7] entry_price fallback a avg_entry_price — Alpaca devuelve
@@ -23,29 +23,23 @@ FIX v1.9:
   [F12] days_between maneja fechas sin timezone (solo "YYYY-MM-DD")
         añadiendo CL_TIMEZONE antes de comparar.
 
-v2.0 — Contexto de curva futura del tracker:
-  [CF1] evaluate_portfolio() acepta tracker_signals: Dict[str, Dict] = None
-        Parámetro opcional — retrocompatible con llamadas existentes.
-  [CF2] evaluate_position() acepta tracker_signal: Dict = None
-        Lee curva_futura si está disponible en la señal del tracker.
-  [CF3] Lógica curva futura (solo no-anchors, solo informativa):
-        - diverging + pnl > 0 + slope_futura="baja"
-            → CLOSE "defensive_close_curve_falling"
-            → tomamos ganancia antes de caída esperada
-        - diverging + pnl > 0 + slope_futura="sube"
-            → HOLD "hold_curve_recovering"
-            → modelo erró hoy pero destino alcista — no cortar
-        - en_zona_valle=True
-            → se agrega a meta como contexto (el orchestrator decide)
-        ANCLAS: ignoran curva_futura — su lógica no cambia.
-  [CF4] Si tracker_signal es None o no tiene curva_futura,
-        comportamiento idéntico a v1.9 — sin regresiones.
+v2.0:
+  [C1] _load_price_curve(ticker): lee curva de predicción desde disco
+       /data/predictions/{ticker}/{fecha}.json — igual que _load_alpha_scores
+       lee alpha_last.json. Sin dependencias externas, sin tracker.
+  [C2] evaluate_position() para NO-ANCHORS: usa curva para más información:
+       - pnl > 0 + slope_futura="baja" → CLOSE (tomar ganancia antes de caída)
+       - pnl > 0 + slope_futura="sube" → HOLD (destino alcista, no cortar)
+       - en_zona_valle=True → agrega contexto en meta
+       Si no hay curva disponible: comportamiento idéntico a v1.9.
+  [C3] ANCHORS: sin ningún cambio — lógica idéntica a v1.9.
+  [C4] Orchestrator y tracker: sin cambios.
 """
 
 import os
 import logging
 from typing import Dict, List, Any, Optional
-from datetime import datetime
+from datetime import datetime, date
 from dataclasses import dataclass
 from pathlib import Path
 import pytz
@@ -65,6 +59,8 @@ ANCHOR_MIN_ALPHA         = float(os.getenv("PM_DEF_ANCHOR_MIN_ALPHA", "0.30"))
 _BASE_DIR   = Path(__file__).resolve().parent
 ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", str(_BASE_DIR / "anchor_universe.json")))
 ALPHA_FILE  = DATA_PATH / "alpha_last.json"
+PRED_DIR    = DATA_PATH / "predictions"
+
 
 logger = logging.getLogger("pm_defensive")
 logging.basicConfig(
@@ -119,7 +115,77 @@ def _safe_price(pos: Dict, *keys) -> float:
 
 
 # =========================================================
-# CARGA ANCHOR UNIVERSE
+# CARGA CURVA DE PREDICCIÓN — v2.0
+# =========================================================
+
+def _load_price_curve(ticker: str) -> Optional[Dict]:
+    """
+    [C1] Lee la curva de predicción más reciente desde disco.
+    /data/predictions/{TICKER}/{fecha}.json
+    Retorna None si no existe o hay error — sin efectos secundarios.
+    """
+    try:
+        ticker_dir = PRED_DIR / ticker.upper()
+        if not ticker_dir.exists():
+            return None
+        candidates = sorted(ticker_dir.glob("*.json"))
+        if not candidates:
+            return None
+        data  = json.loads(candidates[-1].read_text(encoding="utf-8"))
+        curve = data.get("price_curve")
+        if not curve or not curve.get("price_path"):
+            return None
+
+        path       = curve.get("price_path", [])
+        price_now  = float(curve.get("price_now", 0))
+        lower_band = curve.get("lower_band", [])
+
+        if not path or len(path) < 2:
+            return None
+
+        # Slope: tendencia general de la curva completa
+        mid       = max(1, len(path) // 2)
+        avg_first = sum(path[:mid]) / mid
+        avg_last  = sum(path[mid:]) / max(1, len(path) - mid)
+        diff_pct  = (avg_last - avg_first) / avg_first * 100 if avg_first > 0 else 0.0
+
+        if diff_pct > 1.0:
+            slope = "sube"
+        elif diff_pct < -1.0:
+            slope = "baja"
+        else:
+            slope = "plana"
+
+        # Peak y retornos esperados
+        idx_peak     = int(max(range(len(path)), key=lambda i: path[i]))
+        precio_peak  = float(path[idx_peak])
+        precio_final = float(path[-1])
+
+        ret_a_peak  = round((precio_peak  / price_now - 1) * 100, 2) if price_now > 0 else None
+        ret_a_final = round((precio_final / price_now - 1) * 100, 2) if price_now > 0 else None
+
+        # En zona de valle: precio actual bajo lower_band día 1
+        en_zona_valle = False
+        if lower_band and len(lower_band) > 0 and price_now > 0:
+            en_zona_valle = price_now < float(lower_band[0])
+
+        return {
+            "slope_futura":              slope,
+            "ret_desde_hoy_a_peak_pct":  ret_a_peak,
+            "ret_desde_hoy_a_final_pct": ret_a_final,
+            "dias_hasta_peak":           idx_peak + 1,
+            "precio_peak_esperado":      round(precio_peak, 4),
+            "precio_final_esperado":     round(precio_final, 4),
+            "en_zona_valle":             en_zona_valle,
+        }
+
+    except Exception as e:
+        logger.warning(f"⚠️ _load_price_curve {ticker}: {e}")
+        return None
+
+
+# =========================================================
+# CARGA ANCHOR UNIVERSE Y ALPHA
 # =========================================================
 
 def _load_anchor_universe() -> List[Dict[str, Any]]:
@@ -176,20 +242,6 @@ class DefensiveDecision:
 
 
 # =========================================================
-# HELPER CURVA FUTURA — v2.0
-# =========================================================
-
-def _leer_curva_futura(tracker_signal: Optional[Dict]) -> Optional[Dict]:
-    """
-    [CF2] Extrae curva_futura de la señal del tracker.
-    Retorna None si no está disponible — sin efectos secundarios.
-    """
-    if not tracker_signal or not isinstance(tracker_signal, dict):
-        return None
-    return tracker_signal.get("curva_futura") or None
-
-
-# =========================================================
 # PM DEFENSIVO v2.0
 # =========================================================
 
@@ -226,11 +278,7 @@ class PMDefensive:
     # --------------------------------------------------
     # EVALUAR POSICIÓN EXISTENTE
     # --------------------------------------------------
-    def evaluate_position(
-        self,
-        pos:            Dict[str, Any],
-        tracker_signal: Optional[Dict] = None,   # [CF2] señal del tracker con curva_futura
-    ) -> DefensiveDecision:
+    def evaluate_position(self, pos: Dict[str, Any]) -> DefensiveDecision:
         ticker = str(pos.get("ticker", "UNKNOWN")).upper()
         ts     = datetime.now(self.tz).isoformat()
 
@@ -277,102 +325,93 @@ class PMDefensive:
                 {"ret_pct": round(ret * 100, 2), "stop_pct": -CATASTROPHIC_STOP_PCT * 100},
             )
 
-        # Anchors → HOLD indefinido (excepto catastrófico)
-        # [CF3] ANCLAS ignoran curva_futura — lógica sin cambios
+        # [C3] ANCHORS → HOLD indefinido — sin cambios respecto a v1.9
         if is_anchor:
             return DefensiveDecision(
                 "HOLD", ticker, "anchor_hold_indefinite", ts,
                 {
-                    "ret_pct":           round(ret * 100, 2),
-                    "days_held":         age,
-                    "anchor":            True,
-                    "dist_to_stop_pct":  round((ret + CATASTROPHIC_STOP_PCT) * 100, 1),
+                    "ret_pct":          round(ret * 100, 2),
+                    "days_held":        age,
+                    "anchor":           True,
+                    "dist_to_stop_pct": round((ret + CATASTROPHIC_STOP_PCT) * 100, 1),
                 },
             )
 
-        # No-anchors → time exit
+        # No-anchors → time exit (límite duro, no lo toca la curva)
         if age >= MAX_HOLD_DAYS_NON_ANCHOR:
             return DefensiveDecision(
                 "CLOSE", ticker, "non_anchor_time_exit", ts,
                 {"days_held": age, "max_days": MAX_HOLD_DAYS_NON_ANCHOR},
             )
 
-        # ─── [CF3] Contexto de curva futura — solo no-anchors ──────────────
-        # Si el tracker proveyó curva_futura, úsala para refinar la decisión.
-        # Si no hay señal, comportamiento idéntico a v1.9.
+        # ── [C2] Curva de predicción — solo no-anchors ─────────────────────
+        # Lee desde disco. Si no hay curva: comportamiento idéntico a v1.9.
         # ────────────────────────────────────────────────────────────────────
-        curva_futura = _leer_curva_futura(tracker_signal)
+        curva = _load_price_curve(ticker)
+        pnl   = round(ret * 100, 2)
 
-        if curva_futura:
-            slope         = curva_futura.get("slope_futura")          # "sube"|"baja"|"plana"
-            en_zona_valle = curva_futura.get("en_zona_valle", False)
-            ret_a_peak    = curva_futura.get("ret_desde_hoy_a_peak_pct")
-            ret_a_final   = curva_futura.get("ret_desde_hoy_a_final_pct")
-            dias_peak     = curva_futura.get("dias_hasta_peak")
-            pnl_pct       = round(ret * 100, 2)
+        if curva:
+            slope         = curva.get("slope_futura")
+            en_zona_valle = curva.get("en_zona_valle", False)
+            ret_a_peak    = curva.get("ret_desde_hoy_a_peak_pct")
+            ret_a_final   = curva.get("ret_desde_hoy_a_final_pct")
+            dias_peak     = curva.get("dias_hasta_peak")
 
-            # PnL positivo + curva cae desde aquí → cerrar tomando ganancia
-            if pnl_pct > 0 and slope == "baja":
+            # PnL positivo + curva cae → cerrar tomando ganancia
+            if pnl > 0 and slope == "baja":
                 logger.info(
-                    f"📉 {ticker} CLOSE | PnL={pnl_pct:.1f}% + curva cae "
-                    f"(slope={slope} ret_final={ret_a_final}%) → tomar ganancia"
+                    f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva cae "
+                    f"(ret_final={ret_a_final}%) → tomar ganancia"
                 )
                 return DefensiveDecision(
                     "CLOSE", ticker, "defensive_close_curve_falling", ts,
                     {
-                        "ret_pct":          pnl_pct,
-                        "slope_futura":     slope,
-                        "ret_a_final_pct":  ret_a_final,
-                        "dias_hasta_peak":  dias_peak,
-                        "days_held":        age,
-                        "en_zona_valle":    en_zona_valle,
+                        "ret_pct":         pnl,
+                        "slope_futura":    slope,
+                        "ret_a_final_pct": ret_a_final,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age,
+                        "en_zona_valle":   en_zona_valle,
                     },
                 )
 
-            # PnL positivo + curva sube → no cortar, el modelo erró hoy
-            if pnl_pct > 0 and slope == "sube":
+            # PnL positivo + curva sube → mantener, destino alcista
+            if pnl > 0 and slope == "sube":
                 logger.info(
-                    f"📈 {ticker} HOLD | PnL={pnl_pct:.1f}% + curva sube "
-                    f"(slope={slope} ret_peak={ret_a_peak}% en {dias_peak}d) → mantener"
+                    f"📈 {ticker} HOLD | PnL={pnl:.1f}% curva sube "
+                    f"(ret_peak={ret_a_peak}% en {dias_peak}d) → mantener"
                 )
                 return DefensiveDecision(
                     "HOLD", ticker, "hold_curve_recovering", ts,
                     {
-                        "ret_pct":          pnl_pct,
-                        "slope_futura":     slope,
-                        "ret_a_peak_pct":   ret_a_peak,
-                        "dias_hasta_peak":  dias_peak,
-                        "days_held":        age,
-                        "en_zona_valle":    en_zona_valle,
+                        "ret_pct":         pnl,
+                        "slope_futura":    slope,
+                        "ret_a_peak_pct":  ret_a_peak,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age,
+                        "en_zona_valle":   en_zona_valle,
                     },
                 )
 
-            # PnL negativo + en zona de valle → informar, no cerrar todavía
-            # El PM defensivo no promedia a la baja, pero deja el contexto
-            # en meta para que el orchestrator / operador lo vea
-            if pnl_pct < 0 and en_zona_valle:
-                logger.info(
-                    f"🪣 {ticker} en zona valle | PnL={pnl_pct:.1f}% "
-                    f"slope={slope} → HOLD con contexto valle"
-                )
-                return DefensiveDecision(
-                    "HOLD", ticker, "defensive_hold_zona_valle", ts,
-                    {
-                        "ret_pct":          pnl_pct,
-                        "slope_futura":     slope,
-                        "ret_a_peak_pct":   ret_a_peak,
-                        "dias_hasta_peak":  dias_peak,
-                        "days_held":        age,
-                        "en_zona_valle":    True,
-                        "days_to_exit":     MAX_HOLD_DAYS_NON_ANCHOR - age,
-                    },
-                )
+            # Otros casos: HOLD con contexto de curva en meta
+            return DefensiveDecision(
+                "HOLD", ticker, "defensive_hold_non_anchor", ts,
+                {
+                    "ret_pct":        pnl,
+                    "days_held":      age,
+                    "anchor":         False,
+                    "days_to_exit":   MAX_HOLD_DAYS_NON_ANCHOR - age,
+                    "slope_futura":   slope,
+                    "en_zona_valle":  en_zona_valle,
+                    "ret_a_peak_pct": ret_a_peak,
+                },
+            )
 
-        # Sin curva_futura o slope plano → comportamiento v1.9
+        # Sin curva disponible → comportamiento idéntico a v1.9
         return DefensiveDecision(
             "HOLD", ticker, "defensive_hold_non_anchor", ts,
             {
-                "ret_pct":      round(ret * 100, 2),
+                "ret_pct":      pnl,
                 "days_held":    age,
                 "anchor":       False,
                 "days_to_exit": MAX_HOLD_DAYS_NON_ANCHOR - age,
@@ -426,17 +465,10 @@ class PMDefensive:
         positions:       List[Dict[str, Any]],
         anchor_universe: Optional[List[Dict[str, Any]]] = None,
         total_capital:   float = 1000000,
-        tracker_signals: Optional[Dict[str, Dict]] = None,  # [CF1] señales del tracker
     ) -> List[DefensiveDecision]:
-        """
-        [CF1] tracker_signals: dict {ticker: señal_tracker} con curva_futura.
-        Parámetro opcional — si es None, comportamiento idéntico a v1.9.
-        El orchestrator lo pasa después de llamar al tracker.
-        """
+
         decisions    = []
         alpha_scores = _load_alpha_scores()
-
-        tracker_signals = tracker_signals or {}
 
         anchors     = [p for p in positions if p.get("is_anchor", False)
                        or p.get("ticker", "").upper() in self._anchor_tickers]
@@ -445,9 +477,7 @@ class PMDefensive:
                        and not p.get("is_anchor", False)]
 
         for pos in positions:
-            ticker         = str(pos.get("ticker", "")).upper()
-            tracker_signal = tracker_signals.get(ticker)   # [CF2] None si no hay señal
-            decisions.append(self.evaluate_position(pos, tracker_signal))
+            decisions.append(self.evaluate_position(pos))
 
         portfolio_tickers = {p.get("ticker", "").upper() for p in positions}
         eligible_anchors  = [
@@ -502,8 +532,7 @@ class PMDefensive:
         logger.info(
             f"DEFENSIVE v2.0 | pos={len(positions)} anchors={len(anchors)} "
             f"| closes={closes} opens={opens} holds={holds} "
-            f"rotates={rotations_done} | capital=${total_capital:,.0f} "
-            f"| tracker_signals={len(tracker_signals)}"
+            f"rotates={rotations_done} | capital=${total_capital:,.0f}"
         )
 
         return decisions
@@ -520,26 +549,26 @@ if __name__ == "__main__":
     pm = PMDefensive()
 
     test_positions = [
-        {   # Anchor con campos de Alpaca — debe ser HOLD
+        {   # Anchor — debe ser HOLD, curva no aplica
             "ticker":          "JNJ",
             "avg_entry_price": 230.70,
             "current_price":   231.47,
             "qty":             18,
             "entry_date":      "2026-02-26",
         },
-        {   # Anchor sin entry_date — debe ser HOLD (no CLOSE, no warning)
+        {   # Anchor sin entry_date — debe ser HOLD
             "ticker":    "KO",
             "price_now": 75.50,
             "qty":       56,
         },
-        {   # No-anchor con entry_date como fecha simple
+        {   # No-anchor
             "ticker":          "BALL",
             "avg_entry_price": 64.95,
             "current_price":   64.03,
             "qty":             67,
             "entry_date":      "2026-03-01",
         },
-        {   # No-anchor sin entry_date — debe ser HOLD (age=0, no expirado)
+        {   # No-anchor sin entry_date — debe ser HOLD (age=0)
             "ticker":          "STT",
             "avg_entry_price": 156.72,
             "current_price":   157.00,
@@ -547,50 +576,19 @@ if __name__ == "__main__":
         },
     ]
 
-    # Test con tracker_signals simuladas
-    test_tracker_signals = {
-        "BALL": {
-            "curva_futura": {
-                "slope_futura":              "baja",
-                "ret_desde_hoy_a_peak_pct":  1.2,
-                "ret_desde_hoy_a_final_pct": -3.5,
-                "dias_hasta_peak":           1,
-                "en_zona_valle":             False,
-            }
-        },
-        "STT": {
-            "curva_futura": {
-                "slope_futura":              "sube",
-                "ret_desde_hoy_a_peak_pct":  4.8,
-                "ret_desde_hoy_a_final_pct": 2.1,
-                "dias_hasta_peak":           3,
-                "en_zona_valle":             False,
-            }
-        },
-    }
-
     print("\nPMDefensive v2.0 SELF-TEST:")
-    print("\n── Sin tracker_signals (retrocompatibilidad v1.9) ──")
-    results_v19 = pm.evaluate_portfolio(test_positions, total_capital=85000)
-    for d in results_v19:
+    results = pm.evaluate_portfolio(test_positions, total_capital=85000)
+
+    print("\nDECISIONES:")
+    for d in results:
         print(f"  {d.action:6} {d.ticker:12} {d.reason}")
 
-    print("\n── Con tracker_signals (v2.0) ──")
-    results_v20 = pm.evaluate_portfolio(
-        test_positions,
-        total_capital=85000,
-        tracker_signals=test_tracker_signals,
-    )
-    for d in results_v20:
-        print(f"  {d.action:6} {d.ticker:12} {d.reason}")
-
-    # Asserts retrocompatibilidad
-    jnj = next((d for d in results_v19 if d.ticker == "JNJ"),  None)
-    ko  = next((d for d in results_v19 if d.ticker == "KO"),   None)
-    stt = next((d for d in results_v19 if d.ticker == "STT"),  None)
+    jnj = next((d for d in results if d.ticker == "JNJ"),  None)
+    ko  = next((d for d in results if d.ticker == "KO"),   None)
+    stt = next((d for d in results if d.ticker == "STT"),  None)
 
     assert jnj and jnj.action == "HOLD", f"❌ JNJ debe ser HOLD, es {jnj}"
     assert ko  and ko.action  == "HOLD", f"❌ KO debe ser HOLD, es {ko}"
     assert stt and stt.action == "HOLD", f"❌ STT sin entry_date debe ser HOLD (age=0), es {stt}"
 
-    print("\n✅ v2.0 TEST OK — curva futura integrada, retrocompatibilidad v1.9 confirmada")
+    print("\n✅ v2.0 TEST OK — curva desde disco integrada, retrocompatibilidad v1.9 confirmada")
