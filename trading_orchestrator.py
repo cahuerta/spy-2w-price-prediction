@@ -1,5 +1,5 @@
 # =========================================================
-# trading_orchestrator.py — v4.7 CURVE CONTEXT TO PM
+# trading_orchestrator.py — v4.6 TRACKER-PM INTEGRATION
 # =========================================================
 # v4.6:
 #   Refactor arquitectural del flujo intraday:
@@ -15,17 +15,6 @@
 #   [IT3] Filtro intraday usa sugerencia="ENTRAR" (no "entrar_ahora")
 #   [IT4] Cierres: tracker puede sugerir TRAILING — orchestrator respeta
 #   [IT5] Orden correcto: PM → Tracker → CG → Broker
-#
-# v4.7 — Contexto de curva futura a los PM:
-#   [CV1] _get_pm_decisions() acepta tracker_signals: Dict = None
-#         y lo pasa a cada PM como contexto informativo.
-#         Los PM usan curva_futura para refinar sus decisiones
-#         (ver pm_growth v2.7.0, pm_neutral v1.3, pm_defensive v2.0).
-#   [CV2] tracker_closes (ya calculado en paso 1) se pasa a
-#         _get_pm_decisions() en la segunda llamada al PM post-cierres.
-#         No hay llamadas extra al tracker — se reusan las señales.
-#   [CV3] Flujo sin cambios — PM decide, tracker evalúa timing,
-#         orchestrator ejecuta. Solo se enriquece el contexto del PM.
 # =========================================================
 
 import logging
@@ -94,7 +83,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.7 CURVE CONTEXT TO PM | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.6 TRACKER-PM INTEGRATION | fallback capital ${self._fallback_capital:,.0f}")
 
     # =========================================================
     # CAPITAL
@@ -182,7 +171,15 @@ class TradingOrchestrator:
             logger.warning(f"⚠️ No se pudo cargar anchor_universe.json: {e}")
             return set()
 
+    # [IT1] _load_intraday_signals() ELIMINADO — era universo propio del tracker.
+    # En v4.6 el tracker recibe listas del PM via _evaluar_timing_entrada()
+    # y _evaluar_posiciones_abiertas().
+
     def _evaluar_timing_entrada(self, tickers: List[str]) -> Dict[str, Dict]:
+        """
+        [IT2] Llama al tracker con la lista exacta que el PM decidió comprar.
+        Retorna dict {ticker: señal} con sugerencia ENTRAR/ESPERAR.
+        """
         if not tickers:
             return {}
         try:
@@ -200,6 +197,10 @@ class TradingOrchestrator:
             return {}
 
     def _evaluar_posiciones_abiertas(self, tickers: List[str]) -> Dict[str, Dict]:
+        """
+        [IT2] Llama al tracker con la lista exacta de posiciones abiertas del PM.
+        Retorna dict {ticker: señal} con sugerencia MANTENER/CERRAR/TRAILING.
+        """
         if not tickers:
             return {}
         try:
@@ -371,7 +372,7 @@ class TradingOrchestrator:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
-    # RUN PRINCIPAL v4.7
+    # RUN PRINCIPAL v4.6
     # =========================================================
     async def run(
         self,
@@ -381,14 +382,14 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.7 CURVE CONTEXT TO PM | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.6 TRACKER-PM INTEGRATION | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
         executor_genome_id, predictor_genome_id = _load_active_genome_ids()
         logger.info(f"🧬 Genomas activos | executor={executor_genome_id} predictor={predictor_genome_id}")
 
-        # [CB1] Circuit breaker
+        # [CB1] Circuit breaker — chequear antes de cualquier ejecución
         cb_result      = await self._circuit_breaker_check(self.fixed_capital)
         breaker_active = cb_result["active"]
 
@@ -460,27 +461,11 @@ class TradingOrchestrator:
         }
 
         # =========================================================
-        # [CV2] Pre-calcular señales del tracker para posiciones
-        # abiertas ANTES de llamar al PM — así el PM recibe curva_futura.
-        # Una sola llamada al tracker, sin cambio de flujo.
-        # =========================================================
-        position_tickers = [
-            str(p.get("ticker", "")).upper()
-            for p in positions
-            if p.get("ticker")
-        ]
-        tracker_posiciones_previo = self._evaluar_posiciones_abiertas(position_tickers)
-        logger.info(
-            f"📊 Tracker pre-PM | señales={len(tracker_posiciones_previo)} tickers"
-        )
-
-        # =========================================================
-        # PASO 1: PM decide — recibe señales del tracker como contexto
-        # [IT5] Orden: PM (con curva_futura) → Tracker timing → CG → Broker
+        # PASO 1: PM decide primero — cierra y abre
+        # [IT5] Orden correcto: PM → Tracker → CG → Broker
         # =========================================================
         pm_decisions = await self._get_pm_decisions(
-            mode, positions, signals or {}, anchor_universe,
-            tracker_signals=tracker_posiciones_previo,   # [CV1]
+            mode, positions, signals or {}, anchor_universe
         )
 
         closes = []
@@ -521,24 +506,23 @@ class TradingOrchestrator:
         closes = list({c["ticker"]: c for c in closes}.values())
 
         # =========================================================
-        # [IT4] TRACKER VALIDA CIERRES — reusar señales ya calculadas
-        # [CV2] tracker_posiciones_previo ya tiene curva_futura
-        #       No hay segunda llamada al tracker para posiciones.
+        # [IT4] TRACKER VALIDA CIERRES — considera PnL actual
+        # Sugerencia TRAILING → no cerrar posiciones muy ganadoras
         # =========================================================
         close_tickers_pm = [c["ticker"] for c in closes]
         if close_tickers_pm:
-            # Reusar señales del tracker ya calculadas — sin llamada extra
-            tracker_closes   = tracker_posiciones_previo
+            tracker_closes = self._evaluar_posiciones_abiertas(close_tickers_pm)
             closes_filtrados = []
             for c in closes:
-                ticker = c["ticker"]
-                señal  = tracker_closes.get(ticker)
+                ticker   = c["ticker"]
+                señal    = tracker_closes.get(ticker)
                 if señal and señal.get("sugerencia") == "TRAILING":
                     pnl = señal.get("pnl_actual_pct", 0)
                     logger.info(
                         f"🛡 TRAILING BLOCK {ticker} | PnL={pnl:.1f}% → "
                         f"no cerrar, activar trailing stop"
                     )
+                    # Marcamos como trailing para que el orchestrator lo monitoree
                     c = {**c, "trailing": True, "pnl_actual_pct": pnl}
                     closes_filtrados.append(c)
                 else:
@@ -546,7 +530,8 @@ class TradingOrchestrator:
             closes = closes_filtrados
 
         # =========================================================
-        # PASO 2: Ejecutar CIERRES
+        # PASO 2: Ejecutar CIERRES (siempre — breaker no los bloquea)
+        # Solo cierra los que NO tienen trailing=True
         # =========================================================
         close_successes = []
         closes_ejecutar = [c for c in closes if not c.get("trailing")]
@@ -673,6 +658,8 @@ class TradingOrchestrator:
 
         # =========================================================
         # [IT2][IT3] TRACKER VALIDA TIMING DE ENTRADAS
+        # Recibe EXACTAMENTE la lista que el PM decidió comprar.
+        # Anclas pasan directo — tracker no bloquea anclas.
         # =========================================================
         pm_open_tickers = [
             o["ticker"].upper() for o in opens
@@ -694,12 +681,14 @@ class TradingOrchestrator:
                 or ticker in anchor_tickers
             )
             if is_anchor:
+                # Anclas siempre pasan — tracker no las bloquea
                 filtered_opens.append(o)
                 continue
 
             señal = tracker_entradas.get(ticker)
 
             if señal is None:
+                # Sin señal del tracker → pasar (sin datos no bloqueamos)
                 filtered_opens.append(o)
                 continue
 
@@ -711,6 +700,7 @@ class TradingOrchestrator:
                 )
                 filtered_opens.append(o)
             else:
+                # [IT3] ESPERAR → no entra hoy
                 logger.info(
                     f"⏳ INTRADAY ESPERA {ticker} | "
                     f"score={señal.get('entry_score')} | "
@@ -917,57 +907,32 @@ class TradingOrchestrator:
 
     async def _get_pm_decisions(
         self,
-        mode:            str,
-        positions:       List[Dict],
-        signals:         Dict,
-        anchor:          List,
-        tracker_signals: Optional[Dict[str, Dict]] = None,  # [CV1] señales del tracker
+        mode: str,
+        positions: List[Dict],
+        signals: Dict,
+        anchor: List,
     ) -> List[Dict]:
-        """
-        [CV1] tracker_signals: dict {ticker: señal_tracker} con curva_futura.
-        Se pasa a cada PM para que refinen sus decisiones con contexto de curva.
-        Parámetro opcional — si es None, cada PM usa su lógica base sin cambios.
-        """
-        decisions       = []
-        tracker_signals = tracker_signals or {}
-
+        decisions = []
         try:
             if mode == "growth":
                 pm = PMGrowth(self.fixed_capital)
                 for pos in positions:
-                    ticker = str(pos.get("ticker", "")).upper()
-                    d = pm.evaluate_position(
-                        pos,
-                        signals.get(pos["ticker"]),
-                        tracker_signal=tracker_signals.get(ticker),  # [CV1]
-                    )
+                    d = pm.evaluate_position(pos, signals.get(pos["ticker"]))
                     if isinstance(d, dict):
                         decisions.append(d)
-
             elif mode == "defensive":
                 pm  = PMDefensive()
-                raw = pm.evaluate_portfolio(
-                    positions,
-                    anchor,
-                    self.fixed_capital,
-                    tracker_signals=tracker_signals,   # [CV1]
-                )
+                raw = pm.evaluate_portfolio(positions, anchor, self.fixed_capital)
                 if isinstance(raw, list):
                     decisions.extend(
                         [r if isinstance(r, dict) else r.to_dict() for r in raw]
                     )
                 elif isinstance(raw, dict):
                     decisions.extend(raw.get("decisions", []))
-
             else:
                 pm  = PMNeutral()
-                raw = pm.evaluate_portfolio(
-                    positions,
-                    tracker_signals=tracker_signals,   # [CV1]
-                )
+                raw = pm.evaluate_portfolio(positions)
                 decisions.extend(raw.get("decisions", []))
-
         except Exception as e:
             logger.error(f"PM error: {e}")
-
         return decisions
