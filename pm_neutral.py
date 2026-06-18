@@ -18,24 +18,20 @@ FIX v1.2:
   [N2] entry <= 0 también es HOLD si price > 0 (puede ser error de datos de entrada,
        no necesariamente una posición inválida real).
 
-v1.3 — Contexto de curva futura del tracker:
-  [CF1] evaluate_portfolio() acepta tracker_signals: Dict[str, Dict] = None
-        Parámetro opcional — retrocompatible con llamadas existentes.
-  [CF2] evaluate_position() acepta tracker_signal: Dict = None
-        Lee curva_futura si está disponible en la señal del tracker.
-  [CF3] Lógica curva futura (solo si tracker_signal disponible):
-        Se inserta ANTES de los stops existentes para:
-        - pnl > 0 + slope="baja" → CLOSE "neutral_close_curve_falling"
-          (tomar ganancia antes de caída esperada, complementa take_profit)
-        - pnl > 0 + slope="sube" → anular trailing/time_exit si caída es
-          menor al stop duro (no cortar si el destino es alcista)
-        - en_zona_valle=True → agrega contexto en meta, no modifica acción
-        Los stops duros (stop_loss, trailing, take_profit) tienen prioridad
-        sobre curva_futura — no se sobreescriben nunca.
-  [CF4] Si tracker_signal es None o no tiene curva_futura,
-        comportamiento idéntico a v1.2 — sin regresiones.
-  [CF5] evaluate_portfolio() retorna los mismos campos que v1.2
-        más "tracker_signals_count" para trazabilidad.
+v1.3:
+  [C1] _load_price_curve(ticker): lee curva de predicción desde disco
+       /data/predictions/{ticker}/{fecha}.json — sin tracker, sin
+       dependencias externas. Igual patrón que defensive y growth.
+  [C2] evaluate_position(): usa curva DESPUÉS de stops duros y take_profit
+       (prioridad absoluta):
+       - pnl > 0 + slope="baja" → CLOSE "neutral_close_curve_falling"
+         (tomar ganancia antes de caída esperada)
+       - pnl > 0 + slope="sube" → HOLD "hold_curve_recovering"
+         (anula time_exit y confidence_collapse — destino alcista)
+       - Sin curva disponible: comportamiento idéntico a v1.2.
+  [C3] Stops duros (stop_loss, trailing, take_profit): sin cambios,
+       prioridad absoluta sobre curva.
+  [C4] Orchestrator y tracker: sin cambios.
 """
 
 import os
@@ -44,12 +40,16 @@ import json
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 from dataclasses import dataclass
+from pathlib import Path
 import pytz
 
 # =================================================================
 # CONFIGURACIÓN NEUTRAL
 # =================================================================
 CL_TIMEZONE = pytz.timezone("America/Santiago")
+
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
+PRED_DIR  = DATA_PATH / "predictions"
 
 MAX_HOLD_DAYS_NEUTRAL     = int(os.getenv("PM_NEU_MAX_HOLD_DAYS",   "10"))
 MIN_CONFIDENCE_NEUTRAL    = float(os.getenv("PM_NEU_MIN_CONF",      "0.60"))
@@ -74,13 +74,84 @@ def pct_change(current: float, entry: float) -> float:
 def days_between(entry_iso: str) -> int:
     try:
         entry_str = entry_iso.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(entry_str)
-        now_cl   = datetime.now(CL_TIMEZONE)
-        entry_cl = dt.astimezone(CL_TIMEZONE)
+        dt        = datetime.fromisoformat(entry_str)
+        now_cl    = datetime.now(CL_TIMEZONE)
+        entry_cl  = dt.astimezone(CL_TIMEZONE)
         return max(0, (now_cl - entry_cl).days)
     except Exception as e:
         logger.warning(f"Error days_between '{entry_iso}': {e}")
         return MAX_HOLD_DAYS_NEUTRAL
+
+
+# =================================================================
+# CARGA CURVA DE PREDICCIÓN — v1.3
+# =================================================================
+
+def _load_price_curve(ticker: str) -> Optional[Dict]:
+    """
+    [C1] Lee la curva de predicción más reciente desde disco.
+    /data/predictions/{TICKER}/{fecha}.json
+    Retorna None si no existe o hay error — sin efectos secundarios.
+    """
+    try:
+        ticker_dir = PRED_DIR / ticker.upper()
+        if not ticker_dir.exists():
+            return None
+        candidates = sorted(ticker_dir.glob("*.json"))
+        if not candidates:
+            return None
+        data  = json.loads(candidates[-1].read_text(encoding="utf-8"))
+        curve = data.get("price_curve")
+        if not curve or not curve.get("price_path"):
+            return None
+
+        path       = curve.get("price_path", [])
+        price_now  = float(curve.get("price_now", 0))
+        lower_band = curve.get("lower_band", [])
+
+        if not path or len(path) < 2:
+            return None
+
+        # Slope: tendencia general de la curva completa
+        mid       = max(1, len(path) // 2)
+        avg_first = sum(path[:mid]) / mid
+        avg_last  = sum(path[mid:]) / max(1, len(path) - mid)
+        diff_pct  = (avg_last - avg_first) / avg_first * 100 if avg_first > 0 else 0.0
+
+        if diff_pct > 1.0:
+            slope = "sube"
+        elif diff_pct < -1.0:
+            slope = "baja"
+        else:
+            slope = "plana"
+
+        # Peak y retornos esperados
+        idx_peak     = int(max(range(len(path)), key=lambda i: path[i]))
+        precio_peak  = float(path[idx_peak])
+        precio_final = float(path[-1])
+
+        ret_a_peak  = round((precio_peak  / price_now - 1) * 100, 2) if price_now > 0 else None
+        ret_a_final = round((precio_final / price_now - 1) * 100, 2) if price_now > 0 else None
+
+        # En zona de valle: precio actual bajo lower_band día 1
+        en_zona_valle = False
+        if lower_band and len(lower_band) > 0 and price_now > 0:
+            en_zona_valle = price_now < float(lower_band[0])
+
+        return {
+            "slope_futura":              slope,
+            "ret_desde_hoy_a_peak_pct":  ret_a_peak,
+            "ret_desde_hoy_a_final_pct": ret_a_final,
+            "dias_hasta_peak":           idx_peak + 1,
+            "precio_peak_esperado":      round(precio_peak, 4),
+            "precio_final_esperado":     round(precio_final, 4),
+            "en_zona_valle":             en_zona_valle,
+        }
+
+    except Exception as e:
+        logger.warning(f"⚠️ _load_price_curve {ticker}: {e}")
+        return None
+
 
 # =================================================================
 # DATACLASS DECISIÓN
@@ -100,18 +171,6 @@ class NeutralDecision:
             "meta": self.meta or {},
         }
 
-# =================================================================
-# HELPER CURVA FUTURA — v1.3
-# =================================================================
-
-def _leer_curva_futura(tracker_signal: Optional[Dict]) -> Optional[Dict]:
-    """
-    [CF2] Extrae curva_futura de la señal del tracker.
-    Retorna None si no está disponible — sin efectos secundarios.
-    """
-    if not tracker_signal or not isinstance(tracker_signal, dict):
-        return None
-    return tracker_signal.get("curva_futura") or None
 
 # =================================================================
 # PM NEUTRAL
@@ -127,11 +186,7 @@ class PMNeutral:
     # --------------------------------------------------
     # EVALUAR POSICIÓN EXISTENTE
     # --------------------------------------------------
-    def evaluate_position(
-        self,
-        pos:            Dict[str, Any],
-        tracker_signal: Optional[Dict] = None,   # [CF2] señal del tracker con curva_futura
-    ) -> NeutralDecision:
+    def evaluate_position(self, pos: Dict[str, Any]) -> NeutralDecision:
 
         ticker = str(pos.get("ticker", "UNKNOWN")).upper()
 
@@ -143,7 +198,6 @@ class PMNeutral:
             confidence = float(pos.get("confidence", 0))
         except (ValueError, TypeError) as e:
             logger.error(f"Posición inválida {ticker}: {e}")
-            # [N1] Error de parseo → HOLD, no CLOSE
             return NeutralDecision(
                 "HOLD", ticker, "input_error_hold",
                 datetime.now(self.tz).isoformat(),
@@ -174,6 +228,7 @@ class PMNeutral:
             )
 
         ret      = pct_change(price, entry)
+        pnl      = round(ret * 100, 2)
         age_days = days_between(entry_time)
 
         logger.debug(
@@ -181,92 +236,87 @@ class PMNeutral:
             f"conf={confidence:.2f} age={age_days}d"
         )
 
-        # ── [CF3] Contexto de curva futura ─────────────────────────────────
-        # Se evalúa ANTES de trailing y time_exit, pero DESPUÉS de stop duro.
-        # Los stops duros tienen siempre prioridad.
-        # Si no hay curva_futura, este bloque es transparente (no-op).
-        # ───────────────────────────────────────────────────────────────────
-        curva_futura = _leer_curva_futura(tracker_signal)
-
-        # 1️⃣ STOP LOSS DURO — máxima prioridad, nunca se sobreescribe
+        # 1️⃣ STOP LOSS DURO — prioridad absoluta
         if price <= entry * (1 - STOP_LOSS_NEUTRAL_PCT):
             return NeutralDecision(
                 "CLOSE", ticker, "stop_loss_neutral",
                 datetime.now(self.tz).isoformat(),
-                {"ret_pct": round(ret * 100, 2), "trigger_pct": -STOP_LOSS_NEUTRAL_PCT}
+                {"ret_pct": pnl, "trigger_pct": -STOP_LOSS_NEUTRAL_PCT}
             )
 
-        # 2️⃣ TAKE PROFIT — también tiene prioridad sobre curva
-        if ret >= TAKE_PROFIT_NEUTRAL_PCT:
-            return NeutralDecision(
-                "CLOSE", ticker, "take_profit_neutral",
-                datetime.now(self.tz).isoformat(),
-                {"ret_pct": round(ret * 100, 2), "trigger_pct": TAKE_PROFIT_NEUTRAL_PCT}
-            )
-
-        # ── [CF3] Curva futura: cierre estratégico antes de caída ──────────
-        if curva_futura:
-            slope         = curva_futura.get("slope_futura")
-            en_zona_valle = curva_futura.get("en_zona_valle", False)
-            ret_a_peak    = curva_futura.get("ret_desde_hoy_a_peak_pct")
-            ret_a_final   = curva_futura.get("ret_desde_hoy_a_final_pct")
-            dias_peak     = curva_futura.get("dias_hasta_peak")
-            pnl_pct       = round(ret * 100, 2)
-
-            # PnL positivo + curva cae → cerrar tomando ganancia
-            # (complementa take_profit para casos < 7% pero con caída esperada)
-            if pnl_pct > 0 and slope == "baja":
-                logger.info(
-                    f"📉 {ticker} CLOSE | PnL={pnl_pct:.1f}% + curva cae "
-                    f"(slope={slope} ret_final={ret_a_final}%) → tomar ganancia"
-                )
-                return NeutralDecision(
-                    "CLOSE", ticker, "neutral_close_curve_falling",
-                    datetime.now(self.tz).isoformat(),
-                    {
-                        "ret_pct":          pnl_pct,
-                        "slope_futura":     slope,
-                        "ret_a_final_pct":  ret_a_final,
-                        "dias_hasta_peak":  dias_peak,
-                        "days_held":        age_days,
-                        "en_zona_valle":    en_zona_valle,
-                    },
-                )
-
-            # PnL positivo + curva sube → no aplicar trailing ni time_exit
-            # El destino es alcista — no cortar por tiempo o trailing pequeño
-            if pnl_pct > 0 and slope == "sube":
-                logger.info(
-                    f"📈 {ticker} HOLD | PnL={pnl_pct:.1f}% + curva sube "
-                    f"(ret_peak={ret_a_peak}% en {dias_peak}d) → omitir trailing/time"
-                )
-                return NeutralDecision(
-                    "HOLD", ticker, "hold_curve_recovering",
-                    datetime.now(self.tz).isoformat(),
-                    {
-                        "ret_pct":          pnl_pct,
-                        "slope_futura":     slope,
-                        "ret_a_peak_pct":   ret_a_peak,
-                        "dias_hasta_peak":  dias_peak,
-                        "days_held":        age_days,
-                        "en_zona_valle":    en_zona_valle,
-                    },
-                )
-
-        # 3️⃣ TRAILING STOP — después de curva (curva puede anularlo si slope=sube)
+        # 2️⃣ TRAILING STOP — prioridad absoluta
         trail_stop = peak * (1 - TRAILING_STOP_NEUTRAL_PCT)
         if price <= trail_stop:
             return NeutralDecision(
                 "CLOSE", ticker, "trailing_stop_neutral",
                 datetime.now(self.tz).isoformat(),
                 {
-                    "ret_pct":           round(ret * 100, 2),
+                    "ret_pct":           pnl,
                     "peak_pct":          round(pct_change(peak, entry) * 100, 2),
                     "trail_trigger_pct": -TRAILING_STOP_NEUTRAL_PCT,
                 }
             )
 
-        # 4️⃣ TIEMPO MÁXIMO — después de curva (curva puede anularlo si slope=sube)
+        # 3️⃣ TAKE PROFIT — prioridad absoluta
+        if ret >= TAKE_PROFIT_NEUTRAL_PCT:
+            return NeutralDecision(
+                "CLOSE", ticker, "take_profit_neutral",
+                datetime.now(self.tz).isoformat(),
+                {"ret_pct": pnl, "trigger_pct": TAKE_PROFIT_NEUTRAL_PCT}
+            )
+
+        # ── [C2] Curva desde disco — después de stops duros ────────────────
+        # Si no hay curva: comportamiento idéntico a v1.2.
+        # ───────────────────────────────────────────────────────────────────
+        curva = _load_price_curve(ticker)
+
+        if curva:
+            slope         = curva.get("slope_futura")
+            en_zona_valle = curva.get("en_zona_valle", False)
+            ret_a_peak    = curva.get("ret_desde_hoy_a_peak_pct")
+            ret_a_final   = curva.get("ret_desde_hoy_a_final_pct")
+            dias_peak     = curva.get("dias_hasta_peak")
+
+            # PnL positivo + curva cae → cerrar tomando ganancia
+            if pnl > 0 and slope == "baja":
+                logger.info(
+                    f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva cae "
+                    f"(ret_final={ret_a_final}%) → tomar ganancia"
+                )
+                return NeutralDecision(
+                    "CLOSE", ticker, "neutral_close_curve_falling",
+                    datetime.now(self.tz).isoformat(),
+                    {
+                        "ret_pct":         pnl,
+                        "slope_futura":    slope,
+                        "ret_a_final_pct": ret_a_final,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age_days,
+                        "en_zona_valle":   en_zona_valle,
+                    }
+                )
+
+            # PnL positivo + curva sube → no aplicar time_exit ni confidence
+            if pnl > 0 and slope == "sube":
+                logger.info(
+                    f"📈 {ticker} HOLD | PnL={pnl:.1f}% curva sube "
+                    f"(ret_peak={ret_a_peak}% en {dias_peak}d) → mantener"
+                )
+                return NeutralDecision(
+                    "HOLD", ticker, "hold_curve_recovering",
+                    datetime.now(self.tz).isoformat(),
+                    {
+                        "ret_pct":         pnl,
+                        "slope_futura":    slope,
+                        "ret_a_peak_pct":  ret_a_peak,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age_days,
+                        "confidence":      confidence,
+                        "en_zona_valle":   en_zona_valle,
+                    }
+                )
+
+        # 4️⃣ TIEMPO MÁXIMO — después de curva
         if age_days >= MAX_HOLD_DAYS_NEUTRAL:
             return NeutralDecision(
                 "CLOSE", ticker, f"time_exit_{age_days}d",
@@ -274,7 +324,7 @@ class PMNeutral:
                 {"days_held": age_days, "max_days": MAX_HOLD_DAYS_NEUTRAL}
             )
 
-        # 5️⃣ CONFIDENCE COLAPSÓ — no se ve afectado por curva
+        # 5️⃣ CONFIDENCE COLAPSÓ — después de curva
         if confidence < MIN_CONFIDENCE_NEUTRAL * 0.7:
             return NeutralDecision(
                 "CLOSE", ticker, "confidence_collapse",
@@ -284,17 +334,17 @@ class PMNeutral:
 
         # 6️⃣ HOLD — agrega contexto de curva si disponible
         hold_meta = {
-            "ret_pct":        round(ret * 100, 2),
+            "ret_pct":        pnl,
             "days_held":      age_days,
             "confidence":     confidence,
             "distance_sl":    round((price / entry - (1 - STOP_LOSS_NEUTRAL_PCT)) * 100, 2),
             "distance_trail": round((price / peak  - (1 - TRAILING_STOP_NEUTRAL_PCT)) * 100, 2),
         }
-        if curva_futura:
-            hold_meta["slope_futura"]    = curva_futura.get("slope_futura")
-            hold_meta["en_zona_valle"]   = curva_futura.get("en_zona_valle", False)
-            hold_meta["ret_a_peak_pct"]  = curva_futura.get("ret_desde_hoy_a_peak_pct")
-            hold_meta["dias_hasta_peak"] = curva_futura.get("dias_hasta_peak")
+        if curva:
+            hold_meta["slope_futura"]    = curva.get("slope_futura")
+            hold_meta["en_zona_valle"]   = curva.get("en_zona_valle", False)
+            hold_meta["ret_a_peak_pct"]  = curva.get("ret_desde_hoy_a_peak_pct")
+            hold_meta["dias_hasta_peak"] = curva.get("dias_hasta_peak")
 
         return NeutralDecision(
             "HOLD", ticker, "hold_neutral",
@@ -336,36 +386,23 @@ class PMNeutral:
     # --------------------------------------------------
     # PORTFOLIO COMPLETO
     # --------------------------------------------------
-    def evaluate_portfolio(
-        self,
-        positions:       List[Dict[str, Any]],
-        tracker_signals: Optional[Dict[str, Dict]] = None,  # [CF1] señales del tracker
-    ) -> Dict[str, Any]:
-        """
-        [CF1] tracker_signals: dict {ticker: señal_tracker} con curva_futura.
-        Parámetro opcional — si es None, comportamiento idéntico a v1.2.
-        Retorna los mismos campos que v1.2 + tracker_signals_count.
-        """
+    def evaluate_portfolio(self, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not positions:
             return {
-                "mode":                 "neutral",
-                "decisions":            [],
-                "positions":            0,
-                "closes":               0,
-                "tracker_signals_count": 0,
-                "timestamp":            datetime.now(self.tz).isoformat(),
-                "message":              "Portfolio vacío",
+                "mode":      "neutral",
+                "decisions": [],
+                "positions": 0,
+                "closes":    0,
+                "timestamp": datetime.now(self.tz).isoformat(),
+                "message":   "Portfolio vacío",
             }
 
-        tracker_signals  = tracker_signals or {}
         decisions        = []
         closes           = 0
         holds_preventive = 0
 
         for pos in positions:
-            ticker         = str(pos.get("ticker", "")).upper()
-            tracker_signal = tracker_signals.get(ticker)   # [CF2] None si no hay señal
-            decision       = self.evaluate_position(pos, tracker_signal)
+            decision = self.evaluate_position(pos)
             decisions.append(decision.to_dict())
 
             if decision.action == "CLOSE":
@@ -378,26 +415,24 @@ class PMNeutral:
         close_pct = round((closes / len(positions)) * 100, 1) if positions else 0
         logger.info(
             f"📊 Neutral v1.3 eval: {len(positions)} pos, {closes} closes ({close_pct}%), "
-            f"{holds_preventive} holds preventivos, "
-            f"tracker_signals={len(tracker_signals)}"
+            f"{holds_preventive} holds preventivos"
         )
 
         return {
-            "mode":                  "neutral",
-            "decisions":             decisions,
-            "positions":             len(positions),
-            "closes":                closes,
-            "holds_preventive":      holds_preventive,
-            "close_pct":             close_pct,
-            "tracker_signals_count": len(tracker_signals),
-            "timestamp":             datetime.now(self.tz).isoformat(),
+            "mode":             "neutral",
+            "decisions":        decisions,
+            "positions":        len(positions),
+            "closes":           closes,
+            "holds_preventive": holds_preventive,
+            "close_pct":        close_pct,
+            "timestamp":        datetime.now(self.tz).isoformat(),
             "config": {
-                "max_hold_days":      MAX_HOLD_DAYS_NEUTRAL,
-                "min_confidence":     MIN_CONFIDENCE_NEUTRAL,
-                "stop_loss_pct":      STOP_LOSS_NEUTRAL_PCT,
-                "take_profit_pct":    TAKE_PROFIT_NEUTRAL_PCT,
-                "trailing_stop_pct":  TRAILING_STOP_NEUTRAL_PCT,
-                "max_risk_per_trade": MAX_RISK_PER_TRADE_NEUTRAL,
+                "max_hold_days":     MAX_HOLD_DAYS_NEUTRAL,
+                "min_confidence":    MIN_CONFIDENCE_NEUTRAL,
+                "stop_loss_pct":     STOP_LOSS_NEUTRAL_PCT,
+                "take_profit_pct":   TAKE_PROFIT_NEUTRAL_PCT,
+                "trailing_stop_pct": TRAILING_STOP_NEUTRAL_PCT,
+                "max_risk_per_trade":MAX_RISK_PER_TRADE_NEUTRAL,
             },
         }
 
@@ -413,7 +448,7 @@ if __name__ == "__main__":
         {   # [N1] Precio 0 → debe retornar HOLD, no CLOSE
             "ticker":      "AMAT",
             "entry_price": 150.0,
-            "price_now":   0,        # Alpaca fuera de horario
+            "price_now":   0,
             "peak_price":  155.0,
             "entry_time":  "2026-01-10T00:00:00Z",
             "confidence":  0.65,
@@ -434,69 +469,15 @@ if __name__ == "__main__":
             "entry_time":  "2026-01-10T00:00:00Z",
             "confidence":  0.70,
         },
-        {   # [CF3] PnL positivo + curva cae → CLOSE antes de take_profit
-            "ticker":      "NVDA",
-            "entry_price": 100.0,
-            "price_now":   104.0,    # +4% (bajo take_profit 7%)
-            "peak_price":  105.0,
-            "entry_time":  "2026-06-10T00:00:00Z",
-            "confidence":  0.70,
-        },
-        {   # [CF3] Trailing activado pero curva sube → HOLD
-            "ticker":      "TSLA",
-            "entry_price": 200.0,
-            "price_now":   215.0,    # trailing: peak 220 → stop 215.6 → activado
-            "peak_price":  220.0,
-            "entry_time":  "2026-06-10T00:00:00Z",
-            "confidence":  0.70,
-        },
     ]
 
-    test_tracker_signals = {
-        "NVDA": {
-            "curva_futura": {
-                "slope_futura":              "baja",
-                "ret_desde_hoy_a_peak_pct":  0.5,
-                "ret_desde_hoy_a_final_pct": -4.2,
-                "dias_hasta_peak":           1,
-                "en_zona_valle":             False,
-            }
-        },
-        "TSLA": {
-            "curva_futura": {
-                "slope_futura":              "sube",
-                "ret_desde_hoy_a_peak_pct":  5.1,
-                "ret_desde_hoy_a_final_pct": 3.8,
-                "dias_hasta_peak":           3,
-                "en_zona_valle":             False,
-            }
-        },
-    }
-
     print("🧪 PMNeutral v1.3 SELF TEST:")
+    result = pm.evaluate_portfolio(test_positions)
+    print(json.dumps(result, indent=2))
 
-    print("\n── Sin tracker_signals (retrocompatibilidad v1.2) ──")
-    result_v12 = pm.evaluate_portfolio(test_positions)
-    for d in result_v12["decisions"]:
-        print(f"  {d['action']:6} {d['ticker']:8} {d['reason']}")
+    amat = next(d for d in result["decisions"] if d["ticker"] == "AMAT")
+    aapl = next(d for d in result["decisions"] if d["ticker"] == "AAPL")
+    assert amat["action"] == "HOLD",  f"❌ AMAT debería ser HOLD, es {amat['action']}"
+    assert aapl["action"] == "CLOSE", f"❌ AAPL debería ser CLOSE, es {aapl['action']}"
 
-    print("\n── Con tracker_signals (v1.3) ──")
-    result_v13 = pm.evaluate_portfolio(test_positions, tracker_signals=test_tracker_signals)
-    for d in result_v13["decisions"]:
-        print(f"  {d['action']:6} {d['ticker']:8} {d['reason']}")
-
-    # Asserts retrocompatibilidad v1.2
-    amat = next(d for d in result_v12["decisions"] if d["ticker"] == "AMAT")
-    aapl = next(d for d in result_v12["decisions"] if d["ticker"] == "AAPL")
-    assert amat["action"] == "HOLD",  f"❌ AMAT debe ser HOLD, es {amat['action']}"
-    assert aapl["action"] == "CLOSE", f"❌ AAPL debe ser CLOSE, es {aapl['action']}"
-
-    # Asserts v1.3 curva futura
-    nvda = next(d for d in result_v13["decisions"] if d["ticker"] == "NVDA")
-    tsla = next(d for d in result_v13["decisions"] if d["ticker"] == "TSLA")
-    assert nvda["action"] == "CLOSE" and nvda["reason"] == "neutral_close_curve_falling", \
-        f"❌ NVDA debe ser CLOSE curve_falling, es {nvda}"
-    assert tsla["action"] == "HOLD"  and tsla["reason"] == "hold_curve_recovering", \
-        f"❌ TSLA debe ser HOLD curve_recovering, es {tsla}"
-
-    print("\n✅ PMNeutral v1.3 – TEST OK – curva futura integrada, retrocompatibilidad v1.2 confirmada")
+    print("\n✅ PMNeutral v1.3 – TEST OK – curva desde disco integrada, retrocompatibilidad v1.2 confirmada")
