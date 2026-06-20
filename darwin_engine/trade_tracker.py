@@ -16,6 +16,15 @@ FIX v1.2:
        fitness del Darwin Engine con nan.
   [T5] register_open valida entry_price > 0 y shares > 0 antes de
        registrar — evita trades fantasma con datos vacíos.
+
+FIX v1.3:
+  [T6] _get_price_at_date ahora cae a data_provider.get_price_history()
+       (cascada Cache → Chile → EODHD → Yahoo → Twelve) cuando Alpaca
+       falla o no tiene permiso de datos (ej. "subscription does not
+       permit querying recent SIP data"). Antes esos tickers (ej. STT)
+       quedaban en closed_pending_resolution para siempre, reintentando
+       y fallando cada día sin nunca resolver ni aportar al fitness
+       del Darwin Engine.
 """
 
 import json
@@ -78,12 +87,8 @@ def _get_alpaca_client():
         return None
 
 
-def _get_price_at_date(ticker: str, target_date) -> Optional[float]:
-    """Obtiene precio de cierre en una fecha específica desde Alpaca."""
-    if ticker.upper() in ALPACA_UNSUPPORTED:
-        logger.info(f"⏭ _get_price_at_date skip {ticker} — no soportado en Alpaca")
-        return None
-
+def _get_price_at_date_alpaca(ticker: str, target_date) -> Optional[float]:
+    """Intenta obtener precio de cierre en una fecha específica desde Alpaca."""
     client = _get_alpaca_client()
     if not client:
         return None
@@ -106,8 +111,111 @@ def _get_price_at_date(ticker: str, target_date) -> Optional[float]:
             return None
         return float(row["close"].iloc[-1])
     except Exception as e:
-        logger.warning(f"_get_price_at_date({ticker}, {target_date}): {e}")
+        logger.warning(f"_get_price_at_date_alpaca({ticker}, {target_date}): {e}")
         return None
+
+
+def _get_price_at_date_fallback(ticker: str, target_date) -> Optional[float]:
+    """
+    [T6] Fallback usando data_provider (cascada Cache → Chile → EODHD →
+    Yahoo → Twelve). Se usa cuando Alpaca falla o no tiene permiso de
+    datos (ej. límite de SIP data en suscripciones básicas).
+
+    Detecta el esquema del DataFrame de forma defensiva, sin asumir
+    nombres exactos de columnas (pueden venir de distintos providers).
+    """
+    try:
+        from data_provider import get_price_history
+    except Exception as e:
+        logger.warning(f"_get_price_at_date_fallback: data_provider no disponible: {e}")
+        return None
+
+    try:
+        df = get_price_history(ticker, period="1mo", interval="1d")
+        if df is None or df.empty:
+            return None
+
+        df = df.reset_index()
+
+        # Detectar columna de fecha (índice resateado, 'date', 'Date', 'timestamp', etc.)
+        date_col = None
+        for cand in ("date", "Date", "timestamp", "Timestamp", "index"):
+            if cand in df.columns:
+                date_col = cand
+                break
+        if date_col is None:
+            # Última opción: primera columna si parece fecha/datetime
+            first_col = df.columns[0]
+            if pd_api_is_datetimeish(df[first_col]):
+                date_col = first_col
+        if date_col is None:
+            logger.warning(f"_get_price_at_date_fallback({ticker}): no se identificó columna de fecha")
+            return None
+
+        # Normalizar a date (sin hora)
+        df["_date_norm"] = pd_to_date(df[date_col])
+
+        # Detectar columna de cierre
+        close_col = None
+        for cand in ("close", "Close", "Adj Close", "adj_close", "AdjClose"):
+            if cand in df.columns:
+                close_col = cand
+                break
+        if close_col is None:
+            logger.warning(f"_get_price_at_date_fallback({ticker}): no se identificó columna de cierre")
+            return None
+
+        row = df[df["_date_norm"] <= target_date]
+        if row.empty:
+            return None
+
+        price = row.iloc[-1][close_col]
+        if price is None:
+            return None
+        return float(price)
+    except Exception as e:
+        logger.warning(f"_get_price_at_date_fallback({ticker}, {target_date}): {e}")
+        return None
+
+
+def pd_api_is_datetimeish(series) -> bool:
+    """Heurística simple: ¿la serie parece de tipo fecha/datetime?"""
+    try:
+        import pandas as pd
+        return pd.api.types.is_datetime64_any_dtype(series)
+    except Exception:
+        return False
+
+
+def pd_to_date(series):
+    """Convierte una serie (datetime, str, o índice) a objetos date puros."""
+    import pandas as pd
+    return pd.to_datetime(series).dt.date
+
+
+def _get_price_at_date(ticker: str, target_date) -> Optional[float]:
+    """
+    Obtiene precio de cierre en una fecha específica.
+    Orden: Alpaca primero (rápido, ya autenticado) → fallback a
+    data_provider (Cache/Chile/EODHD/Yahoo/Twelve) si Alpaca falla
+    o no tiene permiso de datos (ej. SIP data restringido).
+    """
+    if ticker.upper() in ALPACA_UNSUPPORTED:
+        logger.info(f"⏭ _get_price_at_date skip {ticker} — no soportado en Alpaca")
+        return None
+
+    price = _get_price_at_date_alpaca(ticker, target_date)
+    if price is not None:
+        return price
+
+    logger.info(f"↪️ _get_price_at_date {ticker} — Alpaca sin precio, probando fallback data_provider")
+    price = _get_price_at_date_fallback(ticker, target_date)
+    if price is not None:
+        logger.info(f"✅ _get_price_at_date {ticker} resuelto vía fallback data_provider: ${price:.4f}")
+        return price
+
+    logger.warning(f"⚠️ _get_price_at_date {ticker} — sin precio en Alpaca ni en fallback")
+    return None
 
 
 # ══════════════════════════════════════════════════════
@@ -504,4 +612,3 @@ def get_tracker_summary() -> Dict[str, Any]:
         "win_rate":      round(win_rate,   4),
         "n_pnl_samples": len(pnl_list),
   }
-  
