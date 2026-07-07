@@ -157,11 +157,24 @@ def _calc_universe_bias_score(horizon: int) -> Optional[float]:
 # ══════════════════════════════════════════════════════
 
 def _evaluate_shadow_hit_rates(horizon: int) -> List[Dict]:
+    """
+    [AR2] Excluye champion_baseline.json — es un placeholder que
+    intraday_evaluator.py escribe con el hit_rate del CAMPEÓN, no de
+    un shadow real. Antes de que predictor_shadow_evaluator.py existiera,
+    este archivo era el único dato en shadow/evals/, y como su
+    genome_id ("H{h}_champion_baseline") nunca coincide con ningún
+    shadow real al buscar el match para promoción, no rompía nada
+    directamente — pero si su hit_rate superaba al del campeón por
+    ruido, sí podía inflar best_shadow_hit sin que hubiera ningún
+    shadow real detrás. Ahora se filtra explícitamente.
+    """
     shadow_eval_dir = GENOME_BASE / f"H{horizon}" / "shadow" / "evals"
     if not shadow_eval_dir.exists():
         return []
     results = []
     for path in shadow_eval_dir.glob("*.json"):
+        if path.stem == "champion_baseline":
+            continue
         try:
             data = json.loads(path.read_text())
             results.append(data)
