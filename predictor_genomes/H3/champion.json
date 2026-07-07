@@ -1,0 +1,36 @@
+{
+  "genome_id": "H3_v1",
+  "horizon": 3,
+  "generation": 1,
+  "parent_ids": [],
+  "fitness": null,
+  "hit_rate": 0.5277,
+  "bias_score": 0.4497,
+  "n_evaluations": 3640,
+  "created_at": "2026-07-07T16:52:27.545813+00:00",
+  "features": [
+    "range",
+    "rv_15",
+    "mom_ratio",
+    "dist_ma20",
+    "vol_z",
+    "mom_5d",
+    "mom_10d",
+    "rsi_7",
+    "rsi_14",
+    "ret_lag_1",
+    "ret_lag_2",
+    "ret_lag_3",
+    "ret_lag_5",
+    "ret_lag_8",
+    "trend_20"
+  ],
+  "model_params": {
+    "alpha_ridge": 0.6,
+    "max_pca": 10,
+    "clip_ret": 0.07,
+    "period": "1y",
+    "sample_weight_decay": 0.0
+  },
+  "bias_score_updated_at": "2026-07-07T18:17:10.233004+00:00"
+}
