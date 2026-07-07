@@ -23,6 +23,19 @@ FIXES:
         bias_score = fracción de predicciones positivas que fallaron.
         GOOGL: 15/16 = 0.94 → bias alcista severo en caída.
         Darwin usa este score para decidir si mutar sample_weight_decay.
+
+  [FG1] FEATURE_POOL y BASE_FEATURES_BY_HORIZON reescritos para reflejar
+        las columnas REALES que cada predictor_hX.py calcula en su
+        make_features_hX(). Antes, el genoma ofrecía nombres genéricos
+        (rsi_z_14_60, ema_slope_20_5, slope_25, etc.) que NO existían
+        en la mayoría de los predictores — Darwin evolucionaba genes
+        que se descartaban en silencio por el filtro
+        `[f for f in _feature_override if f in feat.columns]`,
+        evaluando fitness sobre features distintas a las que creía
+        estar probando. BASE_FEATURES_BY_HORIZON ahora es 1:1 idéntico
+        a los `_base_features` hardcodeados en cada predictor (mismo
+        comportamiento default, cero riesgo), y FEATURE_POOL incluye
+        el pool real ampliado disponible para mutación futura.
 """
 
 import json
@@ -40,7 +53,11 @@ REPO_PATH   = Path(os.getenv("REPO_PATH", "/opt/render/project/src"))
 GENOME_BASE = REPO_PATH / "predictor_genomes"
 
 # ══════════════════════════════════════════════════════
-# FEATURE POOLS — todos los genes posibles
+# FEATURE POOLS — todos los genes posibles [FG1]
+# Nombres y metadata alineados a las columnas REALES que
+# produce cada make_features_hX(). Metadata es descriptiva
+# (documentación de qué representa cada gen), no se usa para
+# calcular features — cada predictor calcula las suyas.
 # ══════════════════════════════════════════════════════
 
 FEATURE_POOL = {
@@ -49,54 +66,105 @@ FEATURE_POOL = {
     "ret_lag_2":   {"type": "lag", "lag": 2},
     "ret_lag_3":   {"type": "lag", "lag": 3},
     "ret_lag_5":   {"type": "lag", "lag": 5},
+    "ret_lag_8":   {"type": "lag", "lag": 8},
     "ret_lag_10":  {"type": "lag", "lag": 10},
     "ret_lag_20":  {"type": "lag", "lag": 20},
+    "ret_lag_30":  {"type": "lag", "lag": 30},
     # Volatilidad realizada
-    "rv_10":  {"type": "rv", "window": 10},
-    "rv_20":  {"type": "rv", "window": 20},
-    "rv_25":  {"type": "rv", "window": 25},
-    "rv_60":  {"type": "rv", "window": 60},
+    "rv_short": {"type": "rv", "window": 3},
+    "rv_10":    {"type": "rv", "window": 10},
+    "rv_15":    {"type": "rv", "window": 15},
+    "rv_20":    {"type": "rv", "window": 20},
+    "rv_25":    {"type": "rv", "window": 25},
+    "rv_30":    {"type": "rv", "window": 30},
+    "rv_60":    {"type": "rv", "window": 60},
+    "vol_ema":  {"type": "rv_ema", "span": 5},
+    "atr_14":   {"type": "atr", "window": 14},
     # Rango precio
     "range":  {"type": "range"},
     # Cambio de volumen
     "vol_chg": {"type": "vol_chg"},
-    # RSI Z-score
-    "rsi_z_14_60":  {"type": "rsi_z", "rsi_window": 14, "norm_window": 60},
-    "rsi_z_7_30":   {"type": "rsi_z", "rsi_window": 7,  "norm_window": 30},
-    "rsi_z_21_90":  {"type": "rsi_z", "rsi_window": 21, "norm_window": 90},
-    # EMA slope
-    "ema_slope_20_5":  {"type": "ema_slope", "span": 20, "shift": 5},
-    "ema_slope_50_10": {"type": "ema_slope", "span": 50, "shift": 10},
-    "ema_slope_10_3":  {"type": "ema_slope", "span": 10, "shift": 3},
+    "vol_z":   {"type": "vol_zscore", "window": 20},
+    "vol_price": {"type": "vol_price_interaction"},
+    "vol_ratio": {"type": "range_vs_atr"},
+    # RSI (variantes reales por horizonte — nombres tal cual los calcula cada predictor)
+    "rsi_fast": {"type": "rsi", "window": 3},
+    "rsi_9":    {"type": "rsi", "window": 9},
+    "rsi_7":    {"type": "rsi", "window": 7},
+    "rsi_14":   {"type": "rsi", "window": 14},
+    "rsi_z":    {"type": "rsi_z", "rsi_window": 14, "norm_window": 60},
+    # Momentum / trend
+    "mom_2d":     {"type": "mom_sum", "window": 2},
+    "mom_3d":     {"type": "mom_sum", "window": 3},
+    "mom_5d":     {"type": "mom_sum", "window": 5},
+    "mom_10d":    {"type": "mom_sum", "window": 10},
+    "mom_20d":    {"type": "mom_sum", "window": 20},
+    "mom_vol":    {"type": "mom_over_rv"},
+    "mom_ratio":  {"type": "mom_over_rv"},
+    "price_strength": {"type": "ret_over_rv"},
+    "trend_5":    {"type": "pct_change", "window": 5},
+    "trend_10":   {"type": "pct_change", "window": 10},
+    "trend_20":   {"type": "pct_change", "window": 20},
+    "trend_diff": {"type": "ema_diff", "fast": 5, "slow": 20},
+    "trend_strength": {"type": "adx_x_slope_sign"},
+    # Distancia a medias / bandas
+    "dist_ma10":  {"type": "dist_sma", "window": 10},
+    "dist_ma20":  {"type": "dist_sma", "window": 20},
+    "dist_sma50": {"type": "dist_sma", "window": 50},
+    "ema_20_dist": {"type": "dist_ema", "span": 20},
+    "dist_hi":    {"type": "dist_high", "window": 20},
+    "dist_lo":    {"type": "dist_low", "window": 20},
+    "bb_dist":    {"type": "bollinger_dist", "window": 20},
+    # EMA slope (nombres reales por horizonte)
+    "ema_slope":        {"type": "ema_slope", "span": 20, "shift": 5},
+    "ema_slope_10_3":   {"type": "ema_slope", "span": 10, "shift": 3},
+    "ema_slope_50_10":  {"type": "ema_slope", "span": 50, "shift": 10},
+    "ema50_slope":      {"type": "ema_slope", "span": 50, "shift": 5},
     # Trend slope
-    "slope_10":  {"type": "slope", "window": 10},
-    "slope_25":  {"type": "slope", "window": 25},
-    "slope_50":  {"type": "slope", "window": 50},
+    "slope_20": {"type": "slope", "window": 20},
+    "slope_25": {"type": "slope", "window": 25},
+    "slope_50": {"type": "slope", "window": 50},
     # Hurst
     "hurst_60":  {"type": "hurst", "window": 60},
     "hurst_120": {"type": "hurst", "window": 120},
+    # Osciladores / indicadores especializados por horizonte
+    "stoch_k":       {"type": "stochastic", "window": 14},
+    "adx_14":        {"type": "adx", "window": 14},
+    "mfi_14":        {"type": "money_flow_index", "window": 14},
+    "capital_flow":  {"type": "mfi_derived"},
+    "money_flow":    {"type": "volume_x_return"},
 }
 
+# BASE_FEATURES_BY_HORIZON [FG1]: idéntico a los `_base_features`
+# hardcodeados en cada predictor_hX.py — mismo comportamiento default,
+# ahora también correcto como override evolucionado (100% de las
+# columnas existen realmente en cada feat DataFrame).
 BASE_FEATURES_BY_HORIZON = {
-    1:  ["range", "rv_10", "rsi_z_7_30",  "ema_slope_10_3",  "slope_10",
-         "ret_lag_1", "ret_lag_2", "ret_lag_3"],
-    2:  ["range", "rv_10", "rsi_z_7_30",  "ema_slope_10_3",  "slope_10",
-         "ret_lag_1", "ret_lag_2", "ret_lag_3", "ret_lag_5"],
-    3:  ["range", "rv_20", "rsi_z_14_60", "ema_slope_20_5",  "slope_25",
-         "ret_lag_1", "ret_lag_2", "ret_lag_3", "ret_lag_5"],
-    4:  ["range", "rv_20", "rsi_z_14_60", "ema_slope_20_5",  "slope_25",
-         "ret_lag_1", "ret_lag_3", "ret_lag_5", "ret_lag_10"],
-    5:  ["range", "rv_20", "rsi_z_14_60", "ema_slope_20_5",  "slope_25",
-         "ret_lag_1", "ret_lag_3", "ret_lag_5", "ret_lag_10"],
-    6:  ["range", "rv_25", "rsi_z_14_60", "ema_slope_20_5",  "slope_25",
+    1:  ["range", "ret_lag_1", "ret_lag_2", "ret_lag_5",
+         "rv_short", "vol_ema", "mom_vol", "rsi_fast",
+         "price_strength", "trend_5"],
+    2:  ["range", "rv_10", "mom_ratio", "rsi_9", "dist_ma10",
+         "mom_2d", "mom_5d", "ret_lag_1", "ret_lag_2",
+         "ret_lag_3", "ret_lag_5", "ret_lag_10", "trend_10"],
+    3:  ["range", "rv_15", "mom_ratio", "dist_ma20", "vol_z",
+         "mom_5d", "mom_10d", "rsi_7", "rsi_14",
+         "ret_lag_1", "ret_lag_2", "ret_lag_3", "ret_lag_5",
+         "ret_lag_8", "trend_20"],
+    4:  ["range", "rv_20", "trend_diff", "vol_ratio", "rsi_14",
+         "stoch_k", "dist_hi", "dist_lo", "mom_5d", "mom_10d",
+         "mom_20d", "vol_price"],
+    5:  ["range", "rv_20", "rsi_14", "ema_20_dist", "slope_20",
+         "ret_lag_1", "ret_lag_2", "ret_lag_3", "ret_lag_5",
+         "ret_lag_10", "ret_lag_20"],
+    6:  ["range", "rv_25", "rsi_z", "ema_slope", "slope_25",
          "ret_lag_1", "ret_lag_3", "ret_lag_5", "ret_lag_10", "ret_lag_20"],
-    7:  ["range", "rv_25", "rsi_z_14_60", "ema_slope_20_5",  "slope_25",
-         "ret_lag_1", "ret_lag_3", "ret_lag_5", "ret_lag_10", "ret_lag_20"],
-    8:  ["range", "rv_25", "rsi_z_21_90", "ema_slope_50_10", "slope_50",
-         "vol_chg", "ret_lag_1", "ret_lag_3", "ret_lag_5", "ret_lag_10", "ret_lag_20"],
-    9:  ["range", "rv_60", "rsi_z_21_90", "ema_slope_50_10", "slope_50",
-         "vol_chg", "hurst_60",
-         "ret_lag_1", "ret_lag_3", "ret_lag_5", "ret_lag_10", "ret_lag_20"],
+    7:  ["range", "rv_30", "hurst_60", "dist_sma50", "money_flow",
+         "ret_lag_1", "ret_lag_3", "ret_lag_5", "ret_lag_10",
+         "ret_lag_20", "ret_lag_30"],
+    8:  ["range", "rv_30", "adx_14", "ema50_slope", "trend_strength",
+         "ret_lag_1", "ret_lag_5", "ret_lag_10", "ret_lag_20", "ret_lag_30"],
+    9:  ["range", "mfi_14", "bb_dist", "capital_flow",
+         "ret_lag_1", "ret_lag_5", "ret_lag_10", "ret_lag_20", "ret_lag_30"],
     10: ["range", "rv_20", "rv_60", "vol_chg", "hurst_60", "hurst_120",
          "ret_lag_1", "ret_lag_2", "ret_lag_3", "ret_lag_5",
          "ret_lag_10", "ret_lag_20"],
@@ -415,7 +483,6 @@ def initialize_all_genomes() -> Dict[str, str]:
             results[f"H{h}"] = "exists"
     return results
 
-
 # ══════════════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════════════
@@ -426,4 +493,3 @@ if __name__ == "__main__":
     for h, status in results.items():
         genome = PredictorGenome.load_champion(int(h[1:]))
         print(f"  {h}: {status} → {genome.describe()}")
-  
