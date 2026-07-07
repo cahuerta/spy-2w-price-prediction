@@ -1,4 +1,4 @@
-# scheduler.py — v2.0
+# scheduler.py — v2.1
 # =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
@@ -10,6 +10,7 @@
 #   - Alive log cada hora
 #   - Darwin Engine: resolver trades diario post-market (17:05 Chile)
 #   - Darwin Engine: ciclo evolutivo viernes post-market (18:00 Chile)
+#   - Darwin Engine: shadow evaluator nocturno diario (23:00 Chile)
 #
 # Horario mercado US en hora Chile (verano UTC-3):
 #   Apertura  09:30 ET = 10:30 Chile
@@ -20,13 +21,24 @@
 #   15:30 → CIERRE    — solo cierra posiciones divergentes
 #   12:00-15:00 → Monitor horario (cada hora) — vigila posiciones abiertas
 #   17:05 → Darwin resolve trades
-#   18:00 viernes → Darwin evolución
+#   18:00 viernes → Darwin evolución (executor + predictor arena)
+#   23:00 → Darwin shadow evaluator (genera y evalúa predicciones
+#           de shadow genomes H1-H10 — pipeline separado del trading
+#           real, corre después de todos los procesos del día)
 #
 # v2.0 — Monitor horario actualizado para intraday_tracker v3.0:
 #   - run_intraday_tracker() eliminado — usaba universo propio
 #   - Ahora usa evaluar_posiciones_abiertas(tickers) con lista real
 #   - Solo sugiere cierre cuando sugerencia="CERRAR"
 #   - TRAILING → no cierra, deja correr posiciones ganadoras
+#
+# v2.1 — Agregado trigger nocturno para predictor_shadow_evaluator:
+#   - Corre a las 23:00 Chile, todos los días hábiles
+#   - Genera predicciones de shadow genomes (swap temporal de
+#     champion.json, aislado del trading real) y evalúa las que
+#     ya maduraron contra precio real
+#   - Pieza que faltaba para que predictor_arena.py pueda promover
+#     shadows reales en vez de nunca encontrar candidatos
 # =========================================================
 
 import os
@@ -51,6 +63,10 @@ MIN_CIERRE     = int(os.getenv("PIPELINE_CIERRE_MIN",  "30"))
 
 MONITOR_HORA_INICIO = int(os.getenv("MONITOR_HORA_INICIO", "12"))
 MONITOR_HORA_FIN    = int(os.getenv("MONITOR_HORA_FIN",    "15"))
+
+# v2.1 — Shadow evaluator nocturno
+HORA_SHADOW_EVAL = int(os.getenv("SHADOW_EVAL_HOUR", "23"))
+MIN_SHADOW_EVAL  = int(os.getenv("SHADOW_EVAL_MIN",  "0"))
 
 
 # ══════════════════════════════════════════════════════
@@ -198,6 +214,32 @@ def _trigger_darwin_evolution(motivo: str):
         print(f"❌ Predictor arena error: {e}")
 
 
+def _trigger_shadow_evaluator(motivo: str):
+    """
+    v2.1 — Genera predicciones de shadow genomes H1-H10 (swap temporal
+    de champion.json, aislado del trading real) y evalúa las que ya
+    maduraron contra precio real. Corre de noche, separado de todos
+    los demás procesos del día, para no interferir con predicciones
+    o trades reales.
+    """
+    print(f"🌙 Darwin shadow evaluator [{motivo}]")
+    try:
+        from darwin_engine.predictor_shadow_evaluator import run_shadow_evolution_cycle
+        result = run_shadow_evolution_cycle()
+        gen = result.get("generation", {})
+        ev  = result.get("evaluation", {})
+        print(
+            f"✅ Shadow evaluator | "
+            f"generadas={gen.get('predictions_generated', 0)} | "
+            f"evaluadas={ev.get('evaluated', 0)} | "
+            f"pendientes={ev.get('pending', 0)}"
+        )
+        if gen.get("status") == "locked":
+            print("⚠️  Shadow evaluator: lock activo, se saltó esta corrida")
+    except Exception as e:
+        print(f"❌ Shadow evaluator error: {e}")
+
+
 # ══════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════
@@ -219,7 +261,8 @@ def _loop():
         f"🕐 Quant Scheduler iniciado\n"
         f"   🟢 APERTURA: {HORA_APERTURA:02d}:{MIN_APERTURA:02d} Chile\n"
         f"   🔴 CIERRE:   {HORA_CIERRE:02d}:{MIN_CIERRE:02d} Chile\n"
-        f"   📡 MONITOR:  {MONITOR_HORA_INICIO:02d}:00-{MONITOR_HORA_FIN:02d}:00 Chile (cada hora)"
+        f"   📡 MONITOR:  {MONITOR_HORA_INICIO:02d}:00-{MONITOR_HORA_FIN:02d}:00 Chile (cada hora)\n"
+        f"   🌙 SHADOW EVAL: {HORA_SHADOW_EVAL:02d}:{MIN_SHADOW_EVAL:02d} Chile"
     )
 
     apertura_hoy:         str | None = None
@@ -228,6 +271,7 @@ def _loop():
     ultimo_log_h:         int | None = None
     darwin_resolve_hoy:   str | None = None
     darwin_evolution_hoy: str | None = None
+    shadow_eval_hoy:      str | None = None
 
     while True:
         ahora     = datetime.now(CHILE_TZ)
@@ -293,6 +337,19 @@ def _loop():
         ):
             _trigger_darwin_evolution("viernes_18:00")
             darwin_evolution_hoy = fecha_hoy
+
+        # ── 🌙 Darwin: shadow evaluator nocturno (v2.1) ────
+        # Todos los días hábiles, después de todos los demás
+        # procesos del día. Ventana de 10 min (vs 5 de los otros)
+        # porque este proceso puede tardar más en completar.
+        if (
+            _es_dia_habil(ahora)
+            and ahora.hour       == HORA_SHADOW_EVAL
+            and MIN_SHADOW_EVAL  <= ahora.minute < MIN_SHADOW_EVAL + 10
+            and shadow_eval_hoy  != fecha_hoy
+        ):
+            _trigger_shadow_evaluator(f"nocturno_{HORA_SHADOW_EVAL:02d}:{MIN_SHADOW_EVAL:02d}")
+            shadow_eval_hoy = fecha_hoy
 
         # ── 💓 Alive log cada hora ─────────────────────────
         if ahora.minute < 5 and ultimo_log_h != ahora.hour:
