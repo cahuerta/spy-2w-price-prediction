@@ -1,0 +1,32 @@
+{
+  "genome_id": "H5_v1",
+  "horizon": 5,
+  "generation": 1,
+  "parent_ids": [],
+  "fitness": null,
+  "hit_rate": 0.5332,
+  "bias_score": 0.4497,
+  "n_evaluations": 3700,
+  "created_at": "2026-07-07T16:52:27.546473+00:00",
+  "features": [
+    "range",
+    "rv_20",
+    "rsi_14",
+    "ema_20_dist",
+    "slope_20",
+    "ret_lag_1",
+    "ret_lag_2",
+    "ret_lag_3",
+    "ret_lag_5",
+    "ret_lag_10",
+    "ret_lag_20"
+  ],
+  "model_params": {
+    "alpha_ridge": 0.7,
+    "max_pca": 12,
+    "clip_ret": 0.09,
+    "period": "2y",
+    "sample_weight_decay": 0.0
+  },
+  "bias_score_updated_at": "2026-07-07T18:17:14.028512+00:00"
+}
