@@ -1,0 +1,30 @@
+{
+  "genome_id": "H9_v1",
+  "horizon": 9,
+  "generation": 1,
+  "parent_ids": [],
+  "fitness": null,
+  "hit_rate": 0.5573,
+  "bias_score": 0.4497,
+  "n_evaluations": 3736,
+  "created_at": "2026-07-07T16:52:27.547636+00:00",
+  "features": [
+    "range",
+    "mfi_14",
+    "bb_dist",
+    "capital_flow",
+    "ret_lag_1",
+    "ret_lag_5",
+    "ret_lag_10",
+    "ret_lag_20",
+    "ret_lag_30"
+  ],
+  "model_params": {
+    "alpha_ridge": 1.0,
+    "max_pca": 16,
+    "clip_ret": 0.13,
+    "period": "max",
+    "sample_weight_decay": 0.0
+  },
+  "bias_score_updated_at": "2026-07-07T18:17:21.346444+00:00"
+}
