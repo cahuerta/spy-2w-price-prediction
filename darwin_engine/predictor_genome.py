@@ -170,6 +170,19 @@ BASE_FEATURES_BY_HORIZON = {
          "ret_lag_10", "ret_lag_20"],
 }
 
+# ══════════════════════════════════════════════════════
+# [FG2] POOL DE FEATURES DISPONIBLES POR HORIZONTE
+# Igual a BASE_FEATURES_BY_HORIZON — es el conjunto real y completo
+# de columnas que cada make_features_hX() calcula actualmente.
+# El mutator usa esto (no FEATURE_POOL global) para que las
+# mutaciones nunca seleccionen una feature que el predictor de
+# ese horizonte específico no sabe calcular.
+# Si algún día un predictor_hX.py agrega columnas nuevas, ampliar
+# la lista de ese horizonte aquí para habilitarlas a mutación.
+# ══════════════════════════════════════════════════════
+FEATURE_POOL_BY_HORIZON = {
+    h: list(feats) for h, feats in BASE_FEATURES_BY_HORIZON.items()
+}
 # [SW1] sample_weight_decay agregado a H1-H9
 # H10 excluido — ya tiene walk-forward propio
 BASE_MODEL_PARAMS = {
