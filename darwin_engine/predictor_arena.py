@@ -17,6 +17,15 @@ FIXES:
         los tickers del universo y lo escribe al genome campeón.
         Darwin (generate_children) usa ese score para decidir
         si mutar sample_weight_decay.
+
+  [AR1] _run_h_cycle: se captura previous_hit_rate ANTES de
+        sobreescribir champion.hit_rate con el valor nuevo. Antes,
+        la comparación `hit_rate > champion.hit_rate` en la rama
+        "sin promoción" siempre era hit_rate > hit_rate (False),
+        porque champion.hit_rate ya había sido pisado más arriba.
+        Esto significaba que el respaldo a GitHub nunca se disparaba
+        cuando el campeón mejoraba orgánicamente sin que un shadow
+        lo superara. Ahora se compara contra el hit_rate real anterior.
 """
 
 import json
@@ -230,6 +239,10 @@ def _run_h_cycle(
     champion = PredictorGenome.load_champion(horizon)
     shadow   = PredictorGenome.load_shadow_genomes(horizon)
 
+    # [AR1] Guardar hit_rate anterior ANTES de sobreescribir, para
+    # poder comparar si hubo mejora real y decidir si respaldar a GitHub
+    previous_hit_rate = champion.hit_rate
+
     # Actualizar hit rate del campeón
     champion.hit_rate = hit_rate
     champion.data["n_evaluations"] = n_evals
@@ -298,7 +311,10 @@ def _run_h_cycle(
     else:
         if not dry_run:
             champion.save_as_champion()
-            if was_promoted or hit_rate > (champion.hit_rate or 0):
+            # [AR1] Comparar contra el hit_rate REAL anterior, no contra
+            # champion.hit_rate (que ya fue sobreescrito arriba con el
+            # valor nuevo y siempre daría False en la comparación vieja)
+            if hit_rate > (previous_hit_rate or 0):
                 github_written = _write_genome_to_github(champion)
 
     # Generar nueva generación shadow
@@ -440,4 +456,3 @@ if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
     result  = run_predictor_evolution(dry_run=dry_run)
     print(json.dumps(result, indent=2, default=str))
-                            
