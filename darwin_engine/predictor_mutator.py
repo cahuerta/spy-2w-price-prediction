@@ -16,6 +16,14 @@ Sesgo inteligente:
   - hit_rate > 52%              → exploración conservadora
   - bias_score >= 0.70 [SW2]   → muta decay prioritariamente
     (predictor alcista en mercado bajista → dar más peso a datos recientes)
+
+FIXES:
+  [FG2] _all_features() ahora recibe horizon y usa FEATURE_POOL_BY_HORIZON
+        en vez del pool global FEATURE_POOL. Antes, mutate_features() y
+        crossover() podían seleccionar features de CUALQUIER horizonte
+        (ej. asignarle "mfi_14" —de H9— a H1), que el predictor real
+        descartaba en silencio por no existir en sus columnas. Ahora
+        cada horizonte solo muta dentro de su propio pool real.
 """
 
 import logging
@@ -30,6 +38,7 @@ from darwin_engine.predictor_genome import (
     PredictorGenome,
     FEATURE_POOL,
     BASE_FEATURES_BY_HORIZON,
+    FEATURE_POOL_BY_HORIZON,
     DECAY_LIMITS,
     BIAS_SCORE_THRESHOLD,
 )
@@ -68,8 +77,11 @@ def _clamp(val, lo, hi):
     return max(lo, min(hi, val))
 
 
-def _all_features() -> List[str]:
-    return list(FEATURE_POOL.keys())
+def _all_features(horizon: int) -> List[str]:
+    """[FG2] Pool de features real y específico del horizonte —
+    evita que Darwin asigne a un H features que su predictor
+    correspondiente no calcula."""
+    return list(FEATURE_POOL_BY_HORIZON.get(horizon, BASE_FEATURES_BY_HORIZON.get(horizon, [])))
 
 
 def _base_genome_data(genome: PredictorGenome, mutation_label: str) -> Dict:
@@ -102,7 +114,7 @@ def mutate_features(genome: PredictorGenome, strength: str = "normal") -> Predic
     """
     new_data      = deepcopy(genome.to_dict())
     current_feats = list(new_data["features"])
-    all_feats     = _all_features()
+    all_feats     = _all_features(genome.horizon)
     available     = [f for f in all_feats if f not in current_feats]
 
     n_changes = {
@@ -311,7 +323,7 @@ def crossover(
     if len(child_features) > MAX_FEATURES:
         child_features = random.sample(child_features, MAX_FEATURES)
     elif len(child_features) < MIN_FEATURES:
-        available = [f for f in _all_features() if f not in child_features]
+        available = [f for f in _all_features(parent_a.horizon) if f not in child_features]
         child_features += random.sample(available, MIN_FEATURES - len(child_features))
 
     hit_a  = parent_a.hit_rate or 0.5
@@ -431,4 +443,3 @@ def generate_children(
             children.append(mutate_features(champion, strength="aggressive"))
 
     return children[:n_children]
-      
