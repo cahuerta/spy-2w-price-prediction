@@ -1,0 +1,31 @@
+{
+  "genome_id": "H6_v1",
+  "horizon": 6,
+  "generation": 1,
+  "parent_ids": [],
+  "fitness": null,
+  "hit_rate": 0.561,
+  "bias_score": 0.4497,
+  "n_evaluations": 3711,
+  "created_at": "2026-07-07T16:52:27.546794+00:00",
+  "features": [
+    "range",
+    "rv_25",
+    "rsi_z",
+    "ema_slope",
+    "slope_25",
+    "ret_lag_1",
+    "ret_lag_3",
+    "ret_lag_5",
+    "ret_lag_10",
+    "ret_lag_20"
+  ],
+  "model_params": {
+    "alpha_ridge": 0.8,
+    "max_pca": 12,
+    "clip_ret": 0.1,
+    "period": "2y",
+    "sample_weight_decay": 0.0
+  },
+  "bias_score_updated_at": "2026-07-07T18:17:15.817477+00:00"
+}
