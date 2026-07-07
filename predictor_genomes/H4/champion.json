@@ -1,0 +1,33 @@
+{
+  "genome_id": "H4_v1",
+  "horizon": 4,
+  "generation": 1,
+  "parent_ids": [],
+  "fitness": null,
+  "hit_rate": 0.5587,
+  "bias_score": 0.4497,
+  "n_evaluations": 3673,
+  "created_at": "2026-07-07T16:52:27.546155+00:00",
+  "features": [
+    "range",
+    "rv_20",
+    "trend_diff",
+    "vol_ratio",
+    "rsi_14",
+    "stoch_k",
+    "dist_hi",
+    "dist_lo",
+    "mom_5d",
+    "mom_10d",
+    "mom_20d",
+    "vol_price"
+  ],
+  "model_params": {
+    "alpha_ridge": 0.7,
+    "max_pca": 10,
+    "clip_ret": 0.08,
+    "period": "2y",
+    "sample_weight_decay": 0.0
+  },
+  "bias_score_updated_at": "2026-07-07T18:17:12.069656+00:00"
+}
