@@ -1,0 +1,31 @@
+{
+  "genome_id": "H1_v1",
+  "horizon": 1,
+  "generation": 1,
+  "parent_ids": [],
+  "fitness": null,
+  "hit_rate": 0.5095,
+  "bias_score": 0.4497,
+  "n_evaluations": 3476,
+  "created_at": "2026-07-07T16:52:27.543766+00:00",
+  "features": [
+    "range",
+    "ret_lag_1",
+    "ret_lag_2",
+    "ret_lag_5",
+    "rv_short",
+    "vol_ema",
+    "mom_vol",
+    "rsi_fast",
+    "price_strength",
+    "trend_5"
+  ],
+  "model_params": {
+    "alpha_ridge": 0.5,
+    "max_pca": 8,
+    "clip_ret": 0.05,
+    "period": "1y",
+    "sample_weight_decay": 0.0
+  },
+  "bias_score_updated_at": "2026-07-07T18:17:06.170789+00:00"
+}
