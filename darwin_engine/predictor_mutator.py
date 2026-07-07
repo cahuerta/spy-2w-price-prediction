@@ -24,6 +24,15 @@ FIXES:
         (ej. asignarle "mfi_14" —de H9— a H1), que el predictor real
         descartaba en silencio por no existir en sus columnas. Ahora
         cada horizonte solo muta dentro de su propio pool real.
+
+  [MC1] generate_children(): los 4 hijos se creaban todos a partir del
+        mismo champion, y _next_genome_id() calcula el ID únicamente
+        desde el genome_id del padre — así que los 4 hijos recibían el
+        MISMO genome_id (ej. "H9_v2"). Cada child.save_as_shadow()
+        sobrescribía al anterior, y solo 1 de los 4 hijos sobrevivía
+        en disco por ciclo. Ahora, justo antes de retornar, se
+        reasignan IDs únicos por posición (ej. "H9_v2_1".."H9_v2_4")
+        para que los 4 se guarden sin colisión.
 """
 
 import logging
@@ -381,6 +390,11 @@ def generate_children(
       4. hit_rate > 52% → exploración conservadora + crossover
 
     Para H10: mutate_decay nunca se llama (usa walk-forward propio).
+
+    [MC1] Antes de retornar, se reasignan genome_id únicos por posición.
+    Los 4 hijos parten todos del mismo champion, así que _next_genome_id()
+    calculaba el mismo ID para los 4 (ej. "H9_v2") — cada save_as_shadow()
+    sobrescribía al anterior y solo 1 de 4 sobrevivía en disco.
     """
     hit      = champion.hit_rate or 0.50
     bias     = champion.bias_score
@@ -403,7 +417,11 @@ def generate_children(
         # Hijo 4: mutar features agresivamente (por si el problema es de señal)
         children.append(mutate_features(champion, strength="aggressive"))
 
-        return children[:n_children]
+        # [MC1] IDs únicos por posición — evita colisión al guardar
+        children = children[:n_children]
+        for i, child in enumerate(children):
+            child.data["genome_id"] = f"H{champion.horizon}_v{champion.generation + 1}_{i + 1}"
+        return children
 
     # ── ESTRATEGIA NORMAL BASADA EN HIT RATE ─────────────────────
     if hit < 0.48:
@@ -442,4 +460,8 @@ def generate_children(
         else:
             children.append(mutate_features(champion, strength="aggressive"))
 
-    return children[:n_children]
+    # [MC1] IDs únicos por posición — evita colisión al guardar
+    children = children[:n_children]
+    for i, child in enumerate(children):
+        child.data["genome_id"] = f"H{champion.horizon}_v{champion.generation + 1}_{i + 1}"
+    return children
