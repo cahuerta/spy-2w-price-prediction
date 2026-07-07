@@ -50,7 +50,7 @@ logger = logging.getLogger("predictor_genome")
 
 DATA_PATH   = Path(os.getenv("DATA_PATH", "/data"))
 REPO_PATH   = Path(os.getenv("REPO_PATH", "/opt/render/project/src"))
-GENOME_BASE = REPO_PATH / "predictor_genomes"
+GENOME_BASE = DATA_PATH / "predictor_genomes"
 
 # ══════════════════════════════════════════════════════
 # FEATURE POOLS — todos los genes posibles [FG1]
