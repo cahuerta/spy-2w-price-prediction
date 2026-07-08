@@ -1,3 +1,11 @@
+"""
+predictor_h10.py — H10 con Darwin genome integrado
+Preserva íntegramente el kNN caótico y la lógica ensemble original.
+El genome evoluciona: alpha_ridge, pca_target, clip_ret, theta.
+Las features de Hurst + 20 lags se mantienen como base inamovible
+(son la identidad matemática de H10).
+"""
+
 import os
 import json
 import sys
@@ -312,8 +320,7 @@ def format_report(result: dict) -> str:
         f"RECOMENDACIÓN FINAL : {p['recommendation']}",
         f"Darwin genome       : {'ON' if p.get('genome_active') else 'OFF'}",
     ])
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 if __name__ == "__main__":
     ticker = sys.argv[1].upper() if len(sys.argv) > 1 else "SPY"
@@ -322,5 +329,4 @@ if __name__ == "__main__":
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
     print(format_report(result))
-    print(f"
-💾 Guardado: {output_path}")
+    print(f"\n💾 Guardado: {output_path}")
