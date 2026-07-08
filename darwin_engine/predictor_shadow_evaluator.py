@@ -45,12 +45,26 @@ DISEÑO:
         de evaluator.py — no se duplica lógica de precios ni de umbral
         de señal.
 
+FIX v1.1:
+  [SE6] El import `from master_orchestrator import extract_price_prediction,
+        extract_return_pct` fallaba en producción — ModuleNotFoundError,
+        confirmado en logs de la primera corrida nocturna real
+        ("❌ Shadow evaluator error: No module named 'master_orchestrator'").
+        Ese módulo no expone esas funciones (o no es importable así).
+        Reemplazado por _extract_price_pred()/_extract_return_pct()
+        locales, que leen directo del dict que devuelve cada
+        run_predictor_hX() — soportan ambos formatos: H1-H9 (campos
+        planos "price_pred"/"return_pct") y H10 (anidados bajo
+        "prediction": "price_pred"/"ret_ens_pct"). Cero dependencia
+        externa nueva.
+
 NOTA PENDIENTE (no resuelto en este archivo):
   predictor_arena.py._evaluate_shadow_hit_rates() lee TODOS los .json
   en shadow/evals/, incluyendo champion_baseline.json (escrito por
   intraday_evaluator.py como placeholder temporal). Ese archivo no
   corresponde a un shadow real y debería excluirse de la comparación
-  de "mejor shadow". Requiere un ajuste separado en predictor_arena.py.
+  de "mejor shadow". Ya resuelto en predictor_arena.py [AR2] en sesión
+  previa — mencionado aquí solo como referencia histórica.
 """
 
 import os
@@ -70,7 +84,6 @@ if ROOT_DIR not in sys.path:
 
 from darwin_engine.predictor_genome import PredictorGenome, GENOME_BASE, DATA_PATH
 from evaluator import get_price_at_date, nth_business_day, _calc_hit_sign
-from master_orchestrator import extract_price_prediction, extract_return_pct
 
 logger = logging.getLogger("predictor_shadow_evaluator")
 
@@ -105,6 +118,31 @@ def _save_json(path: Path, data: Dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     tmp.replace(path)
+
+
+# ══════════════════════════════════════════════════════
+# [SE6] EXTRACCIÓN DE CAMPOS DE PREDICCIÓN
+# Soporta ambos formatos que producen los predictores reales:
+#   H1-H9: campos planos {"price_pred": ..., "return_pct": ...}
+#   H10:   anidados bajo {"prediction": {"price_pred": ..., "ret_ens_pct": ...}}
+# ══════════════════════════════════════════════════════
+
+def _extract_price_pred(data: Dict) -> Optional[float]:
+    if data.get("price_pred") is not None:
+        return float(data["price_pred"])
+    pred = data.get("prediction")
+    if isinstance(pred, dict) and pred.get("price_pred") is not None:
+        return float(pred["price_pred"])
+    return None
+
+
+def _extract_return_pct(data: Dict) -> float:
+    if data.get("return_pct") is not None:
+        return float(data["return_pct"])
+    pred = data.get("prediction")
+    if isinstance(pred, dict) and pred.get("ret_ens_pct") is not None:
+        return float(pred["ret_ens_pct"])
+    return 0.0
 
 
 # ══════════════════════════════════════════════════════
@@ -362,8 +400,8 @@ def evaluate_matured_shadow_predictions() -> Dict:
                         or data.get("price_today")
                         or (data.get("prediction") or {}).get("price_now")
                     )
-                    price_pred       = extract_price_prediction(data)
-                    predicted_return = extract_return_pct(data)
+                    price_pred       = _extract_price_pred(data)
+                    predicted_return = _extract_return_pct(data)
 
                     if price_now is None or price_pred is None:
                         pred_file.unlink(missing_ok=True)
