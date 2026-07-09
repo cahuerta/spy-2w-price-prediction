@@ -1,8 +1,10 @@
 # =========================================================
-# analysis_router.py — ORDER ANALYSIS ENDPOINT
+# analysis_router.py — ORDER ANALYSIS + REAL PERFORMANCE
 # =========================================================
-# GET  /dashboard/order-analysis        → lee reporte cacheado
-# POST /dashboard/order-analysis/run    → corre análisis y guarda
+# GET  /dashboard/order-analysis          → lee reporte cacheado
+# POST /dashboard/order-analysis/run      → corre análisis y guarda
+# GET  /dashboard/real-performance        → lee reporte cacheado
+# POST /dashboard/real-performance/run    → corre backtest real+teórico
 #
 # FIX v1.1:
 #   [A1] _fetch_orders(): is_system comparaba client_order_id contra
@@ -13,6 +15,13 @@
 #        "Insuficientes datos para comparar", aunque el sistema
 #        llevara semanas operando con normalidad.
 #        Corregido para leer el prefijo real "sys_".
+#
+# v1.2:
+#   [A2] Agregados endpoints /real-performance — exponen los cálculos
+#        de backtest_evaluations.py (teórico) y backtest_real_trades.py
+#        (real, cuenta Alpaca) que antes solo se corrían manualmente
+#        desde el Shell. Mismo patrón GET-cacheado / POST-background
+#        que /order-analysis, sin duplicar lógica de cálculo.
 # =========================================================
 
 import os
@@ -36,6 +45,11 @@ except ImportError:
 
 from broker import get_engine
 
+# [A2] Reutiliza los cálculos ya construidos y validados hoy —
+# sin duplicar lógica de Sharpe/drawdown/CAGR/Newey-West aquí.
+from backtest_evaluations import run_backtest_from_evaluations
+from backtest_real_trades import run_backtest_from_real_trades
+
 logger = logging.getLogger("order_analysis")
 router = APIRouter(prefix="/dashboard", tags=["analysis"])
 
@@ -43,7 +57,11 @@ DATA_PATH   = Path(os.getenv("DATA_PATH", "/data"))
 EVAL_ROOT   = DATA_PATH / "evaluations"
 REPORT_FILE = DATA_PATH / "order_analysis_report.json"
 
-_running = False  # lock simple para evitar doble ejecución
+# [A2] Archivo y lock separados para el análisis de performance real
+REAL_PERF_FILE = DATA_PATH / "real_performance_report.json"
+
+_running = False           # lock para /order-analysis
+_real_perf_running = False # lock para /real-performance
 
 
 # =========================================================
@@ -208,7 +226,7 @@ def _group_metrics(tickers: List[str], evals: Dict[str, List[Dict]], label: str)
 
 
 # =========================================================
-# ANÁLISIS COMPLETO
+# ANÁLISIS COMPLETO — SISTEMA VS MANUAL
 # =========================================================
 
 def _run_analysis() -> Dict:
@@ -262,7 +280,39 @@ def _run_analysis() -> Dict:
 
 
 # =========================================================
-# ENDPOINTS
+# [A2] ANÁLISIS COMPLETO — PERFORMANCE REAL (Sharpe/Drawdown)
+# =========================================================
+
+def _run_real_performance() -> Dict:
+    """
+    Corre los dos backtests ya construidos hoy:
+      - backtest_evaluations.py: teórico ("si le creyéramos al modelo")
+      - backtest_real_trades.py: real (cuenta Alpaca, filtrado por
+        PM/Governor/Kill Switch, con los 3 trades de exit_price=1.0
+        ya corregidos con precio real de mercado)
+    """
+    global _real_perf_running
+    _real_perf_running = True
+    try:
+        theoretical = run_backtest_from_evaluations()
+        real        = run_backtest_from_real_trades()
+
+        report = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "theoretical":  theoretical,
+            "real":         real,
+        }
+
+        _save_json(REAL_PERF_FILE, report)
+        logger.info("✅ Real performance report generado")
+        return report
+
+    finally:
+        _real_perf_running = False
+
+
+# =========================================================
+# ENDPOINTS — SISTEMA VS MANUAL
 # =========================================================
 
 @router.get("/order-analysis")
@@ -284,3 +334,28 @@ async def run_order_analysis(background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_analysis)
     return {"status": "started", "message": "Análisis iniciado. Consulta GET /order-analysis en ~10s"}
+
+
+# =========================================================
+# [A2] ENDPOINTS — REAL PERFORMANCE (Sharpe/Drawdown)
+# =========================================================
+
+@router.get("/real-performance")
+async def get_real_performance():
+    """Lee el reporte cacheado. Si no existe, retorna status pending."""
+    if REAL_PERF_FILE.exists():
+        data = _load_json(REAL_PERF_FILE)
+        if data:
+            return {"status": "ready", **data}
+    return {"status": "pending", "message": "Análisis no ejecutado aún. Usa POST /run"}
+
+
+@router.post("/real-performance/run")
+async def run_real_performance(background_tasks: BackgroundTasks):
+    """Lanza el cálculo en background. Retorna inmediatamente."""
+    global _real_perf_running
+    if _real_perf_running:
+        return {"status": "running", "message": "Análisis ya en curso"}
+
+    background_tasks.add_task(_run_real_performance)
+    return {"status": "started", "message": "Análisis iniciado. Consulta GET /real-performance en ~15-30s"}
