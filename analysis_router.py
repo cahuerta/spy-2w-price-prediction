@@ -3,6 +3,16 @@
 # =========================================================
 # GET  /dashboard/order-analysis        → lee reporte cacheado
 # POST /dashboard/order-analysis/run    → corre análisis y guarda
+#
+# FIX v1.1:
+#   [A1] _fetch_orders(): is_system comparaba client_order_id contra
+#        "access_key" / prefijo "auto" — pero broker.py (v3.2, [B4])
+#        genera client_order_id con prefijo "sys_" ("sys_{ticker}_{ts}").
+#        Ningún order del sistema matcheaba nunca → system_tickers
+#        quedaba vacío → sys_hr=None → verdict siempre caía en
+#        "Insuficientes datos para comparar", aunque el sistema
+#        llevara semanas operando con normalidad.
+#        Corregido para leer el prefijo real "sys_".
 # =========================================================
 
 import os
@@ -77,7 +87,12 @@ def _fetch_orders() -> List[Dict]:
             continue
 
         client_id = getattr(o, "client_order_id", "") or ""
-        is_system = "access_key" in client_id.lower() or client_id.startswith("auto")
+        # [A1] broker.py asigna client_order_id con prefijo "sys_"
+        # (SYSTEM_ORDER_PREFIX en broker.py [B4]) para órdenes
+        # automáticas del sistema. Cualquier otra orden (sin ese
+        # prefijo, incluidas las puestas manualmente en Alpaca)
+        # se considera "manual".
+        is_system = client_id.lower().startswith("sys_")
 
         side_str = str(o.side).upper()
         is_buy   = "BUY" in side_str
