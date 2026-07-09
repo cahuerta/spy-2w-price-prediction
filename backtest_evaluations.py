@@ -15,6 +15,32 @@
 #      MANTÉN (el sistema no habría operado ahí).
 #   2. POR HORIZONTE (H1-H10) — usa models_diagnostics, dirección
 #      implícita = signo de pred_return.
+#
+# FIX v1.1:
+#   [BF1] _compute_result encadenaba CADA trade individual como si
+#         fuera secuencial sobre el 100% del capital. Con miles de
+#         evaluaciones (múltiples tickers el mismo día), esto
+#         multiplicaba en cadena decenas de "trades" del mismo día
+#         como si ocurrieran uno tras otro — resultado: ret_total
+#         de cientos de millones de % (matemáticamente sin sentido)
+#         y max_drawdown≈0.9999 (artefacto numérico, no una caída
+#         real de capital).
+#         Fix: agrupar por fecha ANTES de encadenar. Todos los
+#         trades del mismo día se promedian (portafolio
+#         equiponderado ese día), y la curva de equity se construye
+#         sobre esa serie diaria — no sobre trades sueltos.
+#         win_rate se mantiene por trade individual (tiene sentido
+#         a ese nivel); sharpe/drawdown/retorno total se calculan
+#         sobre la serie diaria agregada.
+#
+#   NOTA — limitación conocida y no resuelta aquí: los retornos de
+#   horizontes largos (ej. H9 = retorno a 9 días) están auto-
+#   correlacionados entre fechas consecutivas (ventanas que se
+#   solapan), así que el Sharpe anualizado con sqrt(252) puede
+#   seguir estando algo inflado incluso después del fix [BF1].
+#   Es un problema conocido al evaluar retornos multi-día con
+#   métricas pensadas para retornos diarios independientes —
+#   pendiente para el backtest walk-forward completo más adelante.
 # =========================================================
 
 import os
@@ -81,35 +107,59 @@ def _win_rate(returns: List[float]) -> Optional[float]:
 
 @dataclass
 class BacktestResult:
-    label:          str
-    n_trades:       int
-    n_evaluations:  int          # incluye señales débiles descartadas
-    sharpe:         Optional[float]
-    max_drawdown:   Optional[float]
-    win_rate:       Optional[float]
+    label:            str
+    n_trades:         int          # trades individuales reales
+    n_days:           int          # [BF1] puntos en la serie diaria agregada
+    n_evaluations:    int          # incluye señales débiles descartadas
+    sharpe:           Optional[float]
+    max_drawdown:     Optional[float]
+    win_rate:         Optional[float]
     total_return_pct: Optional[float]
     avg_return_pct:   Optional[float]
 
 
 def _compute_result(label: str, dated_returns: List[tuple], n_evaluations: int) -> BacktestResult:
-    """dated_returns: lista de (fecha_str, retorno_pct), se ordena cronológicamente."""
-    dated_returns.sort(key=lambda x: x[0])
-    returns = [r for _, r in dated_returns]
+    """
+    [BF1] dated_returns: lista de (fecha_str, retorno_pct).
+
+    FIX: agrupa por fecha ANTES de encadenar — trata todos los
+    trades del mismo día como un portafolio equiponderado, no
+    como eventos secuenciales sobre el 100% del capital.
+    Sin esto, cientos de trades el mismo día se multiplican en
+    cadena y el "retorno total" explota sin sentido.
+    """
+    by_date = defaultdict(list)
+    for date_str, ret in dated_returns:
+        if not date_str:
+            continue
+        by_date[date_str].append(ret)
+
+    # Una fecha = un punto de la serie = promedio de todos los
+    # trades de ese día (portafolio equiponderado ese día)
+    daily_series = sorted(
+        (date_str, float(np.mean(rets))) for date_str, rets in by_date.items()
+    )
+    daily_returns = [r for _, r in daily_series]
 
     total_return = None
-    if returns:
-        equity = np.cumprod(1 + np.array(returns) / 100)
+    if daily_returns:
+        equity = np.cumprod(1 + np.array(daily_returns) / 100)
         total_return = float((equity[-1] - 1) * 100)
+
+    # win_rate por trade individual (sí tiene sentido a ese nivel,
+    # a diferencia de sharpe/drawdown/retorno total)
+    trade_level_returns = [r for _, r in dated_returns]
 
     return BacktestResult(
         label=label,
-        n_trades=len(returns),
+        n_trades=len(dated_returns),
+        n_days=len(daily_returns),
         n_evaluations=n_evaluations,
-        sharpe=_sharpe(returns),
-        max_drawdown=_max_drawdown(returns),
-        win_rate=_win_rate(returns),
+        sharpe=_sharpe(daily_returns),
+        max_drawdown=_max_drawdown(daily_returns),
+        win_rate=_win_rate(trade_level_returns),
         total_return_pct=round(total_return, 2) if total_return is not None else None,
-        avg_return_pct=round(float(np.mean(returns)), 4) if returns else None,
+        avg_return_pct=round(float(np.mean(daily_returns)), 4) if daily_returns else None,
     )
 
 
@@ -200,7 +250,7 @@ if __name__ == "__main__":
 
     print("\n=== ENSEMBLE (COMPRA/VENDE) ===")
     e = result["ensemble"]
-    print(f"Trades: {e['n_trades']} (de {e['n_evaluations']} evaluaciones)")
+    print(f"Trades: {e['n_trades']} (de {e['n_evaluations']} evaluaciones) | Días agregados: {e['n_days']}")
     print(f"Sharpe: {e['sharpe']}")
     print(f"Max Drawdown: {e['max_drawdown']}")
     print(f"Win Rate: {e['win_rate']}")
@@ -211,7 +261,7 @@ if __name__ == "__main__":
         if r["n_trades"] == 0:
             continue
         print(
-            f"{h}: trades={r['n_trades']} sharpe={r['sharpe']} "
-            f"dd={r['max_drawdown']} win={r['win_rate']} "
-            f"ret_total={r['total_return_pct']}%"
-        )
+            f"{h}: trades={r['n_trades']} días={r['n_days']} "
+            f"sharpe={r['sharpe']} dd={r['max_drawdown']} "
+            f"win={r['win_rate']} ret_total={r['total_return_pct']}%"
+            )
