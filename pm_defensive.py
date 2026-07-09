@@ -315,6 +315,22 @@ class PMDefensive:
         )
         age = days_between(entry_date)
 
+        # [F14] Guardrail: una caída >90% en un solo ciclo es
+        # matemáticamente casi imposible en el mercado real — es
+        # mucho más probable que sea un precio corrupto (ej. el
+        # placeholder price_now=1.0 que existía antes del fix [F13]
+        # en trading_orchestrator.py). No cerrar con datos sospechosos.
+        if ret <= -0.90:
+            logger.error(
+                f"🚨 {ticker} ret={ret:.1%} SOSPECHOSO (caída >90%) — "
+                f"probable precio corrupto (entry={entry} price={price}), "
+                f"NO se ejecuta catastrophic_loss, HOLD preventivo"
+            )
+            return DefensiveDecision(
+                "HOLD", ticker, "suspicious_price_hold", ts,
+                {"ret_pct": round(ret * 100, 2), "entry": entry, "price": price},
+            )
+
         # Stop catastrófico — aplica a TODOS incluyendo anchors
         if ret <= -CATASTROPHIC_STOP_PCT:
             logger.warning(
