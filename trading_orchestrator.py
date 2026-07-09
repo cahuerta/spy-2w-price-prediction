@@ -277,10 +277,21 @@ class TradingOrchestrator:
                     f"⚠️ {ticker} sin precio Alpaca → entry_price: {pos['price_now']:.2f}"
                 )
             else:
-                pos["price_now"] = 1.0
-                logger.error(f"❌ {ticker} SIN PRECIO → usando 1.0")
+                # [F13] FIX: antes se usaba price_now=1.0 como placeholder.
+                # pm_defensive.py calcula ret=(price/entry - 1) sobre ese
+                # valor y lo interpreta como caída real de ~99%, disparando
+                # "catastrophic_loss" con exit_price=1.0 — cierre real con
+                # pérdida ficticia (confirmado en trades reales GILD/SO,
+                # ~$4,200 USD de pérdida registrada sobre un precio falso).
+                # Ahora: sin precio confiable → excluir del ciclo, no inventar.
+                logger.error(f"❌ {ticker} SIN PRECIO CONFIABLE → excluyendo de este ciclo")
+                pos["price_now"] = None
+                pos["price_unreliable"] = True
 
-            enriched.append(pos)
+            if pos.get("price_now") is not None:
+                enriched.append(pos)
+            else:
+                logger.warning(f"⚠️ {ticker} excluido de evaluación por precio no confiable")
 
         if price_map:
             try:
