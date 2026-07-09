@@ -3,44 +3,37 @@
 # =========================================================
 # Construye una curva de equity simulada a partir de las
 # evaluaciones YA EXISTENTES en /data/evaluations/ — sin
-# retraining, sin backtest walk-forward, sin look-ahead bias
-# (las evaluaciones ya fueron generadas prediction-first).
+# retraining, sin backtest walk-forward, sin look-ahead bias.
 #
-# Responde: "el hit_rate de 51-54% en H4-H9, ¿se traduce en
-# Sharpe > 1.0 real, o es ruido?" — usando datos que el sistema
-# ya generó en producción.
+# FIX v1.2 — CORRECCIÓN MATEMÁTICA DE FONDO:
+#   [BF2] Los retornos evaluados son MULTI-DÍA (ej. H9 = retorno
+#         acumulado en 9 días), pero se estaban insertando en la
+#         curva de equity como si fueran retornos de 1 solo día.
+#         Esto no es un problema de anualización (sqrt(N)) — es un
+#         error de UNIDADES: componer un retorno de 9 días como si
+#         fuera diario infla la curva exponencialmente sin sentido,
+#         sin importar qué factor de anualización se use después.
 #
-# Dos niveles de análisis:
-#   1. ENSEMBLE — usa 'recommendation' (COMPRA/VENDE), ignora
-#      MANTÉN (el sistema no habría operado ahí).
-#   2. POR HORIZONTE (H1-H10) — usa models_diagnostics, dirección
-#      implícita = signo de pred_return.
+#         FIX correcto: convertir cada retorno multi-día a su tasa
+#         diaria equivalente compuesta (CAGR estándar) ANTES de
+#         insertarlo en la curva:
+#             r_diario = (1 + R_total/100)^(1/horizonte_dias) - 1
+#         Con esto, cada punto de la serie es una tasa diaria
+#         genuina, y sqrt(252) para anualizar el Sharpe vuelve a
+#         ser matemáticamente correcto (antes se combinaban DOS
+#         errores: unidades incorrectas + anualización sobre esas
+#         unidades incorrectas).
 #
-# FIX v1.1:
-#   [BF1] _compute_result encadenaba CADA trade individual como si
-#         fuera secuencial sobre el 100% del capital. Con miles de
-#         evaluaciones (múltiples tickers el mismo día), esto
-#         multiplicaba en cadena decenas de "trades" del mismo día
-#         como si ocurrieran uno tras otro — resultado: ret_total
-#         de cientos de millones de % (matemáticamente sin sentido)
-#         y max_drawdown≈0.9999 (artefacto numérico, no una caída
-#         real de capital).
-#         Fix: agrupar por fecha ANTES de encadenar. Todos los
-#         trades del mismo día se promedian (portafolio
-#         equiponderado ese día), y la curva de equity se construye
-#         sobre esa serie diaria — no sobre trades sueltos.
-#         win_rate se mantiene por trade individual (tiene sentido
-#         a ese nivel); sharpe/drawdown/retorno total se calculan
-#         sobre la serie diaria agregada.
-#
-#   NOTA — limitación conocida y no resuelta aquí: los retornos de
-#   horizontes largos (ej. H9 = retorno a 9 días) están auto-
-#   correlacionados entre fechas consecutivas (ventanas que se
-#   solapan), así que el Sharpe anualizado con sqrt(252) puede
-#   seguir estando algo inflado incluso después del fix [BF1].
-#   Es un problema conocido al evaluar retornos multi-día con
-#   métricas pensadas para retornos diarios independientes —
-#   pendiente para el backtest walk-forward completo más adelante.
+#   LIMITACIÓN CONOCIDA, NO RESUELTA AQUÍ (y no trivial de resolver):
+#         Los horizontes se solapan en el tiempo — un trade que
+#         entra el día N y otro que entra el día N+1 con el mismo
+#         horizonte comparten casi todo el mismo período de mercado.
+#         Esto genera autocorrelación entre observaciones consecutivas
+#         de la serie, y el Sharpe estándar asume independencia. La
+#         corrección rigurosa (ajuste tipo Newey-West sobre el error
+#         estándar) es matemática adicional real, pendiente para el
+#         backtest walk-forward formal — NO improvisada aquí. Este
+#         fix corrige la magnitud (unidades), no la autocorrelación.
 # =========================================================
 
 import os
@@ -61,6 +54,7 @@ DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 EVAL_ROOT = DATA_PATH / "evaluations"
 
 TRADING_DAYS_YEAR = 252
+DEFAULT_HORIZON_DAYS = 10  # fallback si una evaluación no trae su horizonte
 
 
 # =========================================================
@@ -74,8 +68,31 @@ def _load_json(path: Path) -> Optional[Dict]:
         return None
 
 
+def _daily_equivalent_return(total_return_pct: float, horizon_days: int) -> float:
+    """
+    [BF2] Convierte un retorno total sobre `horizon_days` días a su
+    tasa diaria equivalente compuesta (CAGR estándar):
+        (1 + r)^horizon_days = 1 + total_return_pct/100
+        r = (1 + total_return_pct/100)^(1/horizon_days) - 1
+
+    Retorna la tasa en formato porcentual (ej. 0.5 = 0.5% diario).
+    """
+    horizon_days = max(1, int(horizon_days))
+    base = 1.0 + (total_return_pct / 100.0)
+    # Protección: una pérdida total (-100% o peor, dato corrupto)
+    # no tiene raíz real definida — se trata como pérdida total.
+    if base <= 0:
+        return -100.0
+    daily_factor = base ** (1.0 / horizon_days)
+    return (daily_factor - 1.0) * 100.0
+
+
 def _sharpe(returns: List[float]) -> Optional[float]:
-    """Sharpe anualizado. None si <5 muestras o std=0."""
+    """
+    Sharpe anualizado con sqrt(252). Válido porque, tras [BF2],
+    `returns` son tasas diarias equivalentes genuinas — no
+    retornos multi-día sin convertir.
+    """
     if len(returns) < 5:
         return None
     arr = np.array(returns, dtype=float)
@@ -86,7 +103,7 @@ def _sharpe(returns: List[float]) -> Optional[float]:
 
 
 def _max_drawdown(returns: List[float]) -> Optional[float]:
-    """Max drawdown desde retornos porcentuales encadenados."""
+    """Max drawdown sobre la curva de equity de tasas diarias equivalentes."""
     if not returns:
         return None
     equity = np.cumprod(1 + np.array(returns, dtype=float) / 100)
@@ -109,35 +126,41 @@ def _win_rate(returns: List[float]) -> Optional[float]:
 class BacktestResult:
     label:            str
     n_trades:         int          # trades individuales reales
-    n_days:           int          # [BF1] puntos en la serie diaria agregada
+    n_days:           int          # puntos en la serie diaria agregada
     n_evaluations:    int          # incluye señales débiles descartadas
     sharpe:           Optional[float]
     max_drawdown:     Optional[float]
     win_rate:         Optional[float]
     total_return_pct: Optional[float]
-    avg_return_pct:   Optional[float]
+    avg_daily_return_pct: Optional[float]
 
 
-def _compute_result(label: str, dated_returns: List[tuple], n_evaluations: int) -> BacktestResult:
+def _compute_result(
+    label: str,
+    dated_returns: List[tuple],   # (fecha_str, total_return_pct, horizon_days)
+    n_evaluations: int,
+) -> BacktestResult:
     """
-    [BF1] dated_returns: lista de (fecha_str, retorno_pct).
-
-    FIX: agrupa por fecha ANTES de encadenar — trata todos los
-    trades del mismo día como un portafolio equiponderado, no
-    como eventos secuenciales sobre el 100% del capital.
-    Sin esto, cientos de trades el mismo día se multiplican en
-    cadena y el "retorno total" explota sin sentido.
+    [BF2] Cada elemento de dated_returns trae su propio horizon_days.
+    Se convierte a tasa diaria equivalente ANTES de agrupar por
+    fecha y encadenar — así la curva de equity está en unidades
+    correctas y consistentes.
     """
+    # win_rate se calcula sobre el retorno TOTAL de cada trade
+    # (tiene sentido a nivel de trade individual, sin conversión)
+    trade_level_returns = [r for _, r, _ in dated_returns]
+
     by_date = defaultdict(list)
-    for date_str, ret in dated_returns:
+    for date_str, total_ret, horizon_days in dated_returns:
         if not date_str:
             continue
-        by_date[date_str].append(ret)
+        daily_equiv = _daily_equivalent_return(total_ret, horizon_days)
+        by_date[date_str].append(daily_equiv)
 
-    # Una fecha = un punto de la serie = promedio de todos los
-    # trades de ese día (portafolio equiponderado ese día)
+    # Una fecha = un punto de la serie = promedio de las tasas
+    # diarias equivalentes de todos los trades entrados ese día
     daily_series = sorted(
-        (date_str, float(np.mean(rets))) for date_str, rets in by_date.items()
+        (date_str, float(np.mean(vals))) for date_str, vals in by_date.items()
     )
     daily_returns = [r for _, r in daily_series]
 
@@ -145,10 +168,6 @@ def _compute_result(label: str, dated_returns: List[tuple], n_evaluations: int) 
     if daily_returns:
         equity = np.cumprod(1 + np.array(daily_returns) / 100)
         total_return = float((equity[-1] - 1) * 100)
-
-    # win_rate por trade individual (sí tiene sentido a ese nivel,
-    # a diferencia de sharpe/drawdown/retorno total)
-    trade_level_returns = [r for _, r in dated_returns]
 
     return BacktestResult(
         label=label,
@@ -159,7 +178,7 @@ def _compute_result(label: str, dated_returns: List[tuple], n_evaluations: int) 
         max_drawdown=_max_drawdown(daily_returns),
         win_rate=_win_rate(trade_level_returns),
         total_return_pct=round(total_return, 2) if total_return is not None else None,
-        avg_return_pct=round(float(np.mean(daily_returns)), 4) if daily_returns else None,
+        avg_daily_return_pct=round(float(np.mean(daily_returns)), 4) if daily_returns else None,
     )
 
 
@@ -185,6 +204,7 @@ def run_backtest_from_evaluations() -> Dict[str, Any]:
     Construye curvas de equity simuladas desde evaluaciones existentes.
     Retorna: {"ensemble": BacktestResult, "by_horizon": {H1: ..., H2: ...}}
     """
+    # (fecha, retorno_total_pct, horizon_days)
     ensemble_returns: List[tuple] = []
     ensemble_n_eval = 0
 
@@ -206,14 +226,15 @@ def run_backtest_from_evaluations() -> Dict[str, Any]:
         if real_ret is not None and rec in ("COMPRA", "VENDE"):
             ensemble_n_eval += 1
             direction = 1 if rec == "COMPRA" else -1
-            ensemble_returns.append((pred_date, direction * float(real_ret)))
+            h_days = int(ev.get("evaluation_horizon_days") or DEFAULT_HORIZON_DAYS)
+            ensemble_returns.append((pred_date, direction * float(real_ret), h_days))
 
         # ── POR HORIZONTE (models_diagnostics) ──
         diag = ev.get("models_diagnostics") or {}
         for hkey, hdata in diag.items():
             if not isinstance(hdata, dict):
                 continue
-            pred_ret = hdata.get("pred_return")
+            pred_ret   = hdata.get("pred_return")
             real_ret_h = hdata.get("real_return")
             if pred_ret is None or real_ret_h is None:
                 continue
@@ -225,7 +246,13 @@ def run_backtest_from_evaluations() -> Dict[str, Any]:
                 continue
 
             direction = 1 if float(pred_ret) > 0 else -1
-            horizon_returns[hkey].append((pred_date, direction * float(real_ret_h)))
+            # h_days real de este horizonte, ej. "H9" → 9
+            try:
+                h_days = int(hkey.replace("H", ""))
+            except ValueError:
+                h_days = DEFAULT_HORIZON_DAYS
+
+            horizon_returns[hkey].append((pred_date, direction * float(real_ret_h), h_days))
 
     result = {
         "ensemble": asdict(_compute_result("Ensemble (COMPRA/VENDE)", ensemble_returns, ensemble_n_eval)),
@@ -264,4 +291,4 @@ if __name__ == "__main__":
             f"{h}: trades={r['n_trades']} días={r['n_days']} "
             f"sharpe={r['sharpe']} dd={r['max_drawdown']} "
             f"win={r['win_rate']} ret_total={r['total_return_pct']}%"
-            )
+        )
