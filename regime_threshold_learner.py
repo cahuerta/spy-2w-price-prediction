@@ -15,6 +15,19 @@
 #   NEUTRAL declarado + SPY cayó >5% → perdió caída → umbral más sensible
 #   GROWTH declarado + SPY subió     → acierto → umbral más sensible
 #   GROWTH declarado + SPY cayó      → falsa alarma → umbral menos sensible
+#
+# FIX V1.1:
+#   [A1] THRESHOLD_LIMITS.defensive.dd_max tenía el tuple invertido:
+#        (-0.03, -0.20) en vez de (-0.20, -0.03). _clamp(value, lo, hi)
+#        hace max(lo, min(hi, value)) — con lo=-0.03 y hi=-0.20 (lo > hi),
+#        el resultado SIEMPRE daba -0.03 sin importar el ajuste real,
+#        porque min(hi, value) nunca supera -0.20 y luego max(-0.03, ese)
+#        siempre gana -0.03. Efecto: dd_max quedó congelado en -0.03
+#        (cualquier caída de 3% dispara "defensive"), ignorando 29
+#        ajustes acumulados de "false_alarm" que intentaban subirlo
+#        a -0.20. Con "defensive" disparándose casi todos los días,
+#        "growth"/"neutral" casi nunca se evaluaban, y por eso los
+#        umbrales de growth nunca se movieron de sus defaults.
 # =========================================================
 
 import json
@@ -41,9 +54,10 @@ MISS_PENALTY      = 0.015   # ajuste extra cuando pierde una caída fuerte
 STRONG_MOVE_PCT   = 0.04    # >4% = movimiento fuerte de mercado
 
 # Límites de umbrales (no pueden salirse de rango)
+# [A1] dd_max corregido: (lo, hi) con lo < hi, igual que los demás
 THRESHOLD_LIMITS = {
     "defensive": {
-        "dd_max":   (-0.03, -0.20),
+        "dd_max":   (-0.20, -0.03),
         "vol_min":  (0.15,   0.50),
         "corr_min": (0.55,   0.95),
     },
