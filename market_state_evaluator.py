@@ -15,6 +15,17 @@
 # FIX v3.3.1:
 #   [A4] spy_price: yfinance puede retornar DataFrame en vez de Series
 #        para un solo ticker. Usar squeeze() + scalar() para forzar float.
+#
+# FIX v3.3.2:
+#   [A5] THRESHOLD_LIMITS.defensive.dd_max tenía el tuple invertido:
+#        (-0.03, -0.20) en vez de (-0.20, -0.03). Con _clamp(lo, hi)
+#        usando max(lo, min(hi, value)), ese orden forzaba SIEMPRE
+#        el resultado a -0.03 sin importar el ajuste del learner —
+#        por eso "defensive" se disparaba con cualquier caída de 3%
+#        y "growth" nunca llegaba a evaluarse (29/30 evals = defensive).
+#        Este diccionario no se usa en este archivo (solo en
+#        regime_threshold_learner.py), pero se corrige aquí también
+#        para que ambas copias queden consistentes hasta centralizarlo.
 # =========================================================
 
 import os
@@ -69,9 +80,10 @@ DEFAULT_THRESHOLDS = {
     }
 }
 
+# [A5] Fix: dd_max debe ir (lo, hi) con lo < hi, igual que los demás
 THRESHOLD_LIMITS = {
     "defensive": {
-        "dd_max":   (-0.03, -0.20),
+        "dd_max":   (-0.20, -0.03),
         "vol_min":  (0.15,   0.50),
         "corr_min": (0.55,   0.95),
     },
