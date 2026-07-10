@@ -1,5 +1,5 @@
 """
-market_orchestrator.py — V2.2 PRODUCCIÓN REAL NUMÉRICO ESTRICTO
+market_orchestrator.py — V2.3 PRODUCCIÓN REAL NUMÉRICO ESTRICTO
 
 ORQUESTADOR DE ENTORNO DE MERCADO
 
@@ -19,12 +19,27 @@ FIX v2.2:
        Ahora: 0.50 + (-0.168 * 0.66) = 0.389 → neutral ✅
        Efecto: noticias con baja confianza tienen menos peso,
                noticias con alta confianza tienen peso casi completo.
+
+FIX v2.3:
+  [F2] Persistencia de estado en disco (/data/orchestrator_state.json).
+       pipeline_router.py crea `MarketOrchestrator()` NUEVO en cada
+       corrida del pipeline — _last_mode y _up_counter vivían solo en
+       memoria del objeto, así que se reseteaban a "neutral"/0 en
+       cada ciclo. Resultado: _up_counter nunca podía llegar a
+       HYSTERESIS_UP=2, porque cada pipeline volvía a empezar en 0.
+       "growth" era matemáticamente inalcanzable sin importar qué
+       tan bien calibrado estuviera el régimen cuantitativo.
+       Ahora el estado se carga desde disco al construir el objeto
+       y se guarda después de cada evaluate().
 """
 
 from dataclasses import dataclass, asdict
 from typing import Dict, Literal
 import datetime
+import json
 import logging
+import os
+from pathlib import Path
 
 
 # =================================================================
@@ -54,6 +69,10 @@ REGIME_BASE_SCORE = {
 GROWTH_THRESHOLD = 0.65
 DEFENSIVE_THRESHOLD = 0.35
 
+# [F2] Persistencia de estado
+DATA_PATH   = Path(os.getenv("DATA_PATH", "/data"))
+STATE_FILE  = DATA_PATH / "orchestrator_state.json"
+
 
 # =================================================================
 # DATACLASS DE SALIDA (CONTRATO INTACTO)
@@ -78,9 +97,40 @@ class MarketOrchestrationContext:
 class MarketOrchestrator:
 
     def __init__(self):
-        self._last_mode: Literal["growth", "neutral", "defensive"] = "neutral"
-        self._up_counter: int = 0
-        logger.info("MarketOrchestrator inicializado (modo: neutral)")
+        # [F2] Cargar estado persistido en vez de arrancar siempre en neutral/0
+        self._last_mode, self._up_counter = self._load_state()
+        logger.info(
+            f"MarketOrchestrator inicializado (modo: {self._last_mode}, "
+            f"up_counter: {self._up_counter})"
+        )
+
+    # -------------------------------------------------------------
+    # [F2] PERSISTENCIA DE ESTADO
+    # -------------------------------------------------------------
+    def _load_state(self) -> tuple:
+        if STATE_FILE.exists():
+            try:
+                data = json.loads(STATE_FILE.read_text())
+                mode = data.get("last_mode", "neutral")
+                counter = int(data.get("up_counter", 0))
+                if mode in ("growth", "neutral", "defensive"):
+                    return mode, counter
+            except Exception as e:
+                logger.warning(f"⚠️ [F2] No se pudo leer orchestrator_state.json: {e}")
+        return "neutral", 0
+
+    def _save_state(self) -> None:
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "last_mode":  self._last_mode,
+                "up_counter": self._up_counter,
+                "updated_at": datetime.datetime.utcnow().isoformat(),
+            }, indent=2))
+            tmp.replace(STATE_FILE)
+        except Exception as e:
+            logger.warning(f"⚠️ [F2] No se pudo guardar orchestrator_state.json: {e}")
 
     # -------------------------------------------------------------
     # FUNCIÓN PRINCIPAL
@@ -176,6 +226,10 @@ class MarketOrchestrator:
 
         self._last_mode = next_mode
 
+        # [F2] Persistir estado para que el próximo pipeline (nuevo objeto)
+        # retome desde aquí, en vez de reiniciar en neutral/0
+        self._save_state()
+
         # =========================================================
         # SALIDA (CONTRATO INTACTO)
         # =========================================================
@@ -205,4 +259,4 @@ class MarketOrchestrator:
         return {
             "last_mode": self._last_mode,
             "up_counter": self._up_counter,
-        }
+      }
