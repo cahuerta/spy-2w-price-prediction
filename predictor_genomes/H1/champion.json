@@ -1,19 +1,20 @@
 {
-  "genome_id": "H1_v1",
+  "genome_id": "H1_v2_2",
   "horizon": 1,
-  "generation": 1,
-  "parent_ids": [],
+  "generation": 2,
+  "parent_ids": [
+    "H1_v1"
+  ],
   "fitness": null,
-  "hit_rate": 0.5095,
+  "hit_rate": 0.5467,
   "bias_score": 0.4497,
-  "n_evaluations": 3476,
-  "created_at": "2026-07-07T16:52:27.543766+00:00",
+  "n_evaluations": 0,
+  "created_at": "2026-07-10T22:00:22.344272+00:00",
   "features": [
     "range",
     "ret_lag_1",
     "ret_lag_2",
     "ret_lag_5",
-    "rv_short",
     "vol_ema",
     "mom_vol",
     "rsi_fast",
@@ -27,5 +28,9 @@
     "period": "1y",
     "sample_weight_decay": 0.0
   },
-  "bias_score_updated_at": "2026-07-07T18:17:06.170789+00:00"
+  "bias_score_updated_at": "2026-07-10T22:00:22.343530+00:00",
+  "mutations": [
+    "REM:vol_ema",
+    "REP:rv_short→vol_ema"
+  ]
 }
