@@ -1,15 +1,15 @@
 {
-  "genome_id": "H4_v2_4",
+  "genome_id": "H4_v3_4",
   "horizon": 4,
-  "generation": 2,
+  "generation": 3,
   "parent_ids": [
-    "H4_v1"
+    "H4_v2_4"
   ],
   "fitness": null,
-  "hit_rate": 0.5686,
+  "hit_rate": 0.6333,
   "bias_score": 0.4497,
   "n_evaluations": 0,
-  "created_at": "2026-07-10T22:00:23.881031+00:00",
+  "created_at": "2026-07-24T22:01:01.902723+00:00",
   "features": [
     "range",
     "rv_20",
@@ -21,7 +21,8 @@
     "dist_lo",
     "mom_5d",
     "mom_20d",
-    "vol_price"
+    "vol_price",
+    "mom_10d"
   ],
   "model_params": {
     "alpha_ridge": 0.7,
@@ -30,8 +31,8 @@
     "period": "2y",
     "sample_weight_decay": 0.0
   },
-  "bias_score_updated_at": "2026-07-10T22:00:23.877636+00:00",
+  "bias_score_updated_at": "2026-07-24T22:01:01.892959+00:00",
   "mutations": [
-    "REM:mom_10d"
+    "ADD:mom_10d"
   ]
 }
