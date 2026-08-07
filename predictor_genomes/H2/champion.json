@@ -1,24 +1,23 @@
 {
-  "genome_id": "H2_v3_4",
+  "genome_id": "H2_v4_2",
   "horizon": 2,
-  "generation": 3,
+  "generation": 4,
   "parent_ids": [
-    "H2_v2_3"
+    "H2_v3_4"
   ],
   "fitness": null,
-  "hit_rate": 0.6111,
+  "hit_rate": 0.5755,
   "bias_score": 0.4497,
   "n_evaluations": 0,
-  "created_at": "2026-07-17T22:00:47.891525+00:00",
+  "created_at": "2026-07-31T22:00:24.956652+00:00",
   "features": [
     "range",
     "rv_10",
     "mom_ratio",
-    "rsi_9",
     "dist_ma10",
     "mom_2d",
     "mom_5d",
-    "ret_lag_1",
+    "rsi_9",
     "ret_lag_2",
     "ret_lag_3",
     "ret_lag_5",
@@ -32,9 +31,9 @@
     "period": "1y",
     "sample_weight_decay": 0.0
   },
-  "bias_score_updated_at": "2026-07-10T22:00:22.829038+00:00",
+  "bias_score_updated_at": "2026-07-31T22:00:24.945795+00:00",
   "mutations": [
-    "REM:ret_lag_10",
-    "ADD:ret_lag_10"
+    "REM:rsi_9",
+    "REP:ret_lag_1→rsi_9"
   ]
 }
