@@ -1,15 +1,15 @@
 {
-  "genome_id": "H1_v2_2",
+  "genome_id": "H1_v3_2",
   "horizon": 1,
-  "generation": 2,
+  "generation": 3,
   "parent_ids": [
-    "H1_v1"
+    "H1_v2_2"
   ],
   "fitness": null,
-  "hit_rate": 0.5013,
+  "hit_rate": 0.5206,
   "bias_score": 0.4497,
-  "n_evaluations": 4692,
-  "created_at": "2026-07-10T22:00:22.344272+00:00",
+  "n_evaluations": 0,
+  "created_at": "2026-07-31T22:00:24.289460+00:00",
   "features": [
     "range",
     "ret_lag_1",
@@ -19,7 +19,8 @@
     "mom_vol",
     "rsi_fast",
     "price_strength",
-    "trend_5"
+    "trend_5",
+    "rv_short"
   ],
   "model_params": {
     "alpha_ridge": 0.5,
@@ -30,7 +31,6 @@
   },
   "bias_score_updated_at": "2026-07-31T22:00:22.822033+00:00",
   "mutations": [
-    "REM:vol_ema",
-    "REP:rv_short→vol_ema"
+    "ADD:rv_short"
   ]
 }
