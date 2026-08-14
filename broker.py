@@ -1,5 +1,5 @@
 # =========================================================
-# broker.py — V3.3 PURE EXECUTOR (NO SIZING)
+# broker.py — V3.4 PURE EXECUTOR (BRACKET PROTECTION ON BUY)
 # =========================================================
 #
 # FIX v3.1:
@@ -24,6 +24,20 @@
 #        y se retorna filled_avg_price + price en el dict.
 #        Fallback: si el polling no resuelve en 5s, se busca
 #        el precio actual de la posición antes del cierre.
+#
+# FIX v3.4:
+#   [B6] _place_market_order() para BUY ahora envía la orden
+#        como bracket order (order_class=BRACKET) con:
+#          - take_profit = precio_referencia * 1.10 (fijo 10%)
+#          - stop_loss   = precio_referencia * 0.97 (fijo 3%, stop simple)
+#        El precio de referencia se obtiene vía latest trade
+#        ANTES de enviar la orden, ya que una orden de mercado
+#        no tiene precio conocido de antemano. El TP/SL final
+#        puede diferir levemente del 10%/3% exacto respecto al
+#        fill real (limitación normal de bracket + market order).
+#        El monitoreo horario (tracker/PM) NO se modifica — esto
+#        es una capa de protección adicional en el broker, no un
+#        reemplazo. CLOSE no se toca.
 # =========================================================
 
 import os
@@ -38,8 +52,21 @@ from pydantic import BaseModel
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, QueryOrderStatus
+    from alpaca.trading.requests import (
+        MarketOrderRequest,
+        GetOrdersRequest,
+        TakeProfitRequest,
+        StopLossRequest,
+    )
+    from alpaca.trading.enums import (
+        OrderSide,
+        TimeInForce,
+        OrderStatus,
+        QueryOrderStatus,
+        OrderClass,
+    )
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestTradeRequest
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
@@ -49,6 +76,10 @@ router = APIRouter(prefix="/trading", tags=["trading"])
 
 # Prefijo que identifica órdenes del sistema automático
 SYSTEM_ORDER_PREFIX = "sys_"
+
+# [B6] Porcentajes fijos de protección en toda compra
+TAKE_PROFIT_PCT = 0.10   # +10%
+STOP_LOSS_PCT   = 0.03   # -3%
 
 
 # =========================================================
@@ -75,7 +106,12 @@ class TradingEngine:
             raise ValueError("Faltan credenciales de Alpaca")
 
         self.client = TradingClient(self.key, self.secret, paper=self.paper)
-        logger.info(f"🔌 Broker V3.3 conectado ({'PAPER' if self.paper else 'LIVE'})")
+
+        # [B6] Cliente de datos de mercado para obtener precio de referencia
+        # antes de armar el bracket (usa las mismas credenciales de trading)
+        self.data_client = StockHistoricalDataClient(self.key, self.secret)
+
+        logger.info(f"🔌 Broker V3.4 conectado ({'PAPER' if self.paper else 'LIVE'})")
 
     def is_executable(self, ticker: str) -> bool:
         return ticker is not None and not ticker.upper().endswith(".SN")
@@ -178,6 +214,8 @@ class TradingEngine:
                     await self._close_position(close_ticker)
 
                 if shares > 0:
+                    # [B6] La pata de compra de ROTATE también pasa por
+                    # _place_market_order → también queda protegida con bracket
                     return await self._place_market_order(ticker, shares, OrderSide.BUY)
                 return {"status": "partially_executed", "reason": "close_done_open_failed_shares"}
 
@@ -195,6 +233,11 @@ class TradingEngine:
         retornaba un Order pero solo se extraía el id — el
         filled_avg_price nunca llegaba al Darwin tracker,
         causando exit_price=0.0 y PnL real=-100%.
+
+        NOTA v3.4: si la posición fue abierta con bracket order,
+        cerrar la posición vía close_position() cancela automáticamente
+        las órdenes hijas (TP/SL) asociadas — comportamiento nativo
+        de Alpaca para brackets, no requiere cambios acá.
         """
         # Capturar precio pre-cierre como fallback (antes de cerrar)
         pre_close_price = 0.0
@@ -244,12 +287,72 @@ class TradingEngine:
         }
 
     # =========================================================
-    # [B4] PLACE MARKET ORDER — con client_order_id del sistema
+    # [B6] REFERENCE PRICE — precio de referencia pre-orden
+    # =========================================================
+    def _get_reference_price(self, ticker: str) -> Optional[float]:
+        """
+        Obtiene el último precio conocido del ticker vía latest trade,
+        usado como base para calcular TP/SL del bracket. Una orden de
+        mercado no tiene precio de antemano, así que esto es una
+        aproximación — el fill real puede variar levemente.
+        """
+        try:
+            req = StockLatestTradeRequest(symbol_or_symbols=ticker)
+            trades = self.data_client.get_stock_latest_trade(req)
+            trade = trades.get(ticker)
+            if trade and trade.price:
+                return float(trade.price)
+        except Exception as e:
+            logger.warning(f"⚠️ {ticker} no se pudo obtener precio de referencia: {e}")
+
+        # Fallback: si ya hay posición abierta en el ticker, usar current_price
+        try:
+            positions = self.client.get_all_positions()
+            for p in positions:
+                if p.symbol.upper() == ticker.upper() and hasattr(p, "current_price") and p.current_price:
+                    return float(p.current_price)
+        except Exception:
+            pass
+
+        return None
+
+    # =========================================================
+    # [B4][B6] PLACE MARKET ORDER — bracket en compras
     # =========================================================
     async def _place_market_order(self, ticker: str, qty: int, side: OrderSide):
         # Genera ID único con prefijo "sys_" para identificar órdenes automáticas
         ts_ms     = int(datetime.utcnow().timestamp() * 1000)
         client_id = f"{SYSTEM_ORDER_PREFIX}{ticker.lower()}_{ts_ms}"
+
+        # [B6] Solo las compras llevan protección bracket (TP fijo 10% / SL fijo 3%)
+        order_class  = None
+        take_profit  = None
+        stop_loss    = None
+
+        if side == OrderSide.BUY:
+            ref_price = self._get_reference_price(ticker)
+
+            if ref_price and ref_price > 0:
+                tp_price = round(ref_price * (1 + TAKE_PROFIT_PCT), 2)
+                sl_price = round(ref_price * (1 - STOP_LOSS_PCT), 2)
+
+                order_class = OrderClass.BRACKET
+                take_profit = TakeProfitRequest(limit_price=tp_price)
+                stop_loss   = StopLossRequest(stop_price=sl_price)  # stop simple, sin limit_price
+
+                logger.info(
+                    f"🛡️ {ticker} bracket armado | ref=${ref_price:.2f} "
+                    f"TP=${tp_price:.2f} (+{TAKE_PROFIT_PCT*100:.0f}%) "
+                    f"SL=${sl_price:.2f} (-{STOP_LOSS_PCT*100:.0f}%)"
+                )
+            else:
+                # No se pudo obtener precio de referencia → se envía la orden
+                # simple (sin bracket) para no bloquear la ejecución, y se deja
+                # constancia en el log de que quedó sin protección automática.
+                logger.warning(
+                    f"⚠️ {ticker} sin precio de referencia disponible — "
+                    f"orden enviada SIN bracket (queda a cargo del monitoreo horario)"
+                )
 
         req = MarketOrderRequest(
             symbol=ticker,
@@ -257,10 +360,13 @@ class TradingEngine:
             side=side,
             time_in_force=TimeInForce.DAY,
             client_order_id=client_id,   # [B4] marca de origen sistema
+            order_class=order_class,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
         )
 
         order = self.client.submit_order(req)
-        logger.info(f"📤 Orden enviada {ticker} client_id={client_id}")
+        logger.info(f"📤 Orden enviada {ticker} client_id={client_id} class={order_class}")
 
         for _ in range(5):
             await asyncio.sleep(1)
@@ -273,12 +379,14 @@ class TradingEngine:
                     "client_order_id":  client_id,
                     "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
                     "price":            float(order.filled_avg_price) if order.filled_avg_price else None,
+                    "bracket":          order_class == OrderClass.BRACKET,
                 }
 
         return {
             "status":          "pending",
             "order_id":        str(order.id),
             "client_order_id": client_id,
+            "bracket":         order_class == OrderClass.BRACKET,
         }
 
 
@@ -360,4 +468,3 @@ async def cancel_ticker_orders(ticker: str, x_api_key: str = Header(None)):
     engine    = get_engine()
     cancelled = await engine.cancel_orders_for_ticker(ticker)
     return {"ticker": ticker.upper(), "cancelled": cancelled}
-    
