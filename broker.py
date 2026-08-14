@@ -38,6 +38,14 @@
 #        El monitoreo horario (tracker/PM) NO se modifica — esto
 #        es una capa de protección adicional en el broker, no un
 #        reemplazo. CLOSE no se toca.
+#        [B7] _get_reference_price() ahora pide explícitamente
+#        feed=DataFeed.IEX en el StockLatestTradeRequest. Sin esto,
+#        la librería puede intentar el feed SIP por defecto, que
+#        requiere plan pago de Market Data y falla en cuentas sin
+#        suscripción. IEX es el feed gratuito incluido en cualquier
+#        cuenta paper. Este archivo sigue siendo el único punto de
+#        contacto con Alpaca — el resto del sistema consulta precio
+#        vía los endpoints de acá, no directo a Alpaca.
 # =========================================================
 
 import os
@@ -67,6 +75,7 @@ try:
     )
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockLatestTradeRequest
+    from alpaca.data.enums import DataFeed
     ALPACA_AVAILABLE = True
 except ImportError:
     ALPACA_AVAILABLE = False
@@ -287,7 +296,7 @@ class TradingEngine:
         }
 
     # =========================================================
-    # [B6] REFERENCE PRICE — precio de referencia pre-orden
+    # [B6][B7] REFERENCE PRICE — precio de referencia pre-orden
     # =========================================================
     def _get_reference_price(self, ticker: str) -> Optional[float]:
         """
@@ -295,15 +304,23 @@ class TradingEngine:
         usado como base para calcular TP/SL del bracket. Una orden de
         mercado no tiene precio de antemano, así que esto es una
         aproximación — el fill real puede variar levemente.
+
+        [B7] Se pide explícitamente feed=DataFeed.IEX: es el feed
+        gratuito disponible en cualquier cuenta paper. Sin especificarlo,
+        la librería puede intentar SIP por defecto, que requiere plan
+        pago de Market Data y falla en cuentas sin suscripción.
         """
         try:
-            req = StockLatestTradeRequest(symbol_or_symbols=ticker)
+            req = StockLatestTradeRequest(
+                symbol_or_symbols=ticker,
+                feed=DataFeed.IEX,  # [B7] feed gratuito, sin plan pago
+            )
             trades = self.data_client.get_stock_latest_trade(req)
             trade = trades.get(ticker)
             if trade and trade.price:
                 return float(trade.price)
         except Exception as e:
-            logger.warning(f"⚠️ {ticker} no se pudo obtener precio de referencia: {e}")
+            logger.warning(f"⚠️ {ticker} no se pudo obtener precio de referencia (IEX): {e}")
 
         # Fallback: si ya hay posición abierta en el ticker, usar current_price
         try:
