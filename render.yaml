@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: APP PREDICTIVA
-    env: docker
-    plan: standard
-    repo: https://github.com/cahuerta/spy-2w-price-prediction
-    branch: main
