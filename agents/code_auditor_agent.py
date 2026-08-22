@@ -33,14 +33,14 @@ class CodeAuditorAgent:
         # Prompt para Claude
         prompt = self._build_prompt()
         
-        # Ejecutar claude via CLI
+        # Ejecutar claude via CLI (lee directo de GitHub, no necesita cwd específico)
         try:
             result = subprocess.run(
                 ["claude", "-p", prompt, "--output-format", "json"],
                 capture_output=True,
                 text=True,
                 timeout=600,  # 10 minutos máximo
-                cwd=self.repo_path
+                cwd="/opt/render/project/src"  # Directorio base, pero Claude lee de GitHub
             )
             
             if result.returncode == 0:
@@ -57,35 +57,42 @@ class CodeAuditorAgent:
     
     def _build_prompt(self):
         """Construye el prompt para Claude"""
-        return f"""Eres un auditor de código experto. Tu tarea es revisar el repositorio completo en {self.repo_path} 
-y detectar incoherencias, bugs sutiles, y problemas de arquitectura.
+        return """Eres un auditor de código experto. Tu tarea es revisar el repositorio completo de GitHub en:
+https://github.com/cahuerta/spy-2w-price-prediction
+
+Lee TODO el código (archivos .py) en secuencia completa y detecta incoherencias, bugs sutiles, y problemas de arquitectura.
 
 Busca específicamente:
-1. **Funciones no usadas** — definidas pero nunca llamadas
-2. **Contratos rotos** — funciones que devuelven tipos distintos según rama, o parámetros inconsistentes
+1. **Funciones no usadas** — definidas pero nunca llamadas en el repo
+2. **Contratos rotos** — funciones que devuelven tipos distintos según rama, parámetros inconsistentes
 3. **Variables con nombres conflictivos** — la misma lógica con nombres distintos en archivos diferentes
 4. **Imports circulares o no resueltos**
-5. **Estados inconsistentes** — variables que debería sincronizarse pero no lo hacen
+5. **Estados inconsistentes** — variables que deberían sincronizarse pero no lo hacen
 6. **APIs incompatibles** — endpoints que esperan ciertos campos pero no los reciben
+7. **Duplicación de lógica** — código repetido que debería reutilizarse
+8. **Valores hardcodeados** — números o strings que deberían ser configurables
 
-Responde ÚNICAMENTE en JSON con este formato:
-{{
-  "timestamp": "{self.timestamp}",
-  "repo_path": "{self.repo_path}",
+Lee el código COMPLETO y ANALIZA. Responde ÚNICAMENTE en JSON:
+
+{
+  "timestamp": "2026-08-22T22:30:00",
+  "repo": "cahuerta/spy-2w-price-prediction",
   "findings": [
-    {{
+    {
       "severity": "critical|high|medium|low",
-      "type": "unused_function|contract_break|naming_conflict|circular_import|state_mismatch|api_incompatibility|other",
+      "type": "unused_function|contract_break|naming_conflict|circular_import|state_mismatch|api_incompatibility|duplication|hardcoded_value|other",
       "file": "ruta/al/archivo.py",
-      "function_or_area": "nombre_función_o_zona",
+      "line_or_area": "número_línea o nombre_función",
       "description": "descripción concisa del problema",
-      "code_snippet": "línea de código relevante si aplica",
+      "context": "código relevante o explicación",
       "suggested_fix": "cómo arreglarlo"
-    }}
+    }
   ],
-  "summary": "resumen ejecutivo de los hallazgos",
-  "total_findings": <número>
-}}"""
+  "summary": "resumen ejecutivo de los hallazgos principales",
+  "total_findings": 0,
+  "critical_count": 0,
+  "high_count": 0
+}"""
     
     def _process_output(self, output):
         """Procesa la salida de Claude y la guarda"""
