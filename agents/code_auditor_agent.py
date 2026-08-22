@@ -44,11 +44,15 @@ class CodeAuditorAgent:
             )
             
             if result.returncode == 0:
+                print(f"✅ Claude respondió correctamente")
                 return self._process_output(result.stdout)
             else:
-                print(f"❌ Error en ejecución:")
-                print(result.stderr)
-                return {"status": "error", "message": result.stderr}
+                print(f"❌ Error en ejecución (return code: {result.returncode})")
+                if result.stderr:
+                    print(f"STDERR:\n{result.stderr}")
+                if result.stdout:
+                    print(f"STDOUT:\n{result.stdout}")
+                return {"status": "error", "message": result.stderr, "stdout": result.stdout}
                 
         except subprocess.TimeoutExpired:
             return {"status": "error", "message": "Auditoría excedió timeout (10 min)"}
