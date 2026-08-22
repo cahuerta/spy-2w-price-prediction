@@ -1,4 +1,4 @@
-# scheduler.py — v2.1
+# scheduler.py — v2.2
 # =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
@@ -11,39 +11,31 @@
 #   - Darwin Engine: resolver trades diario post-market (17:05 Chile)
 #   - Darwin Engine: ciclo evolutivo viernes post-market (18:00 Chile)
 #   - Darwin Engine: shadow evaluator nocturno diario (23:00 Chile)
+#   - Code Auditor Agent: auditoría de código diaria (01:00 Chile)
 #
 # Horario mercado US en hora Chile (verano UTC-3):
 #   Apertura  09:30 ET = 10:30 Chile
 #   Cierre    16:00 ET = 17:00 Chile
 #
 # EJECUCIONES DIARIAS:
+#   01:00 → Code Auditor Agent — auditoría completa del repo
 #   11:30 → APERTURA  — predicción + alpha + trading (abre Y cierra)
 #   15:30 → CIERRE    — solo cierra posiciones divergentes
 #   12:00-15:00 → Monitor horario (cada hora) — vigila posiciones abiertas
 #   17:05 → Darwin resolve trades
 #   18:00 viernes → Darwin evolución (executor + predictor arena)
-#   23:00 → Darwin shadow evaluator (genera y evalúa predicciones
-#           de shadow genomes H1-H10 — pipeline separado del trading
-#           real, corre después de todos los procesos del día)
+#   23:00 → Darwin shadow evaluator
 #
-# v2.0 — Monitor horario actualizado para intraday_tracker v3.0:
-#   - run_intraday_tracker() eliminado — usaba universo propio
-#   - Ahora usa evaluar_posiciones_abiertas(tickers) con lista real
-#   - Solo sugiere cierre cuando sugerencia="CERRAR"
-#   - TRAILING → no cierra, deja correr posiciones ganadoras
-#
-# v2.1 — Agregado trigger nocturno para predictor_shadow_evaluator:
-#   - Corre a las 23:00 Chile, todos los días hábiles
-#   - Genera predicciones de shadow genomes (swap temporal de
-#     champion.json, aislado del trading real) y evalúa las que
-#     ya maduraron contra precio real
-#   - Pieza que faltaba para que predictor_arena.py pueda promover
-#     shadows reales en vez de nunca encontrar candidatos
+# v2.2 — Agregado Code Auditor Agent:
+#   - Corre a las 01:00 Chile, todos los días
+#   - Lee repo completo de GitHub y detecta incoherencias
+#   - Guarda reporte en /data/audits/
 # =========================================================
 
 import os
 import time
 import threading
+import subprocess
 import requests
 from datetime import datetime
 import pytz
@@ -67,6 +59,10 @@ MONITOR_HORA_FIN    = int(os.getenv("MONITOR_HORA_FIN",    "15"))
 # v2.1 — Shadow evaluator nocturno
 HORA_SHADOW_EVAL = int(os.getenv("SHADOW_EVAL_HOUR", "23"))
 MIN_SHADOW_EVAL  = int(os.getenv("SHADOW_EVAL_MIN",  "0"))
+
+# v2.2 — Code Auditor Agent
+HORA_AUDITOR = int(os.getenv("AUDITOR_HOUR", "1"))
+MIN_AUDITOR  = int(os.getenv("AUDITOR_MIN",  "0"))
 
 
 # ══════════════════════════════════════════════════════
@@ -100,9 +96,6 @@ def _trigger_pipeline(motivo: str, close_only: bool = False):
 # ══════════════════════════════════════════════════════
 # MONITOR HORARIO (Yahoo Finance)
 # v2.0 — usa evaluar_posiciones_abiertas() del tracker v3.0
-#   El tracker recibe la lista real de posiciones abiertas.
-#   Solo dispara cierre defensivo cuando sugerencia="CERRAR".
-#   TRAILING → no cierra, deja correr posiciones ganadoras.
 # ══════════════════════════════════════════════════════
 
 def _trigger_monitor(motivo: str):
@@ -111,7 +104,6 @@ def _trigger_monitor(motivo: str):
         from intraday_tracker import evaluar_posiciones_abiertas
         from positions_meta import get_all
 
-        # Obtener tickers de posiciones abiertas reales
         meta    = get_all()
         tickers = list(meta.keys())
 
@@ -123,7 +115,6 @@ def _trigger_monitor(motivo: str):
         n_pos  = len(result)
         print(f"✅ Monitor OK | posiciones={n_pos}")
 
-        # Clasificar sugerencias
         cerrar   = [t for t, s in result.items() if s.get("sugerencia") == "CERRAR"]
         trailing = [t for t, s in result.items() if s.get("sugerencia") == "TRAILING"]
         mantener = [t for t, s in result.items() if s.get("sugerencia") == "MANTENER"]
@@ -132,7 +123,6 @@ def _trigger_monitor(motivo: str):
             print(f"✅ MANTENER: {mantener}")
 
         if trailing:
-            # Posiciones ganadoras divergentes — no cerrar, proteger con trailing
             for t in trailing:
                 pnl = result[t].get("pnl_actual_pct", 0)
                 print(f"🛡 TRAILING {t} | PnL={pnl:.1f}% → no cerrar, dejar correr")
@@ -215,13 +205,6 @@ def _trigger_darwin_evolution(motivo: str):
 
 
 def _trigger_shadow_evaluator(motivo: str):
-    """
-    v2.1 — Genera predicciones de shadow genomes H1-H10 (swap temporal
-    de champion.json, aislado del trading real) y evalúa las que ya
-    maduraron contra precio real. Corre de noche, separado de todos
-    los demás procesos del día, para no interferir con predicciones
-    o trades reales.
-    """
     print(f"🌙 Darwin shadow evaluator [{motivo}]")
     try:
         from darwin_engine.predictor_shadow_evaluator import run_shadow_evolution_cycle
@@ -238,6 +221,35 @@ def _trigger_shadow_evaluator(motivo: str):
             print("⚠️  Shadow evaluator: lock activo, se saltó esta corrida")
     except Exception as e:
         print(f"❌ Shadow evaluator error: {e}")
+
+
+# ══════════════════════════════════════════════════════
+# CODE AUDITOR AGENT (v2.2)
+# ══════════════════════════════════════════════════════
+
+def _trigger_code_auditor(motivo: str):
+    """
+    v2.2 — Ejecuta el agente auditor de código.
+    Lee el repo completo de GitHub y detecta incoherencias.
+    Guarda reporte en /data/audits/.
+    """
+    print(f"🔍 Code Auditor Agent [{motivo}]")
+    try:
+        result = subprocess.run(
+            ["python", "agents/code_auditor_agent.py"],
+            timeout=3600,  # 1 hora máximo
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            print(f"✅ Code Auditor completado")
+            print(result.stdout[-500:])  # últimas 500 chars del output
+        else:
+            print(f"❌ Code Auditor error: {result.stderr[:300]}")
+    except subprocess.TimeoutExpired:
+        print("❌ Code Auditor timeout (1 hora)")
+    except Exception as e:
+        print(f"❌ Code Auditor excepción: {e}")
 
 
 # ══════════════════════════════════════════════════════
@@ -259,6 +271,7 @@ def _en_horario_monitor(ahora: datetime) -> bool:
 def _loop():
     print(
         f"🕐 Quant Scheduler iniciado\n"
+        f"   🔍 AUDITOR:  {HORA_AUDITOR:02d}:{MIN_AUDITOR:02d} Chile (diario)\n"
         f"   🟢 APERTURA: {HORA_APERTURA:02d}:{MIN_APERTURA:02d} Chile\n"
         f"   🔴 CIERRE:   {HORA_CIERRE:02d}:{MIN_CIERRE:02d} Chile\n"
         f"   📡 MONITOR:  {MONITOR_HORA_INICIO:02d}:00-{MONITOR_HORA_FIN:02d}:00 Chile (cada hora)\n"
@@ -272,10 +285,20 @@ def _loop():
     darwin_resolve_hoy:   str | None = None
     darwin_evolution_hoy: str | None = None
     shadow_eval_hoy:      str | None = None
+    auditor_hoy:          str | None = None
 
     while True:
         ahora     = datetime.now(CHILE_TZ)
         fecha_hoy = ahora.strftime("%Y-%m-%d")
+
+        # ── 🔍 Code Auditor: 01:00 diario ─────────────────
+        if (
+            ahora.hour      == HORA_AUDITOR
+            and MIN_AUDITOR <= ahora.minute < MIN_AUDITOR + 10
+            and auditor_hoy != fecha_hoy
+        ):
+            _trigger_code_auditor("diario_01:00")
+            auditor_hoy = fecha_hoy
 
         # ── 🟢 APERTURA: 11:30 — predice + abre + cierra ──
         if (
@@ -305,9 +328,6 @@ def _loop():
             cierre_hoy = fecha_hoy
 
         # ── 📡 MONITOR HORARIO: 12:00-15:00 cada hora ─────
-        # Corre cada hora entre apertura y cierre.
-        # Evalúa posiciones abiertas y cierra solo las que
-        # el tracker sugiere CERRAR (no TRAILING ni MANTENER).
         if (
             _es_dia_habil(ahora)
             and _en_horario_monitor(ahora)
@@ -339,9 +359,6 @@ def _loop():
             darwin_evolution_hoy = fecha_hoy
 
         # ── 🌙 Darwin: shadow evaluator nocturno (v2.1) ────
-        # Todos los días hábiles, después de todos los demás
-        # procesos del día. Ventana de 10 min (vs 5 de los otros)
-        # porque este proceso puede tardar más en completar.
         if (
             _es_dia_habil(ahora)
             and ahora.hour       == HORA_SHADOW_EVAL
@@ -376,3 +393,4 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
+            
