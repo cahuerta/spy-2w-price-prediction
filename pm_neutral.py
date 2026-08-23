@@ -1,5 +1,5 @@
 """
-pm_neutral.py — NEUTRAL POSITION MANAGER v1.3 PRODUCCIÓN
+pm_neutral.py — NEUTRAL POSITION MANAGER v1.4
 
 PM NEUTRAL (equilibrio riesgo / oportunidad)
 
@@ -12,26 +12,24 @@ PM NEUTRAL (equilibrio riesgo / oportunidad)
 
 FIX v1.2:
   [N1] invalid_price → HOLD preventivo en vez de CLOSE
-       Cuando Alpaca no retorna precio (fuera de horario, error transitorio),
-       el PM cerraba la posición inmediatamente causando pérdidas innecesarias.
-       Ahora retorna HOLD y loggea warning — se evaluará en el siguiente ciclo.
-  [N2] entry <= 0 también es HOLD si price > 0 (puede ser error de datos de entrada,
-       no necesariamente una posición inválida real).
+  [N2] entry <= 0 también es HOLD si price > 0
 
 v1.3:
   [C1] _load_price_curve(ticker): lee curva de predicción desde disco
-       /data/predictions/{ticker}/{fecha}.json — sin tracker, sin
-       dependencias externas. Igual patrón que defensive y growth.
-  [C2] evaluate_position(): usa curva DESPUÉS de stops duros y take_profit
-       (prioridad absoluta):
-       - pnl > 0 + slope="baja" → CLOSE "neutral_close_curve_falling"
-         (tomar ganancia antes de caída esperada)
-       - pnl > 0 + slope="sube" → HOLD "hold_curve_recovering"
-         (anula time_exit y confidence_collapse — destino alcista)
-       - Sin curva disponible: comportamiento idéntico a v1.2.
-  [C3] Stops duros (stop_loss, trailing, take_profit): sin cambios,
-       prioridad absoluta sobre curva.
-  [C4] Orchestrator y tracker: sin cambios.
+  [C2] evaluate_position(): usa curva DESPUÉS de stops duros
+  [C3] Stops duros: sin cambios, prioridad absoluta
+  [C4] Orchestrator y tracker: sin cambios
+
+v1.4:
+  [N3] _safe_price(): helper propagado desde pm_defensive v1.8.
+       Lee avg_entry_price / current_price como fallback de
+       entry_price / price_now — Alpaca devuelve estos campos
+       y sin el fallback entry=0 disparaba closes incorrectos.
+  [N4] days_between(): retorna 0 (no MAX_HOLD_DAYS_NEUTRAL) cuando
+       entry_iso está vacío — evita cierres por tiempo en posiciones
+       sin metadata. Lee entry_date con fallback a entry_time.
+  [N5] evaluate_position(): usa _safe_price() y lee entry_date
+       con fallback a entry_time por compatibilidad.
 """
 
 import os
@@ -53,10 +51,10 @@ PRED_DIR  = DATA_PATH / "predictions"
 
 MAX_HOLD_DAYS_NEUTRAL     = int(os.getenv("PM_NEU_MAX_HOLD_DAYS",   "10"))
 MIN_CONFIDENCE_NEUTRAL    = float(os.getenv("PM_NEU_MIN_CONF",      "0.60"))
-STOP_LOSS_NEUTRAL_PCT     = float(os.getenv("PM_NEU_STOP_LOSS",     "0.04"))   # 4%
-TAKE_PROFIT_NEUTRAL_PCT   = float(os.getenv("PM_NEU_TAKE_PROFIT",   "0.07"))   # 7%
-TRAILING_STOP_NEUTRAL_PCT = float(os.getenv("PM_NEU_TRAILING",      "0.02"))   # 2%
-MAX_RISK_PER_TRADE_NEUTRAL= float(os.getenv("PM_NEU_RISK_PER_TRADE","0.005"))  # 0.5%
+STOP_LOSS_NEUTRAL_PCT     = float(os.getenv("PM_NEU_STOP_LOSS",     "0.04"))
+TAKE_PROFIT_NEUTRAL_PCT   = float(os.getenv("PM_NEU_TAKE_PROFIT",   "0.07"))
+TRAILING_STOP_NEUTRAL_PCT = float(os.getenv("PM_NEU_TRAILING",      "0.02"))
+MAX_RISK_PER_TRADE_NEUTRAL= float(os.getenv("PM_NEU_RISK_PER_TRADE","0.005"))
 
 logger = logging.getLogger("pm_neutral")
 logging.basicConfig(
@@ -71,16 +69,46 @@ logging.basicConfig(
 def pct_change(current: float, entry: float) -> float:
     return (current / entry - 1.0) if entry > 0 else 0.0
 
+
+def _safe_price(pos: dict, *keys) -> float:
+    """
+    [N3] Busca el primer campo de precio válido en la posición.
+    Alpaca devuelve avg_entry_price / current_price en vez de
+    entry_price / price_now que usan los PMs internamente.
+    Propagado desde pm_defensive.py v1.8.
+    """
+    for k in keys:
+        val = pos.get(k)
+        if val is not None:
+            try:
+                f = float(val)
+                if f > 0:
+                    return f
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
 def days_between(entry_iso: str) -> int:
+    """
+    [N4] Retorna 0 si entry_iso está vacío o ausente — la posición
+         se trata como nueva, no como expirada.
+         Maneja fechas sin timezone ("YYYY-MM-DD") añadiendo
+         CL_TIMEZONE antes de comparar.
+    """
     try:
-        entry_str = entry_iso.replace("Z", "+00:00")
+        if not entry_iso or not entry_iso.strip():
+            return 0
+        entry_str = entry_iso.strip().replace("Z", "+00:00")
         dt        = datetime.fromisoformat(entry_str)
+        if dt.tzinfo is None:
+            dt = CL_TIMEZONE.localize(dt)
         now_cl    = datetime.now(CL_TIMEZONE)
         entry_cl  = dt.astimezone(CL_TIMEZONE)
         return max(0, (now_cl - entry_cl).days)
     except Exception as e:
         logger.warning(f"Error days_between '{entry_iso}': {e}")
-        return MAX_HOLD_DAYS_NEUTRAL
+        return 0
 
 
 # =================================================================
@@ -112,7 +140,6 @@ def _load_price_curve(ticker: str) -> Optional[Dict]:
         if not path or len(path) < 2:
             return None
 
-        # Slope: tendencia general de la curva completa
         mid       = max(1, len(path) // 2)
         avg_first = sum(path[:mid]) / mid
         avg_last  = sum(path[mid:]) / max(1, len(path) - mid)
@@ -125,7 +152,6 @@ def _load_price_curve(ticker: str) -> Optional[Dict]:
         else:
             slope = "plana"
 
-        # Peak y retornos esperados
         idx_peak     = int(max(range(len(path)), key=lambda i: path[i]))
         precio_peak  = float(path[idx_peak])
         precio_final = float(path[-1])
@@ -133,7 +159,6 @@ def _load_price_curve(ticker: str) -> Optional[Dict]:
         ret_a_peak  = round((precio_peak  / price_now - 1) * 100, 2) if price_now > 0 else None
         ret_a_final = round((precio_final / price_now - 1) * 100, 2) if price_now > 0 else None
 
-        # En zona de valle: precio actual bajo lower_band día 1
         en_zona_valle = False
         if lower_band and len(lower_band) > 0 and price_now > 0:
             en_zona_valle = price_now < float(lower_band[0])
@@ -159,7 +184,7 @@ def _load_price_curve(ticker: str) -> Optional[Dict]:
 
 @dataclass
 class NeutralDecision:
-    action:    str        # "OPEN" | "CLOSE" | "HOLD"
+    action:    str
     ticker:    str
     reason:    str
     timestamp: str
@@ -181,21 +206,22 @@ class PMNeutral:
 
     def __init__(self):
         self.tz = CL_TIMEZONE
-        logger.info("🟡 PMNeutral v1.3 inicializado – MODO BALANCEADO")
+        logger.info("🟡 PMNeutral v1.4 inicializado – MODO BALANCEADO")
 
-    # --------------------------------------------------
-    # EVALUAR POSICIÓN EXISTENTE
-    # --------------------------------------------------
     def evaluate_position(self, pos: Dict[str, Any]) -> NeutralDecision:
-
+        """
+        [N5] Usa _safe_price() para leer precios con fallback a campos
+             de Alpaca (avg_entry_price / current_price).
+             Lee entry_date con fallback a entry_time.
+        """
         ticker = str(pos.get("ticker", "UNKNOWN")).upper()
 
         try:
-            entry      = float(pos.get("entry_price", 0))
-            price      = float(pos.get("price_now", 0))
-            peak       = float(pos.get("peak_price", entry))
-            entry_time = str(pos.get("entry_time", ""))
-            confidence = float(pos.get("confidence", 0))
+            entry      = _safe_price(pos, "entry_price", "avg_entry_price")
+            price      = _safe_price(pos, "price_now", "current_price")
+            peak       = _safe_price(pos, "peak_price") or entry
+            entry_time = str(pos.get("entry_date") or pos.get("entry_time") or "")
+            confidence = float(pos.get("confidence", 0) or 0)
         except (ValueError, TypeError) as e:
             logger.error(f"Posición inválida {ticker}: {e}")
             return NeutralDecision(
@@ -207,8 +233,7 @@ class PMNeutral:
         # [N1] Precio inválido → HOLD PREVENTIVO
         if price <= 0:
             logger.warning(
-                f"⚠️ {ticker}: price_now={price} inválido → HOLD preventivo "
-                f"(se evaluará en próximo ciclo)"
+                f"⚠️ {ticker}: price_now={price} inválido → HOLD preventivo"
             )
             return NeutralDecision(
                 "HOLD", ticker, "invalid_price_hold",
@@ -230,11 +255,6 @@ class PMNeutral:
         ret      = pct_change(price, entry)
         pnl      = round(ret * 100, 2)
         age_days = days_between(entry_time)
-
-        logger.debug(
-            f"{ticker}: ret={ret:.1%} peak={pct_change(peak,entry):.1%} "
-            f"conf={confidence:.2f} age={age_days}d"
-        )
 
         # 1️⃣ STOP LOSS DURO — prioridad absoluta
         if price <= entry * (1 - STOP_LOSS_NEUTRAL_PCT):
@@ -266,8 +286,6 @@ class PMNeutral:
             )
 
         # ── [C2] Curva desde disco — después de stops duros ────────────────
-        # Si no hay curva: comportamiento idéntico a v1.2.
-        # ───────────────────────────────────────────────────────────────────
         curva = _load_price_curve(ticker)
 
         if curva:
@@ -277,11 +295,9 @@ class PMNeutral:
             ret_a_final   = curva.get("ret_desde_hoy_a_final_pct")
             dias_peak     = curva.get("dias_hasta_peak")
 
-            # PnL positivo + curva cae → cerrar tomando ganancia
             if pnl > 0 and slope == "baja":
                 logger.info(
-                    f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva cae "
-                    f"(ret_final={ret_a_final}%) → tomar ganancia"
+                    f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva cae → tomar ganancia"
                 )
                 return NeutralDecision(
                     "CLOSE", ticker, "neutral_close_curve_falling",
@@ -296,11 +312,9 @@ class PMNeutral:
                     }
                 )
 
-            # PnL positivo + curva sube → no aplicar time_exit ni confidence
             if pnl > 0 and slope == "sube":
                 logger.info(
-                    f"📈 {ticker} HOLD | PnL={pnl:.1f}% curva sube "
-                    f"(ret_peak={ret_a_peak}% en {dias_peak}d) → mantener"
+                    f"📈 {ticker} HOLD | PnL={pnl:.1f}% curva sube → mantener"
                 )
                 return NeutralDecision(
                     "HOLD", ticker, "hold_curve_recovering",
@@ -332,7 +346,7 @@ class PMNeutral:
                 {"current_conf": confidence, "min_conf": MIN_CONFIDENCE_NEUTRAL}
             )
 
-        # 6️⃣ HOLD — agrega contexto de curva si disponible
+        # 6️⃣ HOLD
         hold_meta = {
             "ret_pct":        pnl,
             "days_held":      age_days,
@@ -352,9 +366,6 @@ class PMNeutral:
             hold_meta,
         )
 
-    # --------------------------------------------------
-    # EVALUAR NUEVA SEÑAL
-    # --------------------------------------------------
     def evaluate_signal(self, signal: Dict[str, Any]) -> NeutralDecision:
         ticker     = str(signal.get("ticker", "UNKNOWN")).upper()
         confidence = float(signal.get("confidence", 0))
@@ -383,9 +394,6 @@ class PMNeutral:
             }
         )
 
-    # --------------------------------------------------
-    # PORTFOLIO COMPLETO
-    # --------------------------------------------------
     def evaluate_portfolio(self, positions: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not positions:
             return {
@@ -414,7 +422,7 @@ class PMNeutral:
 
         close_pct = round((closes / len(positions)) * 100, 1) if positions else 0
         logger.info(
-            f"📊 Neutral v1.3 eval: {len(positions)} pos, {closes} closes ({close_pct}%), "
+            f"📊 Neutral v1.4 eval: {len(positions)} pos, {closes} closes ({close_pct}%), "
             f"{holds_preventive} holds preventivos"
         )
 
@@ -445,33 +453,33 @@ if __name__ == "__main__":
     pm = PMNeutral()
 
     test_positions = [
-        {   # [N1] Precio 0 → debe retornar HOLD, no CLOSE
-            "ticker":      "AMAT",
-            "entry_price": 150.0,
-            "price_now":   0,
-            "peak_price":  155.0,
-            "entry_time":  "2026-01-10T00:00:00Z",
-            "confidence":  0.65,
+        {   # [N1] Precio 0 → debe retornar HOLD
+            "ticker":          "AMAT",
+            "avg_entry_price": 150.0,
+            "current_price":   0,
+            "peak_price":      155.0,
+            "entry_date":      "2026-01-10",
+            "confidence":      0.65,
         },
         {   # Stop loss normal
-            "ticker":      "AAPL",
-            "entry_price": 150.0,
-            "price_now":   144.0,    # -4% → CLOSE
-            "peak_price":  155.0,
-            "entry_time":  "2026-01-01T00:00:00Z",
-            "confidence":  0.65,
+            "ticker":          "AAPL",
+            "avg_entry_price": 150.0,
+            "current_price":   144.0,
+            "peak_price":      155.0,
+            "entry_date":      "2026-01-01",
+            "confidence":      0.65,
         },
         {   # Hold normal
-            "ticker":      "MSFT",
-            "entry_price": 300.0,
-            "price_now":   315.0,    # +5% → HOLD
-            "peak_price":  320.0,
-            "entry_time":  "2026-01-10T00:00:00Z",
-            "confidence":  0.70,
+            "ticker":          "MSFT",
+            "avg_entry_price": 300.0,
+            "current_price":   315.0,
+            "peak_price":      320.0,
+            "entry_date":      "2026-01-10",
+            "confidence":      0.70,
         },
     ]
 
-    print("🧪 PMNeutral v1.3 SELF TEST:")
+    print("🧪 PMNeutral v1.4 SELF TEST:")
     result = pm.evaluate_portfolio(test_positions)
     print(json.dumps(result, indent=2))
 
@@ -480,4 +488,4 @@ if __name__ == "__main__":
     assert amat["action"] == "HOLD",  f"❌ AMAT debería ser HOLD, es {amat['action']}"
     assert aapl["action"] == "CLOSE", f"❌ AAPL debería ser CLOSE, es {aapl['action']}"
 
-    print("\n✅ PMNeutral v1.3 – TEST OK – curva desde disco integrada, retrocompatibilidad v1.2 confirmada")
+    print("\n✅ PMNeutral v1.4 – TEST OK")
