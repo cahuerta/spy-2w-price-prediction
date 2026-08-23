@@ -71,7 +71,7 @@ DIVERGING_THRESHOLD = float(os.getenv("INTRADAY_DIVERGING",       "0.970"))
 DIVERGING_STD_MULT = float(os.getenv("INTRADAY_DIVERGING_STD_MULT", "2.0"))
 
 # PnL mínimo para proteger con trailing en vez de cerrar directo
-TRAILING_PNL_THRESHOLD = float(os.getenv("INTRADAY_TRAILING_PNL", "0.10"))  # 10%
+TRAILING_PNL_THRESHOLD = float(os.getenv("INTRADAY_TRAILING_PNL", "0.02"))  # 2%
 # Caída desde máximo para activar trailing stop
 TRAILING_DROP_PCT      = float(os.getenv("INTRADAY_TRAILING_DROP", "0.05"))  # 5%
 
@@ -530,9 +530,8 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
                 f"trailing stop, no cerrar directo"
             )
         elif pnl > 0:
-            sugerencia   = "CERRAR"
-            razon_cierre = (
-                f"diverging + PnL={pnl:.1f}% positivo pequeño → cerrar para proteger"
+            sugerencia   = "TRAILING"
+            razon_cierre = f"diverging + PnL={pnl:.1f}% positivo → trailing, no cerrar"
             )
         else:
             sugerencia   = "CERRAR"
