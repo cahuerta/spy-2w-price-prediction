@@ -1,6 +1,18 @@
 # =========================================================
-# trading_orchestrator.py — v4.6 TRACKER-PM INTEGRATION
+# trading_orchestrator.py — v4.7 TRACKER-PM INTEGRATION + FIX AUDITORIA P1
 # =========================================================
+# v4.7:
+#   [AUD-P1] Fix Problema 1 de auditoría (fallos de registro de trades
+#            silenciados en Darwin):
+#     - register_open/register_close ya no solo loguean warning al
+#       fallar: ahora es logger.error + persistencia en
+#       /data/darwin/tracking_failures.json vía _record_tracking_failure()
+#     - Nueva reconciliación diaria al inicio de run(): compara tickers
+#       con posiciones reales en el broker contra los trades abiertos
+#       hoy en darwin/trades/*.json. Si difieren, logger.error con el
+#       detalle. Es un chequeo informativo — no bloquea ejecución ni
+#       actúa como circuit breaker nuevo.
+#
 # v4.6:
 #   Refactor arquitectural del flujo intraday:
 #   - El tracker ya NO corre con universo propio.
@@ -54,6 +66,12 @@ SOD_FILE = DATA_PATH / "circuit_breaker_sod.json"
 # Umbral de drawdown diario para activar el breaker (default 5%)
 CIRCUIT_BREAKER_DD_PCT = float(os.getenv("CIRCUIT_BREAKER_DD_PCT", "0.05"))
 
+# [AUD-P1] Archivo de fallos de tracking Darwin (open/close no registrados)
+TRACKING_FAILURES_FILE = DATA_PATH / "darwin" / "tracking_failures.json"
+
+# [AUD-P1] Directorio de trades registrados por Darwin (para reconciliación)
+DARWIN_TRADES_DIR = DATA_PATH / "darwin" / "trades"
+
 
 def _load_active_genome_ids() -> tuple:
     try:
@@ -65,6 +83,99 @@ def _load_active_genome_ids() -> tuple:
     except Exception as e:
         logger.warning(f"⚠️ No se pudo leer champion.json: {e} → usando defaults")
     return "executor_v1", "predictor_v1"
+
+
+def _record_tracking_failure(kind: str, ticker: str, error: str) -> None:
+    """
+    [AUD-P1] Persiste un fallo de registro de trade en Darwin (open o close)
+    que antes solo se perdía en un logger.warning. Sin este registro, un
+    trade real ejecutado en el broker queda invisible para el fitness/
+    performance de Darwin, sesgando el reporte de rentabilidad al alza.
+
+    No lanza excepción hacia arriba: un fallo al escribir el propio
+    registro de fallos no debe interrumpir la ejecución de trading.
+    """
+    try:
+        TRACKING_FAILURES_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        existing: List[Dict[str, Any]] = []
+        if TRACKING_FAILURES_FILE.exists():
+            try:
+                existing = json.loads(TRACKING_FAILURES_FILE.read_text())
+                if not isinstance(existing, list):
+                    existing = []
+            except Exception:
+                existing = []
+
+        existing.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "kind":      kind,       # "open" | "close"
+            "ticker":    ticker,
+            "error":     error,
+        })
+
+        tmp = TRACKING_FAILURES_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(existing, indent=2))
+        tmp.replace(TRACKING_FAILURES_FILE)
+    except Exception as e:
+        logger.error(f"❌ No se pudo persistir tracking failure ({kind}/{ticker}): {e}")
+
+
+def _reconcile_broker_vs_darwin(broker_tickers: set) -> None:
+    """
+    [AUD-P1] Reconciliación diaria: compara los tickers con posición real
+    en el broker (hoy) contra los tickers que aparecen en los trades
+    abiertos registrados por Darwin hoy (darwin/trades/*.json).
+
+    Chequeo informativo — no bloquea el ciclo ni actúa como circuit
+    breaker. Su único objetivo es hacer visible, vía logger.error, la
+    divergencia entre "lo que el broker realmente sostiene" y "lo que
+    Darwin cree que sostiene", que es la causa raíz sospechada del
+    Problema 1 de la auditoría (P&L de Darwin positivo mientras la
+    cuenta real cae).
+    """
+    try:
+        if not DARWIN_TRADES_DIR.exists():
+            logger.warning(f"⚠️ Reconciliación omitida: {DARWIN_TRADES_DIR} no existe")
+            return
+
+        today_str = date.today().isoformat()
+        darwin_open_tickers = set()
+
+        for trade_file in DARWIN_TRADES_DIR.glob("*.json"):
+            try:
+                trade = json.loads(trade_file.read_text())
+            except Exception:
+                continue
+
+            opened_at = str(trade.get("opened_at", ""))
+            closed_at = trade.get("closed_at")
+
+            # Trade abierto hoy y aún sin cerrar → debería reflejarse en el broker
+            if opened_at.startswith(today_str) and not closed_at:
+                ticker = str(trade.get("ticker", "")).upper()
+                if ticker:
+                    darwin_open_tickers.add(ticker)
+
+        broker_tickers_upper = {t.upper() for t in broker_tickers}
+
+        missing_in_darwin = broker_tickers_upper - darwin_open_tickers
+        missing_in_broker = darwin_open_tickers - broker_tickers_upper
+
+        if missing_in_darwin or missing_in_broker:
+            logger.error(
+                f"🚨 RECONCILIACIÓN BROKER↔DARWIN DIVERGE | "
+                f"en_broker_no_en_darwin={sorted(missing_in_darwin)} | "
+                f"en_darwin_no_en_broker={sorted(missing_in_broker)} | "
+                f"posible fuga de capital no capturada por darwin/trades/*.json"
+            )
+        else:
+            logger.info(
+                f"✅ Reconciliación broker↔Darwin OK | "
+                f"{len(broker_tickers_upper)} posiciones coinciden"
+            )
+    except Exception as e:
+        logger.warning(f"⚠️ Reconciliación broker↔Darwin falló: {e}")
 
 
 class TradingOrchestrator:
@@ -83,7 +194,7 @@ class TradingOrchestrator:
         self.alpha_kill        = float(os.getenv("ALPHA_KILL",      "-0.40"))
 
         self.governor = None
-        logger.info(f"🚀 v4.6 TRACKER-PM INTEGRATION | fallback capital ${self._fallback_capital:,.0f}")
+        logger.info(f"🚀 v4.7 TRACKER-PM + FIX AUDITORIA P1 | fallback capital ${self._fallback_capital:,.0f}")
 
     # =========================================================
     # CAPITAL
@@ -383,7 +494,7 @@ class TradingOrchestrator:
                 logger.warning(f"⚠️ cancel_orders {ticker}: {e}")
 
     # =========================================================
-    # RUN PRINCIPAL v4.6
+    # RUN PRINCIPAL v4.7
     # =========================================================
     async def run(
         self,
@@ -393,7 +504,7 @@ class TradingOrchestrator:
     ) -> Dict:
 
         self.governor = await self._refresh_governor()
-        logger.info(f"🚀 v4.6 TRACKER-PM INTEGRATION | Capital ${self.fixed_capital:,.0f}")
+        logger.info(f"🚀 v4.7 TRACKER-PM + FIX AUDITORIA P1 | Capital ${self.fixed_capital:,.0f}")
 
         anchor_tickers = self._load_anchor_tickers()
 
@@ -455,6 +566,10 @@ class TradingOrchestrator:
         disk_tickers        = {p["ticker"].upper() for p in broker_positions}
         real_positions      = broker_real_tickers | disk_tickers
         portfolio_tickers   = real_positions
+
+        # [AUD-P1] Reconciliación diaria broker↔Darwin — informativa, no bloquea.
+        if DARWIN_TRACKING:
+            _reconcile_broker_vs_darwin(broker_real_tickers)
 
         logger.info(
             f"📊 Portfolio | broker={len(broker_real_tickers)} "
@@ -602,7 +717,12 @@ class TradingOrchestrator:
                                 alpha_score = alpha_at_close,
                             )
                         except Exception as _te:
-                            logger.warning(f"⚠️ darwin close {order['ticker']}: {_te}")
+                            # [AUD-P1] Antes: solo logger.warning, el fallo se perdía.
+                            # Un cierre real que no se registra en Darwin deja el
+                            # trade "abierto" para el fitness aunque ya no exista
+                            # en el broker — sesga el cálculo de performance.
+                            logger.error(f"❌ DARWIN CLOSE FALLÓ {order['ticker']}: {_te}")
+                            _record_tracking_failure("close", order["ticker"], str(_te))
 
                     try:
                         from positions_meta import remove_entry
@@ -800,7 +920,13 @@ class TradingOrchestrator:
                             f"entrada=${order.get('entry_price', 0):.2f}"
                         )
                     except Exception as _te:
-                        logger.warning(f"⚠️ darwin open {order['ticker']}: {_te}")
+                        # [AUD-P1] Antes: solo logger.warning, el fallo se perdía.
+                        # Un open real que no se registra en Darwin queda
+                        # totalmente invisible para pnl_fitness.py: si ese
+                        # trade termina en pérdida, nunca entra al cálculo de
+                        # fitness ni al performance report.
+                        logger.error(f"❌ DARWIN OPEN FALLÓ {order['ticker']}: {_te}")
+                        _record_tracking_failure("open", order["ticker"], str(_te))
 
                 if result.get("status") == "executed":
                     try:
