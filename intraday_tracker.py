@@ -532,7 +532,7 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         elif pnl > 0:
             sugerencia   = "TRAILING"
             razon_cierre = f"diverging + PnL={pnl:.1f}% positivo → trailing, no cerrar"
-            )
+            
         else:
             sugerencia   = "CERRAR"
             razon_cierre = (
