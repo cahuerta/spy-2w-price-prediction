@@ -1,5 +1,5 @@
 # =========================================================
-# pm_growth.py — GROWTH POSITION MANAGER v2.7.0
+# pm_growth.py — GROWTH POSITION MANAGER v2.8.0
 # =========================================================
 # ✔ PM GROWTH PURO (market_mode == growth)
 # ✔ Decision engine (NO ejecuta órdenes)
@@ -32,6 +32,17 @@
 #   [C3] Stops duros (trailing, stop_loss, take_profit): sin cambios,
 #        prioridad absoluta sobre curva.
 #   [C4] Orchestrator y tracker: sin cambios.
+#
+# v2.8.0:
+#   [G2] _safe_price(): helper propagado desde pm_defensive v1.8.
+#        Lee avg_entry_price / current_price como fallback de
+#        entry_price / price_now — Alpaca devuelve estos campos
+#        y sin el fallback entry=0 disparaba closes incorrectos.
+#   [G3] days_between(): fallback entry_date → entry_time, y
+#        retorna 0 (no MAX_HOLD_DAYS) cuando la fecha está vacía
+#        — evita cierres por time_decay en posiciones sin metadata.
+#   [G4] evaluate_position(): usa _safe_price() y lee entry_date
+#        con fallback a entry_time por compatibilidad.
 # =========================================================
 
 import os
@@ -90,12 +101,45 @@ class PortfolioHealth(Enum):
 def pct_change(current: float, entry: float) -> float:
     return (current / entry - 1.0) if entry > 0 else 0.0
 
+
+def _safe_price(pos: dict, *keys) -> float:
+    """
+    [G2] Busca el primer campo de precio válido en la posición.
+    Alpaca devuelve avg_entry_price / current_price en vez de
+    entry_price / price_now que usan los PMs internamente.
+    Propagado desde pm_defensive.py v1.8.
+    """
+    for k in keys:
+        val = pos.get(k)
+        if val is not None:
+            try:
+                f = float(val)
+                if f > 0:
+                    return f
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
 def days_between(entry_iso: str) -> int:
+    """
+    [G3] Retorna 0 si entry_iso está vacío o ausente — la posición
+         se trata como nueva, no como expirada.
+         Maneja fechas sin timezone ("YYYY-MM-DD") añadiendo
+         CL_TIMEZONE antes de comparar.
+         Lee entry_date con fallback a entry_time por compatibilidad.
+    """
     try:
-        dt = datetime.fromisoformat(entry_iso.replace("Z", "+00:00"))
-        return (datetime.now(CL_TIMEZONE) - dt.astimezone(CL_TIMEZONE)).days
+        if not entry_iso or not entry_iso.strip():
+            return 0
+        entry_str = entry_iso.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(entry_str)
+        if dt.tzinfo is None:
+            dt = CL_TIMEZONE.localize(dt)
+        return max(0, (datetime.now(CL_TIMEZONE) - dt.astimezone(CL_TIMEZONE)).days)
     except Exception:
-        return MAX_HOLD_DAYS
+        return 0
+
 
 def calculate_position_size(
     risk_amount: float, entry_price: float, stop_price: float
@@ -138,7 +182,6 @@ def _load_price_curve(ticker: str) -> Optional[Dict]:
         if not path or len(path) < 2:
             return None
 
-        # Slope: tendencia general de la curva completa
         mid       = max(1, len(path) // 2)
         avg_first = sum(path[:mid]) / mid
         avg_last  = sum(path[mid:]) / max(1, len(path) - mid)
@@ -151,7 +194,6 @@ def _load_price_curve(ticker: str) -> Optional[Dict]:
         else:
             slope = "plana"
 
-        # Peak y retornos esperados
         idx_peak     = int(max(range(len(path)), key=lambda i: path[i]))
         precio_peak  = float(path[idx_peak])
         precio_final = float(path[-1])
@@ -159,7 +201,6 @@ def _load_price_curve(ticker: str) -> Optional[Dict]:
         ret_a_peak  = round((precio_peak  / price_now - 1) * 100, 2) if price_now > 0 else None
         ret_a_final = round((precio_final / price_now - 1) * 100, 2) if price_now > 0 else None
 
-        # En zona de valle: precio actual bajo lower_band día 1
         en_zona_valle = False
         if lower_band and len(lower_band) > 0 and price_now > 0:
             en_zona_valle = price_now < float(lower_band[0])
@@ -192,17 +233,11 @@ class PMGrowth:
         self.fixed_capital = fixed_capital
         self.tz = CL_TIMEZONE
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
-        logger.info("📈 PMGrowth v2.7.0 inicializado")
+        logger.info("📈 PMGrowth v2.8.0 inicializado")
 
-    # --------------------------------------------------
-    # CAPABILITIES
-    # --------------------------------------------------
     def allow_new_positions(self) -> bool:
         return True
 
-    # --------------------------------------------------
-    # FUNDAMENTAL CONTEXT (CACHE 1h)
-    # --------------------------------------------------
     def _get_fundamental_context(self, ticker: str) -> Dict[str, Any]:
         now = time.time()
         key = ticker.upper()
@@ -240,30 +275,21 @@ class PMGrowth:
         except Exception:
             return {"usable": False}
 
-    # --------------------------------------------------
-    # POSITION EVALUATION
-    # --------------------------------------------------
     def evaluate_position(
         self,
         pos:    Dict[str, Any],
         signal: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Evalúa posición existente.
-        Signal es preferible pero no bloquea stops de emergencia.
-
-        [G1] Si signal=None: evalúa trailing_stop y stop_loss de
-             emergencia antes de hacer HOLD — evita posiciones
-             huérfanas cuando el predictor falla.
-
-        [C2] Curva leída desde disco. Se aplica DESPUÉS de stops
-             duros — estos tienen prioridad absoluta siempre.
+        [G4] Usa _safe_price() para leer precios con fallback a campos
+             de Alpaca (avg_entry_price / current_price).
+             Lee entry_date con fallback a entry_time.
         """
         ticker = str(pos.get("ticker", "")).upper()
-        entry  = float(pos.get("entry_price", 0))
-        price  = float(pos.get("price_now", 0))
-        peak   = float(pos.get("peak_price", entry))
-        age    = days_between(str(pos.get("entry_time", "")))
+        entry  = _safe_price(pos, "entry_price", "avg_entry_price")
+        price  = _safe_price(pos, "price_now", "current_price")
+        peak   = _safe_price(pos, "peak_price") or entry
+        age    = days_between(str(pos.get("entry_date") or pos.get("entry_time") or ""))
 
         fundamental = self._get_fundamental_context(ticker)
 
@@ -320,8 +346,6 @@ class PMGrowth:
             return self._decision("CLOSE", ticker, "take_profit", fundamental)
 
         # ── [C2] Curva desde disco — después de stops duros ────────────────
-        # Si no hay curva: comportamiento idéntico a v2.6.4.
-        # ───────────────────────────────────────────────────────────────────
         curva = _load_price_curve(ticker)
 
         if curva:
@@ -331,7 +355,6 @@ class PMGrowth:
             ret_a_final   = curva.get("ret_desde_hoy_a_final_pct")
             dias_peak     = curva.get("dias_hasta_peak")
 
-            # PnL positivo + curva cae → cerrar tomando ganancia
             if pnl > 0 and slope == "baja":
                 logger.info(
                     f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva cae "
@@ -349,7 +372,6 @@ class PMGrowth:
                     },
                 )
 
-            # PnL positivo + curva sube → no aplicar time_decay ni confidence_decay
             if pnl > 0 and slope == "sube":
                 logger.info(
                     f"📈 {ticker} HOLD | PnL={pnl:.1f}% curva sube "
@@ -380,7 +402,7 @@ class PMGrowth:
         if price > peak:
             pos["peak_price"] = price
 
-        # ---- HOLD — agrega contexto de curva si disponible ----
+        # ---- HOLD ----
         hold_extra = {
             "ret_pct":    pnl,
             "days":       age,
@@ -394,9 +416,6 @@ class PMGrowth:
 
         return self._decision("HOLD", ticker, "healthy", fundamental, hold_extra)
 
-    # --------------------------------------------------
-    # ROTATION (GROWTH ONLY)
-    # --------------------------------------------------
     def evaluate_rotation(
         self,
         open_positions: List[Dict[str, Any]],
@@ -436,9 +455,6 @@ class PMGrowth:
             },
         }
 
-    # --------------------------------------------------
-    # NEW POSITION SIZING
-    # --------------------------------------------------
     def calculate_new_position(
         self,
         ticker:      str,
@@ -448,7 +464,6 @@ class PMGrowth:
 
         risk_amount = self.fixed_capital * MAX_RISK_PER_TRADE_PCT
         stop_price  = stop_price or (entry_price * (1 - STOP_LOSS_PCT))
-
         shares = calculate_position_size(risk_amount, entry_price, stop_price)
 
         return {
@@ -459,9 +474,6 @@ class PMGrowth:
             "stop_price":  round(stop_price, 2),
         }
 
-    # --------------------------------------------------
-    # DECISION BUILDER
-    # --------------------------------------------------
     def _decision(
         self,
         action:      str,
@@ -490,11 +502,11 @@ if __name__ == "__main__":
     pm = PMGrowth()
 
     pos = {
-        "ticker":      "AAPL",
-        "entry_price": 150.0,
-        "price_now":   155.0,
-        "peak_price":  158.0,
-        "entry_time":  "2026-01-01T00:00:00Z",
+        "ticker":          "AAPL",
+        "avg_entry_price": 150.0,   # [G2] campo de Alpaca
+        "current_price":   155.0,   # [G2] campo de Alpaca
+        "peak_price":      158.0,
+        "entry_date":      "2026-01-01",  # [G3] entry_date
     }
     signal = {"confidence": 0.65}
 
@@ -502,11 +514,11 @@ if __name__ == "__main__":
     print("🧪 Sin signal (healthy):", pm.evaluate_position(pos, None))
 
     pos_down = {
-        "ticker":      "AAPL",
-        "entry_price": 150.0,
-        "price_now":   141.0,  # -6% → stop loss
-        "peak_price":  155.0,
-        "entry_time":  "2026-01-01T00:00:00Z",
+        "ticker":          "AAPL",
+        "avg_entry_price": 150.0,
+        "current_price":   141.0,
+        "peak_price":      155.0,
+        "entry_date":      "2026-01-01",
     }
     print("🧪 Sin signal (stop loss):", pm.evaluate_position(pos_down, None))
-    print("✅ PMGrowth v2.7.0 READY")
+    print("✅ PMGrowth v2.8.0 READY")
