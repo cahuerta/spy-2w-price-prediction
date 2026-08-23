@@ -99,6 +99,7 @@ class PureDecisionInput(BaseModel):
     ticker: str
     shares: Optional[int] = 0
     reason: Optional[str] = None
+    close_ticker: Optional[str] = None
     meta: Optional[Dict] = None
 
 
