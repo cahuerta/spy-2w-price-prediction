@@ -476,7 +476,8 @@ class TradingOrchestrator:
         # [IT5] Orden correcto: PM → Tracker → CG → Broker
         # =========================================================
         pm_decisions = await self._get_pm_decisions(
-            mode, positions, signals or {}, anchor_universe
+            mode, positions, signals or {}, anchor_universe,
+            alpha_map=alpha_map,
         )
 
         closes = []
@@ -922,13 +923,25 @@ class TradingOrchestrator:
         positions: List[Dict],
         signals: Dict,
         anchor: List,
+        alpha_map: Dict = None,
     ) -> List[Dict]:
         decisions = []
         try:
             if mode == "growth":
                 pm = PMGrowth(self.fixed_capital)
                 for pos in positions:
-                    d = pm.evaluate_position(pos, signals.get(pos["ticker"]))
+                    ticker = pos.get("ticker", "").upper()
+                    # [FIX v4.7] signals siempre llegaba vacío desde run().
+                    # PMGrowth.evaluate_position() quedaba con signal=None
+                    # en todas las posiciones → stops de emergencia sin
+                    # contexto real. Ahora construimos signal desde alpha_map.
+                    alpha_entry = (alpha_map or {}).get(ticker, {})
+                    signal = {
+                        "confidence":  alpha_entry.get("confidence", 0.0),
+                        "direction":   alpha_entry.get("direction", ""),
+                        "alpha_score": alpha_entry.get("alpha_score", 0.0),
+                    } if alpha_entry else None
+                    d = pm.evaluate_position(pos, signal)
                     if isinstance(d, dict):
                         decisions.append(d)
             elif mode == "defensive":
