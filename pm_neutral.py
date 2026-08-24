@@ -1,5 +1,5 @@
 """
-pm_neutral.py — NEUTRAL POSITION MANAGER v1.4
+pm_neutral.py — NEUTRAL POSITION MANAGER v1.5
 
 PM NEUTRAL (equilibrio riesgo / oportunidad)
 
@@ -30,6 +30,14 @@ v1.4:
        sin metadata. Lee entry_date con fallback a entry_time.
   [N5] evaluate_position(): usa _safe_price() y lee entry_date
        con fallback a entry_time por compatibilidad.
+
+v1.5:
+  [AUD-P3] FIX asimetría "corta ganadores, deja correr perdedores":
+       antes la curva solo actuaba con pnl > 0. Ahora, si pnl < 0,
+       slope == "baja" (curva confirma la caída) y la pérdida aún
+       es moderada (abs(pnl) < NEUTRAL_CURVE_LOSS_CUT_PCT, 50% del
+       stop duro de 4% → 2%), se cierra antes de esperar el
+       stop_loss_neutral completo.
 """
 
 import os
@@ -55,6 +63,10 @@ STOP_LOSS_NEUTRAL_PCT     = float(os.getenv("PM_NEU_STOP_LOSS",     "0.04"))
 TAKE_PROFIT_NEUTRAL_PCT   = float(os.getenv("PM_NEU_TAKE_PROFIT",   "0.07"))
 TRAILING_STOP_NEUTRAL_PCT = float(os.getenv("PM_NEU_TRAILING",      "0.02"))
 MAX_RISK_PER_TRADE_NEUTRAL= float(os.getenv("PM_NEU_RISK_PER_TRADE","0.005"))
+
+# [AUD-P3] Umbral de pérdida moderada para el corte simétrico por curva.
+# 2% = 50% del stop duro (4%) — confirmado con el usuario.
+NEUTRAL_CURVE_LOSS_CUT_PCT = float(os.getenv("PM_NEU_CURVE_LOSS_CUT", "0.02"))
 
 logger = logging.getLogger("pm_neutral")
 logging.basicConfig(
@@ -206,7 +218,7 @@ class PMNeutral:
 
     def __init__(self):
         self.tz = CL_TIMEZONE
-        logger.info("🟡 PMNeutral v1.4 inicializado – MODO BALANCEADO")
+        logger.info("🟡 PMNeutral v1.5 inicializado – MODO BALANCEADO")
 
     def evaluate_position(self, pos: Dict[str, Any]) -> NeutralDecision:
         """
@@ -285,7 +297,7 @@ class PMNeutral:
                 {"ret_pct": pnl, "trigger_pct": TAKE_PROFIT_NEUTRAL_PCT}
             )
 
-        # ── [C2] Curva desde disco — después de stops duros ────────────────
+        # ── [C2][AUD-P3] Curva desde disco — después de stops duros ────────
         curva = _load_price_curve(ticker)
 
         if curva:
@@ -327,6 +339,28 @@ class PMNeutral:
                         "days_held":       age_days,
                         "confidence":      confidence,
                         "en_zona_valle":   en_zona_valle,
+                    }
+                )
+
+            # [AUD-P3] Rama simétrica: curva confirma caída y ya estamos en
+            # pérdida moderada (< 2%, 50% del stop duro de 4%) → cortar
+            # antes de esperar el stop_loss_neutral completo.
+            if pnl < 0 and slope == "baja" and abs(pnl) < NEUTRAL_CURVE_LOSS_CUT_PCT * 100:
+                logger.info(
+                    f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva confirma caída "
+                    f"(ret_final={ret_a_final}%) → cortar pérdida moderada antes del stop duro"
+                )
+                return NeutralDecision(
+                    "CLOSE", ticker, "neutral_close_curve_confirms_down",
+                    datetime.now(self.tz).isoformat(),
+                    {
+                        "ret_pct":         pnl,
+                        "slope_futura":    slope,
+                        "ret_a_final_pct": ret_a_final,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age_days,
+                        "en_zona_valle":   en_zona_valle,
+                        "loss_cut_threshold_pct": -NEUTRAL_CURVE_LOSS_CUT_PCT * 100,
                     }
                 )
 
@@ -422,7 +456,7 @@ class PMNeutral:
 
         close_pct = round((closes / len(positions)) * 100, 1) if positions else 0
         logger.info(
-            f"📊 Neutral v1.4 eval: {len(positions)} pos, {closes} closes ({close_pct}%), "
+            f"📊 Neutral v1.5 eval: {len(positions)} pos, {closes} closes ({close_pct}%), "
             f"{holds_preventive} holds preventivos"
         )
 
@@ -479,7 +513,7 @@ if __name__ == "__main__":
         },
     ]
 
-    print("🧪 PMNeutral v1.4 SELF TEST:")
+    print("🧪 PMNeutral v1.5 SELF TEST:")
     result = pm.evaluate_portfolio(test_positions)
     print(json.dumps(result, indent=2))
 
@@ -488,4 +522,4 @@ if __name__ == "__main__":
     assert amat["action"] == "HOLD",  f"❌ AMAT debería ser HOLD, es {amat['action']}"
     assert aapl["action"] == "CLOSE", f"❌ AAPL debería ser CLOSE, es {aapl['action']}"
 
-    print("\n✅ PMNeutral v1.4 – TEST OK")
+    print("\n✅ PMNeutral v1.5 – TEST OK")
