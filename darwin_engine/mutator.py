@@ -12,6 +12,24 @@ El mutador tiene sesgo inteligente:
   - Si COMPRA hit rate < 45% → muta parámetros de entrada/confianza
   - Si oportunidad perdida alta → muta días de mantención
   - Si drawdown alto → muta loss_cut y profit_lock
+
+FIX [AUD-D1] (bug Darwin #1 — colisión de genome_id):
+  generate_next_generation() producía hasta 5 hijos por ciclo, todos
+  derivados del mismo padre (best). _next_genome_id() calcula el ID
+  únicamente a partir del genome_id del padre — así que los 5 hijos
+  recibían el MISMO ID (ej. "executor_v2"). Como ExecutorGenome.save()
+  escribe siempre a GENOME_DIR / f"{gid}.json" y arena.py guarda cada
+  hijo en un bucle (`for child in new_generation: child.save()`) sin
+  manejar colisión, solo el último hijo en guardarse sobrevivía en
+  disco — de 5 estrategias de mutación/crossover distintas, el espacio
+  de búsqueda real explorado era una fracción del diseñado.
+
+  Mismo patrón de fix ya aplicado y en producción en
+  darwin_engine/predictor_mutator.py ([MC1]): justo antes de retornar,
+  se reasignan IDs únicos por posición
+  (ej. "executor_v2_1".."executor_v2_5"). Confirmado que
+  ExecutorGenome.load_champion() usa glob("executor_*.json"), que
+  sigue matcheando este formato de ID sin cambios adicionales.
 """
 
 import json
@@ -326,11 +344,22 @@ def generate_next_generation(
 
     Returns:
         Lista de nuevos genomas (no guardados aún)
+
+    [AUD-D1] Antes de retornar, se reasignan genome_id únicos por
+    posición (ej. "executor_v2_1".."executor_v2_5"). Todos los hijos
+    parten del mismo padre (best), así que _next_genome_id() calculaba
+    el mismo ID para todos — cada child.save() en arena.py sobrescribía
+    al anterior y solo 1 de N sobrevivía en disco. Mismo patrón de fix
+    ya aplicado en predictor_mutator.py ([MC1]).
     """
     if not ranked_genomes:
         logger.warning("⚠️ Sin genomas para evolucionar — generando desde default")
         default = ExecutorGenome.load_or_default()
-        return [mutate(default, n_mutations=1) for _ in range(generation_size)]
+        children = [mutate(default, n_mutations=1) for _ in range(generation_size)]
+        next_gen = default.generation + 1
+        for i, child in enumerate(children):
+            child.data["genome_id"] = f"executor_v{next_gen}_{i + 1}"
+        return children
 
     best  = ranked_genomes[0]
     second = ranked_genomes[1] if len(ranked_genomes) > 1 else best
@@ -359,11 +388,21 @@ def generate_next_generation(
     # 5. Mutación de exploración (sin sesgo, más fuerte)
     children.append(_mutate_strong(best))
 
+    children = children[:generation_size]
+
+    # [AUD-D1] IDs únicos por posición — evita colisión al guardar.
+    # Sin esto, todos los hijos comparten genome_id (derivan del mismo
+    # "best") y arena.py los pisa entre sí al hacer child.save() en bucle.
+    next_gen = best.generation + 1
+    for i, child in enumerate(children):
+        child.data["genome_id"] = f"executor_v{next_gen}_{i + 1}"
+
     logger.info(
-        f"🌱 Nueva generación | {len(children)} hijos | "
+        f"🌱 Nueva generación | {len(children)} hijos "
+        f"[{', '.join(c.genome_id for c in children)}] | "
         f"padre={best.genome_id} fit={best.fitness} | sesgo={bias}"
     )
-    return children[:generation_size]
+    return children
 
 
 # ══════════════════════════════════════════════════════
