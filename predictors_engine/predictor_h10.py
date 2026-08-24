@@ -4,6 +4,15 @@ Preserva íntegramente el kNN caótico y la lógica ensemble original.
 El genome evoluciona: alpha_ridge, pca_target, clip_ret, theta.
 Las features de Hurst + 20 lags se mantienen como base inamovible
 (son la identidad matemática de H10).
+
+[DETREND] Auditoría 2026-08-24: mismo mecanismo aplicado a H1-H9. Se
+resta el drift local (media móvil de retornos pasados, escalada por
+HORIZON) del target antes de entrenar (tanto en el walk-forward OOS
+como en el entrenamiento final), y se reincorpora al ensemble final
+antes de calcular price_pred y recommendation. Sin esto, tanto el
+Ridge como el kNN convergen hacia el drift promedio de la muestra
+"max" de entrenamiento (décadas de historial, casi siempre alcista)
+en vez de aprender señal genuina de corto plazo.
 """
 
 import os
@@ -43,6 +52,10 @@ K_NEIGHBORS_H10 = 20
 ALPHA_H10 = 0.5
 PERIOD_H10 = "max"
 CLIP_RET_H10 = 0.15
+
+# [DETREND] Mismo mecanismo aplicado a H1-H9.
+DRIFT_WINDOW_H10      = int(os.getenv("H10_DRIFT_WINDOW", "60"))
+DRIFT_MIN_PERIODS_H10 = int(os.getenv("H10_DRIFT_MIN_PERIODS", "30"))
 
 @dataclass
 class ModelMeta:
@@ -97,6 +110,20 @@ def make_features(df: pd.DataFrame, horizon: int = 10, clip_ret: float = 0.15) -
     out["hurst_60"] = rolling_hurst(past, 60)
     out["hurst_120"] = rolling_hurst(past, 120)
     out["y_fwd"] = np.log(out["Close"].shift(-horizon) / out["Close"]).clip(-clip_ret, clip_ret)
+
+    # [DETREND] Drift local: media móvil de retornos PASADOS (usa
+    # `past`, ya shift(1) → no hay leakage). Se usa solo para
+    # destrendear el target, no como feature del modelo.
+    out["_drift_local"] = past.rolling(
+        DRIFT_WINDOW_H10, min_periods=DRIFT_MIN_PERIODS_H10
+    ).mean()
+
+    # [DETREND] Target de entrenamiento = retorno crudo (ya clippeado)
+    # menos el drift local vigente en ese momento, escalado por
+    # `horizon` (mismo criterio ya corregido en H1-H9: _drift_local es
+    # la media DIARIA, y_fwd es el retorno acumulado a `horizon` días).
+    out["y_fwd_excess"] = out["y_fwd"] - (out["_drift_local"] * horizon)
+
     return out
 
 def knn_caotico_predict(X_train, y_train, X_query, k=20) -> float:
@@ -182,8 +209,11 @@ def _run_full_math_engine(ticker, horizon, pca_target, theta,
         *[f"ret_lag_{k}" for k in range(1, 21)]
     ]
 
+    # [DETREND] Walk-forward OOS ahora corre sobre el target destrendeado
+    # (y_fwd_excess), no sobre el retorno crudo — el hit_rate resultante
+    # refleja skill genuino, no acierto por drift.
     res_df = walk_forward_train_test(
-        feat, feature_cols, "y_fwd", alpha_ridge=alpha, pca_target=pca_target
+        feat, feature_cols, "y_fwd_excess", alpha_ridge=alpha, pca_target=pca_target
     )
 
     if res_df is None or len(res_df) == 0:
@@ -205,9 +235,10 @@ def _run_full_math_engine(ticker, horizon, pca_target, theta,
         ("ridge", Ridge(alpha=alpha))
     ])
 
-    train_df = feat.dropna(subset=["y_fwd"] + feature_cols)
+    # [DETREND] Entrenamiento final también sobre el target destrendeado.
+    train_df = feat.dropna(subset=["y_fwd_excess"] + feature_cols)
     X = train_df[feature_cols].values
-    y = train_df["y_fwd"].values
+    y = train_df["y_fwd_excess"].values
     model.fit(X, y)
 
     feat_only = feat[feature_cols]
@@ -218,14 +249,25 @@ def _run_full_math_engine(ticker, horizon, pca_target, theta,
 
     X_last = last_values.reshape(1, -1)
     price_now = float(feat["Close"].dropna().iloc[-1])
-    y_global = float(model.predict(X_last)[0])
+    y_global_excess = float(model.predict(X_last)[0])
 
     X_pca = model.named_steps["pca"].transform(model.named_steps["scaler"].transform(X))
     X_last_pca = model.named_steps["pca"].transform(model.named_steps["scaler"].transform(X_last))
-    y_knn = knn_caotico_predict(X_pca, y, X_last_pca, k_neighbors)
+    # [DETREND] y aquí ya es la serie destrendeada (y_fwd_excess) usada
+    # para entrenar el Ridge — el kNN caótico también predice el exceso.
+    y_knn_excess = knn_caotico_predict(X_pca, y, X_last_pca, k_neighbors)
 
     w = float(np.clip(hist.hit_rate_mean, 0.4, 0.6)) if hist.hit_rate_mean is not None else 0.5
-    y_ens = w * y_knn + (1 - w) * y_global
+    y_ens_excess = w * y_knn_excess + (1 - w) * y_global_excess
+
+    # [DETREND] Drift local vigente HOY — se vuelve a sumar al ensemble
+    # (que predijo solo el exceso) antes de calcular precio y decisión.
+    drift_series = feat["_drift_local"].dropna()
+    local_drift_now = float(drift_series.iloc[-1]) if len(drift_series) > 0 else 0.0
+
+    y_global = y_global_excess + local_drift_now * horizon
+    y_knn = y_knn_excess + local_drift_now * horizon
+    y_ens = y_ens_excess + local_drift_now * horizon
 
     recent_vol = float(feat["rv_60"].dropna().iloc[-1]) if feat["rv_60"].dropna().shape[0] else 0.02
     if not np.isfinite(recent_vol) or recent_vol <= 0:
@@ -243,6 +285,7 @@ def _run_full_math_engine(ticker, horizon, pca_target, theta,
         "MANTÉN"
     )
 
+    # JSON de salida — MISMO esquema que el original, sin campos nuevos.
     return {
         "meta": ModelMeta(ticker, horizon, pca_target, theta, k_neighbors, alpha, clip_ret, period).__dict__,
         "historical": {
@@ -330,3 +373,4 @@ if __name__ == "__main__":
         json.dump(result, f, indent=2)
     print(format_report(result))
     print(f"\n💾 Guardado: {output_path}")
+                                                       
