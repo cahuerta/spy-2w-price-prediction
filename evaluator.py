@@ -52,6 +52,17 @@ HIT_SIGN_MIN_PCT = float(os.getenv("HIT_SIGN_MIN_PCT", "0.05"))
 #        TTWO y GOOGL no mejoran → genuinamente malos predictores.
 #
 #   [E7b] Mismo fix aplicado en evaluate_models para hit_sign de H1-H10.
+#
+#   [E8] FIX H10 nunca evaluado (auditoría 2026-08-24):
+#        curve = price_curve.price_path SIEMPRE tiene longitud 9
+#        (master_orchestrator._build_curve_bands solo construye la
+#        curva para horizontes < 10). El loop original comparaba
+#        `len(curve) < h` para TODO h en range(1,11), así que para
+#        h=10 daba 9 < 10 → continue, siempre. H10 nunca se evaluaba
+#        pese a que sí existe una predicción propia en
+#        pred_data["prediction"] (price_pred, ret_ens_pct).
+#        Fix: para h==10 no se lee de `curve`, se lee directo de
+#        `old_p` (la predicción H10 ya cargada al inicio de la función).
 # ======================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -164,7 +175,9 @@ def _eval_needs_recalculation(eval_path: Path) -> bool:
     """
     [E6] True si la evaluación debe crearse o recalcularse.
     También recalcula evaluaciones v2.2 que no tienen el fix E7
-    (no tienen el campo 'weak_signal').
+    (no tienen el campo 'weak_signal'), y evaluaciones sin el fix
+    [E8] (H10 ausente de models_diagnostics pese a existir la
+    predicción H10 en el JSON original).
     """
     if not eval_path.exists():
         return True
@@ -175,6 +188,10 @@ def _eval_needs_recalculation(eval_path: Path) -> bool:
             return True
         # Si no tiene el campo weak_signal → es v2.2 sin fix E7 → recalcular
         if "weak_signal" not in d:
+            return True
+        # [E8] Si no tiene H10 en models_diagnostics → recalcular con el fix nuevo
+        diag = d.get("models_diagnostics") or {}
+        if "H10" not in diag:
             return True
         return False
     except Exception:
@@ -273,6 +290,12 @@ def evaluate_models(
       - h-ésimo día hábil después de pred_date
       - price_path[h-1] vs precio real en esa fecha
       - [E7b] hit_sign=None si pred≈0
+
+    [E8] H10 es un caso especial: no viene de `price_curve.price_path`
+    (que siempre tiene longitud 9, porque el orquestador solo construye
+    la curva para horizontes < 10). H10 se lee directo de la predicción
+    original (`old_p["price_pred"]` / `old_p["ret_ens_pct"]`), que ya
+    está cargada en `old_p` para todo el resto de la función.
     """
     models: Dict[str, Any] = {}
     pred_root = Path(DATA_PATH) / "predictions" / ticker
@@ -290,17 +313,26 @@ def evaluate_models(
         return {}
 
     for h in range(1, 11):
-        if len(curve) < h:
-            continue
+        if h == 10:
+            # [E8] H10 no viene de la curva — se lee de su propia predicción
+            raw_price_pred = old_p.get("price_pred")
+            raw_pred_ret   = old_p.get("ret_ens_pct")
+            if raw_price_pred is None or raw_pred_ret is None:
+                continue
+            price_pred = float(raw_price_pred)
+            pred_ret   = float(raw_pred_ret)
+        else:
+            if len(curve) < h:
+                continue
+            price_pred = float(curve[h - 1])
+            pred_ret   = (price_pred / price_now - 1) * 100
 
         target     = nth_business_day(pred_date, h)
         price_real = get_price_at_date(ticker, target)
         if not price_real:
             continue
 
-        price_pred = float(curve[h - 1])
-        pred_ret   = (price_pred / price_now - 1) * 100
-        real_ret   = (price_real / price_now - 1) * 100
+        real_ret = (price_real / price_now - 1) * 100
 
         # [E7b] Umbral de señal para H diagnósticos
         h_hit_sign, h_weak = _calc_hit_sign(pred_ret, real_ret)
@@ -429,7 +461,8 @@ def evaluate_all(
     Para cada predicción:
       1. Calcula su fecha objetivo (nth_business_day)
       2. Solo evalúa si esa fecha ya pasó
-      3. Recalcula si legacy_bad_horizon != False o falta weak_signal
+      3. Recalcula si legacy_bad_horizon != False, falta weak_signal,
+         o [E8] falta H10 en models_diagnostics
     """
     pred_root = Path(DATA_PATH) / "predictions"
     eval_root = Path(DATA_PATH) / "evaluations"
@@ -477,7 +510,7 @@ def evaluate_all(
     if dry_run:
         return {"pending": len(pending)}
 
-    logger.info(f"📊 Evaluator v2.3 | {len(pending)} predicciones a evaluar/recalcular")
+    logger.info(f"📊 Evaluator v2.4 | {len(pending)} predicciones a evaluar/recalcular")
 
     workers = max_workers or MAX_WORKERS
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -503,7 +536,7 @@ def evaluate_all(
         "skipped":   len(results["skipped"]),
         "errors":    len(results["errors"]),
     }
-    logger.info(f"✅ Evaluator v2.3 COMPLETADO | {results['summary']}")
+    logger.info(f"✅ Evaluator v2.4 COMPLETADO | {results['summary']}")
     return results
 
 
