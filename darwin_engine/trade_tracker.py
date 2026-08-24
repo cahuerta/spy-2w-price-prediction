@@ -41,6 +41,27 @@ FIX v1.4 [AUD-P5]:
        mismo comportamiento default que existía antes de este fix.
        Confirmado con el usuario: sin hit_rate no hay confianza en
        la predicción, por lo tanto no debe competir.
+
+FIX v1.5 [AUD-P6] (auditoría 2026-08-24):
+  [T8] register_close y resolve_pending_trades invertían el signo del
+       PnL cuando `recommendation` (la etiqueta direccional de la
+       predicción H10 del día de entrada) era "VENDE" — tratando el
+       trade como si fuera una posición corta. Confirmado en
+       trading_orchestrator.py: el sistema NUNCA abre cortos, todas
+       las posiciones son compras de `shares` (positivo, real).
+       `recommendation` es solo la etiqueta direccional que tenía la
+       predicción ESE día, no el tipo de posición ejecutada — el
+       alpha_score que decide la compra puede ser positivo aunque la
+       predicción cruda de H10 diga "VENDE" ese mismo día. Esto podía
+       invertir el signo real de ganancias/pérdidas en un subconjunto
+       de trades, contaminando pnl_real_pct, pnl_teorico_pct, el
+       fitness que decide el campeón de Darwin, y las métricas
+       agregadas del tracker — coherente con la brecha no reconciliada
+       entre el PnL que reporta Darwin (+$1,088) y la caída real de la
+       cuenta (-$16,766) detectada en la auditoría.
+       Fix: pnl_real_pct y pnl_teorico_pct se calculan SIEMPRE como
+       posición larga, sin ninguna rama condicional por
+       `recommendation`.
 """
 
 import json
@@ -441,6 +462,13 @@ def register_close(
 ) -> Optional[Dict[str, Any]]:
     """
     Llamar desde trading_orchestrator cuando se ejecuta un CLOSE exitoso.
+
+    [T8] pnl_real_pct se calcula SIEMPRE como posición larga. El sistema
+    nunca abre cortos (trading_orchestrator.py solo compra `shares`
+    positivos) — la etiqueta `recommendation` de h_signals_at_entry es
+    solo la dirección que tenía la predicción H10 ESE día, no el tipo
+    de posición realmente ejecutada, así que no debe invertir el signo
+    del PnL.
     """
     # [T1] No procesar tickers europeos
     ticker_upper = ticker.upper()
@@ -470,11 +498,8 @@ def register_close(
     entry_date   = trade["entry_date"]
     horizon_days = int(trade.get("horizon_days", 6))
 
-    recommendation = trade.get("h_signals_at_entry", {}).get("main", {}).get("recommendation", "COMPRA")
-    if recommendation == "VENDE":
-        pnl_real_pct = (entry_price - exit_price) / entry_price * 100
-    else:
-        pnl_real_pct = (exit_price - entry_price) / entry_price * 100
+    # [T8] Siempre posición larga — el sistema no opera en corto.
+    pnl_real_pct = (exit_price - entry_price) / entry_price * 100
 
     pnl_real_usd = pnl_real_pct / 100 * entry_price * int(trade.get("shares", 0))
 
@@ -507,7 +532,6 @@ def register_close(
     )
     return trade
 
-
 # ══════════════════════════════════════════════════════
 # RESOLUCIÓN: PRECIO AL HORIZONTE TEÓRICO
 # ══════════════════════════════════════════════════════
@@ -516,6 +540,9 @@ def resolve_pending_trades() -> List[Dict]:
     """
     Cron diario: busca trades cerrados cuyo horizonte ya venció
     y obtiene el precio real al horizonte para calcular oportunidad.
+
+    [T8] pnl_teorico_pct se calcula SIEMPRE como posición larga, por
+    la misma razón que en register_close: el sistema no opera en corto.
     """
     if not TRACKER_DIR.exists():
         return []
@@ -566,11 +593,8 @@ def resolve_pending_trades() -> List[Dict]:
             logger.warning(f"⚠️ resolve: no precio horizonte {ticker} {horizon_date}")
             continue
 
-        recommendation = trade.get("h_signals_at_entry", {}).get("main", {}).get("recommendation", "COMPRA")
-        if recommendation == "VENDE":
-            pnl_teorico = (entry_price - price_at_horizon) / entry_price * 100
-        else:
-            pnl_teorico = (price_at_horizon - entry_price) / entry_price * 100
+        # [T8] Siempre posición larga — el sistema no opera en corto.
+        pnl_teorico = (price_at_horizon - entry_price) / entry_price * 100
 
         oportunidad     = pnl_teorico - pnl_real
         predictor_right = pnl_teorico > 0
@@ -676,4 +700,4 @@ def get_tracker_summary() -> Dict[str, Any]:
         "total_pnl_pct": round(total_pnl,  4),
         "win_rate":      round(win_rate,   4),
         "n_pnl_samples": len(pnl_list),
-  }
+    }
