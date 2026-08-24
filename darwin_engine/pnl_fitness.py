@@ -14,6 +14,16 @@ FIX v1.1:
        nan < -0.5 como False, dejando pasar el nan al combined.
   [F4] _select_champion en arena.py: idem, protección contra nan en
        champion_fitness e improvement.
+
+FIX v1.2 [AUD-P6] (auditoría 2026-08-24):
+  [F5] _enrich_with_alpaca_pnl invertía el signo del PnL (fallback,
+       cuando pnl_real_pct no venía calculado por el tracker) tratando
+       recommendation=="VENDE" como si fuera una posición corta. El
+       sistema nunca abre cortos (confirmado en trading_orchestrator.py
+       — solo compra `shares` positivos), así que el cálculo debe ser
+       siempre el de una posición larga, sin excepción. Mismo fix
+       aplicado en darwin_engine/trade_tracker.py (fuente canónica de
+       pnl_real_pct/pnl_teorico_pct).
 """
 
 import json
@@ -124,6 +134,10 @@ def _enrich_with_alpaca_pnl(trades: List[Dict]) -> List[Dict]:
     """
     Si el trade tiene pnl_real_pct calculado por el tracker, lo usa.
     Si no, intenta calcularlo desde entry/exit price disponibles.
+
+    [F5] Siempre como posición larga — el sistema no opera en corto.
+    Antes esta rama invertía el signo si recommendation=="VENDE",
+    tratando el trade como si fuera un corto que nunca existió.
     """
     enriched = []
     for t in trades:
@@ -132,8 +146,7 @@ def _enrich_with_alpaca_pnl(trades: List[Dict]) -> List[Dict]:
             ep = float(t.get("entry_price") or 0)
             xp = float(t.get("exit_price") or 0)
             if ep > 0 and xp > 0:
-                rec = t.get("h_signals_at_entry", {}).get("main", {}).get("recommendation", "COMPRA")
-                pnl = (xp - ep) / ep * 100 if rec != "VENDE" else (ep - xp) / ep * 100
+                pnl = (xp - ep) / ep * 100
                 t = dict(t)
                 t["pnl_real_pct"] = round(pnl, 4)
         if pnl is not None:
@@ -472,5 +485,5 @@ def get_fitness_summary() -> Dict:
             for r in ranking[:3]
         ],
         "status": "ok",
-  }
-  
+      }
+      
