@@ -8,6 +8,24 @@ FIX v1.1:
        fitness=nan inamovible indefinidamente.
        Ahora nan → 0.0 para comparación, permitiendo que
        candidatos con datos reales puedan desbancarlo.
+
+FIX v1.2 [AUD-D2]:
+  [D2] _select_champion() contaba cand_trades con
+       get_resolved_trades(executor_genome_id=candidate.genome_id),
+       que solo lee darwin/trades/*.json — el pipeline de trades
+       REALES que únicamente alimenta el campeón (los shadows nunca
+       operan con dinero real). Resultado: cand_trades era siempre 0
+       para todo shadow, nunca alcanzaban MIN_TRADES_TO_COMPETE, y el
+       campeón nunca podía ser reemplazado sin importar cuán bueno
+       fuera un candidato.
+
+       Ahora, para genomas shadow, cand_trades se cuenta con
+       get_shadow_resolved_trades() (darwin_engine.executor_shadow_evaluator),
+       que lee darwin/shadow_trades/{genome_id}/ — el historial de
+       decisiones simuladas que cada shadow acumula evaluando el
+       MISMO ciclo que el campeón (mismo momento, mismo alpha_map,
+       portfolio propio independiente). El campeón sigue midiéndose
+       exclusivamente con sus trades reales — sin cambios ahí.
 """
 
 import json
@@ -31,6 +49,7 @@ from darwin_engine.pnl_fitness import (
 )
 from darwin_engine.mutator import generate_next_generation, random_genome
 from darwin_engine.trade_tracker import get_resolved_trades, get_tracker_summary
+from darwin_engine.executor_shadow_evaluator import get_shadow_resolved_trades
 
 logger = logging.getLogger("arena")
 
@@ -197,7 +216,7 @@ def _evaluate_all_genomes(
 
 
 # ══════════════════════════════════════════════════════
-# SELECCIÓN: ¿PROMOVER NUEVO CAMPEÓN?  [F4]
+# SELECCIÓN: ¿PROMOVER NUEVO CAMPEÓN?  [F4][AUD-D2]
 # ══════════════════════════════════════════════════════
 
 def _select_champion(
@@ -209,6 +228,14 @@ def _select_champion(
     [F4] math.isfinite() explícito — numpy evalúa nan >= umbral
     como False, dejando al campeón inamovible cuando fitness=nan.
     Ahora nan → 0.0 para comparación.
+
+    [AUD-D2] cand_trades para genomas SHADOW ahora se cuenta con
+    get_shadow_resolved_trades() (trades simulados que cada shadow
+    acumula evaluando el mismo ciclo que el campeón), no con
+    get_resolved_trades() — que solo ve el pipeline de trades reales
+    y siempre da 0 para shadows, dejándolos incapaces de competir
+    sin importar su fitness. El campeón sigue contándose con sus
+    trades reales, sin cambios.
     """
     raw_champion_fitness = fitness_results.get(
         current_champion.genome_id, {}
@@ -226,6 +253,7 @@ def _select_champion(
             f"tratado como {champion_fitness} para comparación"
         )
 
+    # El campeón se mide SIEMPRE con sus trades reales — sin cambios.
     champion_trades = len(
         get_resolved_trades(executor_genome_id=current_champion.genome_id)
     )
@@ -248,13 +276,15 @@ def _select_champion(
             )
             continue
 
+        # [AUD-D2] Shadows se miden con su historial simulado propio —
+        # ya no con get_resolved_trades(), que para ellos siempre es 0.
         cand_trades = len(
-            get_resolved_trades(executor_genome_id=candidate.genome_id)
+            get_shadow_resolved_trades(candidate.genome_id)
         )
 
         if cand_trades < MIN_TRADES_TO_COMPETE:
             logger.info(
-                f"⏳ {candidate.genome_id} insuficientes trades "
+                f"⏳ {candidate.genome_id} insuficientes trades simulados "
                 f"({cand_trades}/{MIN_TRADES_TO_COMPETE})"
             )
             continue
@@ -392,7 +422,11 @@ def run_evolution_cycle(
     logger.info("🏆 Ranking actual:")
     for i, g in enumerate(ranked[:5]):
         fit    = fitness_results.get(g.genome_id, {}).get("combined_fitness", 0)
-        trades = len(get_resolved_trades(executor_genome_id=g.genome_id))
+        trades = (
+            len(get_resolved_trades(executor_genome_id=g.genome_id))
+            if g.genome_id == champion.genome_id
+            else len(get_shadow_resolved_trades(g.genome_id))
+        )
         logger.info(f"   {i+1}. {g.genome_id} | fitness={fit:.4f} | trades={trades}")
 
     # Paso 3: Seleccionar campeón
