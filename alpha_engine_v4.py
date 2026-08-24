@@ -19,6 +19,28 @@
 #        → libera DataFrames de precio y señales entre cada ticker
 #        → evita acumulación de ~87 DataFrames en memoria simultáneos
 #        → resuelve crash "Ran out of memory (used over 512MB)"
+#
+# FIXES v4.5 (auditoría 2026-08-24):
+#   [F8] fundamental=None (clave presente con valor None, no ausente)
+#        rompía `fundamental.get("usable")` con AttributeError. Esto
+#        afectaba ~37/191 tickers (19.4% del universo), incluyendo
+#        nombres grandes (ADBE, AMD, AMZN, BA...). Confirmado en
+#        /data/alpha_last.json: 37 de 42 errores totales eran
+#        exactamente 'NoneType' object has no attribute 'get'.
+#        Fix: `signal.get("fundamental") or {}` en vez de
+#        `signal.get("fundamental", {})` — el default de .get() solo
+#        aplica si la clave está AUSENTE, no si está presente con
+#        valor None.
+#   [F9] except Exception genérico en compute_and_persist_alpha
+#        mezclaba bugs reales (como F8) con casos esperados de "sin
+#        datos" (FileNotFoundError, ValueError, KeyError — que el
+#        propio código ya levanta deliberadamente más arriba). Ambos
+#        terminaban con el mismo alpha_score=0.0 indistinguible entre
+#        sí. Ahora se separan: los esperados se registran como
+#        warning con reason="no_data", cualquier otra excepción se
+#        registra como error con reason="unexpected_bug" y traceback
+#        completo, para que un bug nuevo no vuelva a pasar
+#        desapercibido mezclado con "sin datos".
 # =========================================================
 
 import os
@@ -49,6 +71,10 @@ MAX_PRED_AGE_HOURS       = 240
 MIN_STRUCTURAL_LIQUIDITY = 0.20
 DISAGREEMENT_HAIRCUT     = 0.75
 V6_3_THETA_BONUS         = 1.10
+
+# [F9] Excepciones "esperadas" — el propio código las levanta
+# deliberadamente para señalar "sin datos suficientes", no un bug.
+_EXPECTED_NO_DATA_ERRORS = (FileNotFoundError, ValueError, KeyError)
 
 
 # =========================================================
@@ -169,7 +195,12 @@ def compute_alpha_for_ticker(
     s_hit      = clip01((metrics["hit_rate"] - 0.45) / 0.30)
     s_mae      = clip01(1.0 / (1.0 + metrics["mae_return_pct"] / 5.0))
 
-    fundamental = signal.get("fundamental", {})
+    # [F8] fundamental puede venir con la clave PRESENTE pero valor
+    # None (signals.py: "fundamental": fundamental if usable else None).
+    # `.get("fundamental", {})` NO aplica el default en ese caso, porque
+    # el default de dict.get() solo se usa si la clave está AUSENTE.
+    # `or {}` cubre ambos casos: clave ausente Y clave presente con None.
+    fundamental = signal.get("fundamental") or {}
     mispricing  = fundamental.get("mispricing_pct", 0.0) if fundamental.get("usable") else 0.0
     s_fund      = clip01(abs(mispricing) / 25.0)
 
@@ -255,7 +286,7 @@ def compute_alpha_for_ticker(
 def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
     """Entrada: tickers.json → Salida: /data/alpha_last.json"""
 
-    logger.info(f"🔬 AlphaEngine V4.4-mem iniciado | {len(tickers)} tickers")
+    logger.info(f"🔬 AlphaEngine V4.5 iniciado | {len(tickers)} tickers")
 
     market_ctx = load_json(MARKET_FILE) or {}
 
@@ -276,6 +307,8 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
 
     results:     Dict[str, Any] = {}
     valid_count: int            = 0
+    no_data_count:  int         = 0
+    unexpected_count: int       = 0
 
     for t in tickers:
         try:
@@ -283,9 +316,31 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
             results[t] = result
             if result["alpha_score"] != 0:
                 valid_count += 1
+        except _EXPECTED_NO_DATA_ERRORS as e:
+            # [F9] Caso esperado: el propio código levantó esto para
+            # señalar "sin datos suficientes" (sin predicción, historial
+            # insuficiente, JSON corrupto o incompleto). No es un bug.
+            logger.warning(f"⚠️ {t}: sin datos suficientes: {e}")
+            results[t] = {
+                "error":       str(e),
+                "error_type":  type(e).__name__,
+                "reason":      "no_data",
+                "alpha_score": 0.0,
+            }
+            no_data_count += 1
         except Exception as e:
-            logger.error(f"❌ {t}: {e}")
-            results[t] = {"error": str(e), "alpha_score": 0.0}
+            # [F9] Cualquier otra excepción es un bug real e inesperado
+            # (como F8 antes de corregirse) — se registra con traceback
+            # completo para que no quede invisible mezclado con "sin
+            # datos".
+            logger.error(f"❌ {t}: BUG INESPERADO: {e}", exc_info=True)
+            results[t] = {
+                "error":       str(e),
+                "error_type":  type(e).__name__,
+                "reason":      "unexpected_bug",
+                "alpha_score": 0.0,
+            }
+            unexpected_count += 1
         finally:
             # [F7] Liberar memoria entre tickers
             # compute_structural_score descarga 1 año de precios por ticker
@@ -294,16 +349,20 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
             gc.collect()
 
     payload: Dict[str, Any] = {
-        "timestamp":       datetime.now(timezone.utc).isoformat(),
-        "version":         "4.4-mem",
-        "universe_size":   len(tickers),
-        "valid_alphas":    valid_count,
-        "alpha_threshold": 0.70,
-        "results":         results,
+        "timestamp":         datetime.now(timezone.utc).isoformat(),
+        "version":           "4.5",
+        "universe_size":     len(tickers),
+        "valid_alphas":      valid_count,
+        "no_data_count":     no_data_count,      # [F9] trazabilidad
+        "unexpected_errors": unexpected_count,   # [F9] trazabilidad — debería ser 0
+        "alpha_threshold":   0.70,
+        "results":           results,
     }
 
     save_json(ALPHA_FILE, payload)
-    logger.info(f"✅ Alpha V4.4-mem COMPLETADO | {valid_count}/{len(tickers)} válidos")
+    logger.info(
+        f"✅ Alpha V4.5 COMPLETADO | {valid_count}/{len(tickers)} válidos | "
+        f"sin_datos={no_data_count} | bugs_inesperados={unexpected_count}"
+    )
 
     return payload
-    
