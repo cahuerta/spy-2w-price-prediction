@@ -25,6 +25,22 @@ FIX v1.3:
        quedaban en closed_pending_resolution para siempre, reintentando
        y fallando cada día sin nunca resolver ni aportar al fitness
        del Darwin Engine.
+
+FIX v1.4 [AUD-P5]:
+  [T7] Selección de dominant_h corregida: antes ganaba el horizonte
+       con mayor |pred_return| sin importar si ese horizonte suele
+       acertar. Ahora se pondera por hit_rate real del genoma
+       campeón de cada horizonte (PredictorGenome.load_champion(h)):
+       score = |pred_return| * max(0, hit_rate - 0.5).
+       Horizontes SIN hit_rate calculado aún (None — nunca evaluados)
+       quedan EXCLUIDOS de la competencia por dominante: no hay
+       evidencia de que acierten, así que no deben competir solo
+       por la magnitud de su retorno predicho. Si NINGÚN horizonte
+       tiene hit_rate todavía (sistema recién arrancado, sin
+       historial de evaluaciones), se usa "H6" como fallback —
+       mismo comportamiento default que existía antes de este fix.
+       Confirmado con el usuario: sin hit_rate no hay confianza en
+       la predicción, por lo tanto no debe competir.
 """
 
 import json
@@ -264,6 +280,62 @@ def _read_h_signals(ticker: str, entry_date) -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════
+# [T7][AUD-P5] SELECCIÓN DE HORIZONTE DOMINANTE
+# ══════════════════════════════════════════════════════
+
+def _select_dominant_horizon(h_signals: Dict[str, Any]) -> str:
+    """
+    [T7] Selecciona el horizonte dominante ponderando por hit_rate real
+    del genoma campeón de cada horizonte, no solo por la magnitud del
+    retorno predicho.
+
+    score(h) = |pred_return(h)| * max(0, hit_rate(h) - 0.5)
+
+    Horizontes sin hit_rate calculado (None — el genoma nunca fue
+    evaluado) quedan EXCLUIDOS de la competencia: sin evidencia de
+    que acierten, no deben competir por dominante solo por gritar
+    un retorno grande. Si NINGÚN horizonte tiene hit_rate todavía,
+    se usa "H6" como fallback (mismo default que antes del fix).
+    """
+    try:
+        from darwin_engine.predictor_genome import PredictorGenome
+    except Exception as e:
+        logger.warning(f"⚠️ _select_dominant_horizon: PredictorGenome no disponible ({e}) — usando H6")
+        return "H6"
+
+    dominant_h     = None
+    dominant_score = -1.0
+
+    for h in [f"H{i}" for i in range(1, 11)]:
+        sig = h_signals.get(h, {})
+        ret = abs(sig.get("pred_return", 0))
+        if ret <= 0:
+            continue
+
+        try:
+            genome   = PredictorGenome.load_champion(int(h[1:]))
+            hit_rate = genome.hit_rate
+        except Exception as e:
+            logger.warning(f"⚠️ _select_dominant_horizon: no se pudo cargar champion {h}: {e}")
+            hit_rate = None
+
+        if hit_rate is None:
+            # Sin evidencia de acierto → no compite por dominante
+            continue
+
+        score = ret * max(0.0, hit_rate - 0.5)
+        if score > dominant_score:
+            dominant_score = score
+            dominant_h     = h
+
+    if dominant_h is None:
+        logger.info("ℹ️ _select_dominant_horizon: ningún horizonte con hit_rate calculado → fallback H6")
+        return "H6"
+
+    return dominant_h
+
+
+# ══════════════════════════════════════════════════════
 # API PÚBLICA: REGISTRAR APERTURA
 # ══════════════════════════════════════════════════════
 
@@ -310,15 +382,8 @@ def register_open(
 
     h_signals = _read_h_signals(ticker, entry_date)
 
-    # Horizonte dominante
-    dominant_h   = "H6"
-    dominant_ret = 0.0
-    for h in [f"H{i}" for i in range(10, 0, -1)]:
-        sig = h_signals.get(h, {})
-        ret = abs(sig.get("pred_return", 0))
-        if ret > dominant_ret:
-            dominant_ret = ret
-            dominant_h   = h
+    # [T7][AUD-P5] Horizonte dominante ponderado por hit_rate real
+    dominant_h = _select_dominant_horizon(h_signals)
 
     horizon_days = int(dominant_h[1:]) if dominant_h[1:].isdigit() else 6
 
