@@ -49,7 +49,7 @@ from darwin_engine.pnl_fitness import (
 )
 from darwin_engine.mutator import generate_next_generation, random_genome
 from darwin_engine.trade_tracker import get_resolved_trades, get_tracker_summary
-from darwin_engine.executor_shadow_evaluator import get_shadow_resolved_trades
+from darwin_engine.executor_shadow_evaluator import get_shadow_resolved_trades, run_all_shadows
 
 logger = logging.getLogger("arena")
 
@@ -384,6 +384,93 @@ def _build_fitness_context() -> Dict:
 
 
 # ══════════════════════════════════════════════════════
+# [AUD-D2] CONSTRUCCIÓN DE alpha_map / price_map PARA SHADOWS
+# ══════════════════════════════════════════════════════
+
+ALPHA_FILE = DATA_PATH / "alpha_last.json"
+PRED_DIR   = DATA_PATH / "predictions"
+
+
+def _load_alpha_map() -> Dict[str, Dict]:
+    """
+    Mismo alpha_last.json que ya consume trading_orchestrator.py y
+    trade_tracker.py — ningún dato nuevo, ninguna llamada adicional
+    a un proveedor externo.
+    """
+    try:
+        if not ALPHA_FILE.exists():
+            logger.warning("⚠️ alpha_last.json no encontrado — shadows sin universo este ciclo")
+            return {}
+        data = json.loads(ALPHA_FILE.read_text())
+        return {
+            t.upper(): d
+            for t, d in data.get("results", {}).items()
+            if isinstance(d, dict)
+        }
+    except Exception as e:
+        logger.warning(f"⚠️ _load_alpha_map falló: {e}")
+        return {}
+
+
+def _load_price_map(tickers: List[str]) -> Dict[str, float]:
+    """
+    [AUD-D2] price_now por ticker leído desde el mismo archivo de
+    predicción diaria que ya lee trade_tracker._read_h_signals()
+    (prediction.price_now) — no es una fuente nueva, es la misma
+    que ya persiste el pipeline de predicción cada día.
+    """
+    price_map = {}
+    for ticker in tickers:
+        try:
+            ticker_dir = PRED_DIR / ticker.upper()
+            if not ticker_dir.exists():
+                continue
+            candidates = sorted(ticker_dir.glob("*.json"))
+            if not candidates:
+                continue
+            data  = json.loads(candidates[-1].read_text(encoding="utf-8"))
+            price = float(data.get("prediction", {}).get("price_now", 0))
+            if price > 0:
+                price_map[ticker.upper()] = price
+        except Exception as e:
+            logger.debug(f"_load_price_map {ticker}: {e}")
+            continue
+    return price_map
+
+
+def _run_shadow_evaluation(shadow: List[ExecutorGenome]) -> None:
+    """
+    [AUD-D2] Cierra el circuito: corre la evaluación de todos los
+    executor shadows EN EL MISMO CICLO del arena (que corre junto al
+    ciclo diario, sin desfase respecto al momento en que se generó
+    alpha_last.json / las predicciones del día) — no depende de que
+    trading_orchestrator.py llame a nada. Usa exclusivamente datos ya
+    persistidos en disco por el pipeline existente.
+
+    Si no hay shadows o no hay alpha_map, no hace nada (no bloquea el
+    resto del ciclo del arena).
+    """
+    if not shadow:
+        return
+
+    alpha_map = _load_alpha_map()
+    if not alpha_map:
+        logger.warning("⚠️ Sin alpha_map — shadows no evaluados este ciclo")
+        return
+
+    price_map = _load_price_map(list(alpha_map.keys()))
+
+    logger.info(
+        f"🌑 Evaluando {len(shadow)} executor shadows | "
+        f"universo={len(alpha_map)} tickers | precios_disponibles={len(price_map)}"
+    )
+    results = run_all_shadows(shadow, alpha_map, price_map)
+    for r in results:
+        if "error" in r:
+            logger.error(f"❌ Shadow {r['genome_id']}: {r['error']}")
+
+
+# ══════════════════════════════════════════════════════
 # CICLO PRINCIPAL DEL ARENA
 # ══════════════════════════════════════════════════════
 
@@ -406,6 +493,14 @@ def run_evolution_cycle(
         f"open={tracker_summary['open']} "
         f"resueltos={tracker_summary['resolved']}"
     )
+
+    # [AUD-D2] Paso 1.5: correr la evaluación de shadows ANTES de
+    # calcular fitness — así el fitness de este ciclo ya refleja
+    # cualquier trade simulado que se cierre en este mismo paso.
+    if not dry_run:
+        _run_shadow_evaluation(shadow)
+    else:
+        logger.info("🔍 DRY RUN — evaluación de shadows omitida")
 
     # Paso 2: Evaluar fitness
     all_genomes     = [champion] + shadow
