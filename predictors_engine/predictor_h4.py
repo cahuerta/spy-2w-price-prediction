@@ -35,6 +35,15 @@ ALPHA_H4 = 0.5
 MAX_PCA_COMPONENTS = 10
 CLIP_RET = 0.10
 
+# [DETREND] Mismo mecanismo aplicado a H1/H2/H3 (auditoría 2026-08-24):
+# se resta el drift local (media móvil de retornos pasados, escalada
+# por HORIZON) del target antes de entrenar, y se reincorpora al
+# predecir. Sin esto, el Ridge converge al drift promedio de la
+# muestra de entrenamiento en vez de aprender señal genuina de corto
+# plazo.
+DRIFT_WINDOW      = int(os.getenv("H4_DRIFT_WINDOW", "60"))
+DRIFT_MIN_PERIODS = int(os.getenv("H4_DRIFT_MIN_PERIODS", "30"))
+
 try:
     from data_provider import get_price_history
 except ImportError:
@@ -88,6 +97,13 @@ def make_features_h4(df: pd.DataFrame):
     out["rv_10"]   = past.rolling(10).std().clip(1e-6)
     out["vol_chg"] = np.log(out["Volume"].replace(0, np.nan)).diff()
 
+    # [DETREND] Drift local: media móvil de retornos PASADOS (usa
+    # past, ya shift(1) → no hay leakage). Se usa solo para
+    # destrendear el target, no como feature del modelo.
+    out["_drift_local"] = past.rolling(
+        DRIFT_WINDOW, min_periods=DRIFT_MIN_PERIODS
+    ).mean()
+
     return out
 
 # ======================================================
@@ -136,13 +152,20 @@ def run_predictor_h4(ticker: str):
         feature_cols = _base_features
 
     feat["y_fwd"] = np.log(feat["Close"].shift(-HORIZON) / feat["Close"])
-    clean = feat.dropna(subset=feature_cols + ["y_fwd"])
+
+    # [DETREND] Target de entrenamiento = retorno crudo menos el drift
+    # local vigente en ese momento, escalado por HORIZON (mismo criterio
+    # ya corregido en H1/H2/H3: _drift_local es la media DIARIA, y_fwd
+    # es el retorno acumulado a HORIZON=4 días).
+    feat["y_fwd_excess"] = feat["y_fwd"] - (feat["_drift_local"] * HORIZON)
+
+    clean = feat.dropna(subset=feature_cols + ["y_fwd_excess"])
 
     if len(clean) < 160:
         return None
 
     X = clean[feature_cols].values
-    y = clean["y_fwd"].values
+    y = clean["y_fwd_excess"].values
 
     n_samples, n_features = X.shape
     dynamic_pca = max(1, min(_max_pca, n_features, n_samples - 1))
@@ -166,14 +189,24 @@ def run_predictor_h4(ticker: str):
     if last_features.isna().any().any():
         return None
 
-    y_pred_log  = float(model.predict(last_features)[0])
-    y_pred_log  = np.clip(y_pred_log, -_clip_ret, _clip_ret)
+    # [DETREND] Drift local vigente HOY — se vuelve a sumar a la
+    # predicción del modelo (que predice solo el exceso).
+    local_drift_now = feat["_drift_local"].iloc[-1]
+    if pd.isna(local_drift_now):
+        local_drift_now = 0.0
+    local_drift_now = float(local_drift_now)
+
+    y_pred_excess_log = float(model.predict(last_features)[0])
+    y_pred_log         = y_pred_excess_log + local_drift_now * HORIZON
+    y_pred_log         = np.clip(y_pred_log, -_clip_ret, _clip_ret)
+
     price_today = float(feat["Close"].iloc[-1])
     price_4d    = price_today * np.exp(y_pred_log)
 
-    r2_train   = model.score(X, y)
+    r2_train   = model.score(X, y)   # r2 sobre el target destrendeado (excess)
     confidence = 1 / (1 + np.std(model.named_steps["ridge"].coef_))
 
+    # JSON de salida — MISMO esquema que el original, sin campos nuevos.
     return {
         "ticker":       ticker,
         "predictor":    "H4",
@@ -202,6 +235,12 @@ if __name__ == "__main__":
         path = os.path.join(DATA_OUTPUT_DIR, f"{ticker}_H4.json")
         with open(path, "w") as f:
             json.dump(result, f, indent=2)
-        print(f"✅ H4 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | {result['return_pct']}% | decay={_decay}")
+        # [FIX] _decay es local a run_predictor_h4() — no existe en este scope
+        # (mismo bug identificado y corregido en predictor_h1/h2/h3.py).
+        # Se lee desde el propio resultado ya guardado en el JSON.
+        print(
+            f"✅ H4 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | "
+            f"{result['return_pct']}% | decay={result['model_params']['weight_decay']}"
+        )
     else:
         print("❌ Datos insuficientes")
