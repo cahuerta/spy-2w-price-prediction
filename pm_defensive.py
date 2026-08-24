@@ -1,5 +1,5 @@
 """
-pm_defensive.py - DEFENSIVE POSITION MANAGER v2.0 PRODUCCION
+pm_defensive.py - DEFENSIVE POSITION MANAGER v2.1 PRODUCCION
 
 FIX v1.8:
   [F7] entry_price fallback a avg_entry_price — Alpaca devuelve
@@ -34,6 +34,17 @@ v2.0:
        Si no hay curva disponible: comportamiento idéntico a v1.9.
   [C3] ANCHORS: sin ningún cambio — lógica idéntica a v1.9.
   [C4] Orchestrator y tracker: sin cambios.
+
+v2.1:
+  [AUD-P3] FIX asimetría "corta ganadores, deja correr perdedores"
+       — SOLO para no-anchors (anchors mantienen HOLD indefinido,
+       sin cambios). Antes la curva solo actuaba con pnl > 0. Ahora,
+       si pnl < 0, slope == "baja" (curva confirma la caída) y la
+       pérdida aún es moderada (abs(pnl) < DEFENSIVE_CURVE_LOSS_CUT_PCT,
+       5% fijo — independiente del stop catastrófico de 25%, que está
+       pensado como último recurso, no como referencia de "pérdida
+       moderada"), se cierra antes de esperar el time_exit o el stop
+       catastrófico completo.
 """
 
 import os
@@ -55,6 +66,12 @@ MAX_HOLD_DAYS_NON_ANCHOR = int(os.getenv("PM_DEF_MAX_HOLD_DAYS", "30"))
 CATASTROPHIC_STOP_PCT    = float(os.getenv("PM_DEF_STOP_LOSS_CATA", "0.25"))
 MAX_ANCHOR_EXPOSURE_PCT  = float(os.getenv("PM_DEF_MAX_ANCHOR_EXPO", "0.30"))
 ANCHOR_MIN_ALPHA         = float(os.getenv("PM_DEF_ANCHOR_MIN_ALPHA", "0.30"))
+
+# [AUD-P3] Umbral de pérdida moderada para el corte simétrico por curva.
+# 5% fijo (no escalado del 25% catastrófico) — confirmado con el usuario:
+# escalar del stop catastrófico daba un umbral demasiado alto (15%) para
+# no-anchors, que deben protegerse antes que las posiciones ancla.
+DEFENSIVE_CURVE_LOSS_CUT_PCT = float(os.getenv("PM_DEF_CURVE_LOSS_CUT", "0.05"))
 
 _BASE_DIR   = Path(__file__).resolve().parent
 ANCHOR_FILE = Path(os.getenv("ANCHOR_FILE", str(_BASE_DIR / "anchor_universe.json")))
@@ -242,7 +259,7 @@ class DefensiveDecision:
 
 
 # =========================================================
-# PM DEFENSIVO v2.0
+# PM DEFENSIVO v2.1
 # =========================================================
 
 class PMDefensive:
@@ -253,7 +270,7 @@ class PMDefensive:
         self._anchor_universe    = _load_anchor_universe()
         self._anchor_tickers     = {a["ticker"].upper() for a in self._anchor_universe}
         logger.info(
-            f"PMDefensive v2.0 | anclas={len(self._anchor_tickers)}: "
+            f"PMDefensive v2.1 | anclas={len(self._anchor_tickers)}: "
             f"{sorted(self._anchor_tickers)}"
         )
 
@@ -360,7 +377,7 @@ class PMDefensive:
                 {"days_held": age, "max_days": MAX_HOLD_DAYS_NON_ANCHOR},
             )
 
-        # ── [C2] Curva de predicción — solo no-anchors ─────────────────────
+        # ── [C2][AUD-P3] Curva de predicción — solo no-anchors ──────────────
         # Lee desde disco. Si no hay curva: comportamiento idéntico a v1.9.
         # ────────────────────────────────────────────────────────────────────
         curva = _load_price_curve(ticker)
@@ -406,6 +423,29 @@ class PMDefensive:
                         "dias_hasta_peak": dias_peak,
                         "days_held":       age,
                         "en_zona_valle":   en_zona_valle,
+                    },
+                )
+
+            # [AUD-P3] Rama simétrica (solo no-anchors, ya garantizado por
+            # el HOLD indefinido de anchors más arriba): curva confirma
+            # caída y ya estamos en pérdida moderada (< 5%, umbral fijo,
+            # independiente del stop catastrófico de 25%) → cortar antes
+            # de esperar el time_exit o el stop catastrófico.
+            if pnl < 0 and slope == "baja" and abs(pnl) < DEFENSIVE_CURVE_LOSS_CUT_PCT * 100:
+                logger.info(
+                    f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva confirma caída "
+                    f"(ret_final={ret_a_final}%) → cortar pérdida moderada, no-anchor"
+                )
+                return DefensiveDecision(
+                    "CLOSE", ticker, "defensive_close_curve_confirms_down", ts,
+                    {
+                        "ret_pct":         pnl,
+                        "slope_futura":    slope,
+                        "ret_a_final_pct": ret_a_final,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age,
+                        "en_zona_valle":   en_zona_valle,
+                        "loss_cut_threshold_pct": -DEFENSIVE_CURVE_LOSS_CUT_PCT * 100,
                     },
                 )
 
@@ -546,7 +586,7 @@ class PMDefensive:
         holds  = len([d for d in decisions if d.action == "HOLD"])
 
         logger.info(
-            f"DEFENSIVE v2.0 | pos={len(positions)} anchors={len(anchors)} "
+            f"DEFENSIVE v2.1 | pos={len(positions)} anchors={len(anchors)} "
             f"| closes={closes} opens={opens} holds={holds} "
             f"rotates={rotations_done} | capital=${total_capital:,.0f}"
         )
@@ -592,7 +632,7 @@ if __name__ == "__main__":
         },
     ]
 
-    print("\nPMDefensive v2.0 SELF-TEST:")
+    print("\nPMDefensive v2.1 SELF-TEST:")
     results = pm.evaluate_portfolio(test_positions, total_capital=85000)
 
     print("\nDECISIONES:")
@@ -607,4 +647,4 @@ if __name__ == "__main__":
     assert ko  and ko.action  == "HOLD", f"❌ KO debe ser HOLD, es {ko}"
     assert stt and stt.action == "HOLD", f"❌ STT sin entry_date debe ser HOLD (age=0), es {stt}"
 
-    print("\n✅ v2.0 TEST OK — curva desde disco integrada, retrocompatibilidad v1.9 confirmada")
+    print("\n✅ v2.1 TEST OK — curva desde disco integrada, retrocompatibilidad v1.9 confirmada")
