@@ -1062,9 +1062,15 @@ class TradingOrchestrator:
                     # en todas las posiciones → stops de emergencia sin
                     # contexto real. Ahora construimos signal desde alpha_map.
                     alpha_entry = (alpha_map or {}).get(ticker, {})
+                    # [AUD-P4] FIX: confidence vive anidado en
+                    # alpha_entry["components"]["confidence"], no top-level.
+                    # Antes esto siempre devolvía 0.0, disparando
+                    # confidence_decay en pm_growth.py de forma sistemática
+                    # e independiente de la calidad real de la señal.
+                    components = alpha_entry.get("components", {})
                     signal = {
-                        "confidence":  alpha_entry.get("confidence", 0.0),
-                        "direction":   alpha_entry.get("direction", ""),
+                        "confidence":  components.get("confidence", 0.0),
+                        "direction":   "COMPRA" if alpha_entry.get("alpha_score", 0) > 0 else "VENDE",
                         "alpha_score": alpha_entry.get("alpha_score", 0.0),
                     } if alpha_entry else None
                     d = pm.evaluate_position(pos, signal)
