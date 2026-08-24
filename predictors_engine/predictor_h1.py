@@ -42,7 +42,7 @@ CLIP_RET = 0.05
 # para acciones que siguen listadas), generando sesgo alcista
 # sistemático (73.6% predicciones positivas vs 50.4% real) y un hit
 # rate que solo coincide con el azar (~50-53%), no con edge genuino.
-DRIFT_WINDOW    = int(os.getenv("H1_DRIFT_WINDOW", "60"))
+DRIFT_WINDOW      = int(os.getenv("H1_DRIFT_WINDOW", "60"))
 DRIFT_MIN_PERIODS = int(os.getenv("H1_DRIFT_MIN_PERIODS", "30"))
 
 try:
@@ -200,6 +200,7 @@ def run_predictor_h1(ticker: str):
     coef_std    = float(np.std(model.named_steps["ridge"].coef_))
     confidence  = float(max(0.0, min(1.0, 1 / (1 + coef_std))))
 
+    # JSON de salida — MISMO esquema que el original, sin campos nuevos.
     return {
         "ticker":        ticker,
         "predictor":     "H1",
@@ -208,8 +209,6 @@ def run_predictor_h1(ticker: str):
         "price_today":   round(price_today, 4),
         "price_pred":    round(price_1d, 4),
         "return_pct":    round(y_pred_log * 100, 4),
-        "return_excess_pct": round(y_pred_excess_log * 100, 4),  # [DETREND] predicción cruda del modelo, antes de sumar drift
-        "local_drift_pct":   round(local_drift_now * 100, 4),    # [DETREND] drift local reincorporado
         "confidence":    round(confidence, 3),
         "r2_train":      round(float(r2_train), 4),
         "samples":       len(clean),
@@ -219,7 +218,6 @@ def run_predictor_h1(ticker: str):
             "features_count": len(feature_cols),
             "genome_active":  DARWIN_PREDICTOR,
             "weight_decay":   _decay,   # [SW1] trazabilidad
-            "drift_window":   DRIFT_WINDOW,  # [DETREND] trazabilidad
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -232,10 +230,12 @@ if __name__ == "__main__":
         path = os.path.join(DATA_OUTPUT_DIR, f"{ticker}_H1.json")
         with open(path, "w") as f:
             json.dump(result, f, indent=2, default=str)
+        # [FIX] _decay es local a run_predictor_h1() — no existe en este scope.
+        # Se lee desde el propio resultado ya guardado en el JSON.
         print(
             f"✅ H1 | ${result['price_today']:,.2f} → ${result['price_pred']:,.2f} | "
-            f"{result['return_pct']}% (excess={result['return_excess_pct']}% + "
-            f"drift={result['local_drift_pct']}%) | conf={result['confidence']} | decay={_decay}"
+            f"{result['return_pct']}% | conf={result['confidence']} | "
+            f"decay={result['model']['weight_decay']}"
         )
     else:
         print("❌ Datos insuficientes")
