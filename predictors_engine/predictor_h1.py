@@ -150,7 +150,12 @@ def run_predictor_h1(ticker: str):
     # [DETREND] Target de entrenamiento = retorno crudo menos el drift
     # local vigente en ese momento. El modelo aprende a predecir el
     # EXCESO sobre el drift reciente, no el retorno absoluto.
-    feat["y_fwd_excess"] = feat["y_fwd"] - feat["_drift_local"]
+    # [FIX escala] _drift_local es la media de retornos DIARIOS; y_fwd
+    # es el retorno acumulado a HORIZON días. Hay que escalar el drift
+    # por HORIZON para que sea consistente con lo que se le suma de
+    # vuelta al predecir (local_drift_now * HORIZON, más abajo). Para
+    # H1 (HORIZON=1) es cosmético; para horizontes mayores es necesario.
+    feat["y_fwd_excess"] = feat["y_fwd"] - (feat["_drift_local"] * HORIZON)
 
     clean = feat.dropna(subset=feature_cols + ["y_fwd_excess"])
 
