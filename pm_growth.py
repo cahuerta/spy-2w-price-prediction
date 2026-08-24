@@ -1,5 +1,5 @@
 # =========================================================
-# pm_growth.py — GROWTH POSITION MANAGER v2.8.0
+# pm_growth.py — GROWTH POSITION MANAGER v2.9.0
 # =========================================================
 # ✔ PM GROWTH PURO (market_mode == growth)
 # ✔ Decision engine (NO ejecuta órdenes)
@@ -43,6 +43,16 @@
 #        — evita cierres por time_decay en posiciones sin metadata.
 #   [G4] evaluate_position(): usa _safe_price() y lee entry_date
 #        con fallback a entry_time por compatibilidad.
+#
+# v2.9.0:
+#   [AUD-P3] FIX asimetría "corta ganadores, deja correr perdedores":
+#        antes la curva solo actuaba con pnl > 0 (cerrar en ganancia
+#        si la curva cae). No existía la rama simétrica para pnl < 0.
+#        Ahora: si pnl < 0, slope == "baja" (curva confirma la caída)
+#        y la pérdida aún es moderada (abs(pnl) < GROWTH_CURVE_LOSS_CUT_PCT,
+#        60% del stop duro de 5% → 3%), se cierra antes de esperar el
+#        stop_loss completo. Prioridad: sigue después de los stops duros
+#        (trailing, stop_loss, take_profit), igual que la rama de ganancia.
 # =========================================================
 
 import os
@@ -68,6 +78,10 @@ ROTATION_CONF_DELTA    = float(os.getenv("PM_ROTATION_DELTA",      "0.15"))
 TAKE_PROFIT_PCT        = float(os.getenv("PM_TAKE_PROFIT",         "0.10"))
 STOP_LOSS_PCT          = float(os.getenv("PM_STOP_LOSS",           "0.05"))
 TRAILING_STOP_PCT      = float(os.getenv("PM_TRAILING_STOP",       "0.03"))
+
+# [AUD-P3] Umbral de pérdida moderada para el corte simétrico por curva.
+# 3% = 60% del stop duro (5%) — confirmado con el usuario.
+GROWTH_CURVE_LOSS_CUT_PCT = float(os.getenv("PM_GROWTH_CURVE_LOSS_CUT", "0.03"))
 
 FIXED_CAPITAL          = float(os.getenv("PM_FIXED_CAPITAL",       "100000"))
 MAX_PORTFOLIO_RISK_PCT = float(os.getenv("PM_MAX_PORT_RISK",        "0.02"))
@@ -127,7 +141,7 @@ def days_between(entry_iso: str) -> int:
          se trata como nueva, no como expirada.
          Maneja fechas sin timezone ("YYYY-MM-DD") añadiendo
          CL_TIMEZONE antes de comparar.
-         Lee entry_date con fallback a entry_time por compatibilidad.
+         Lee entry_date con fallback a entry_time.
     """
     try:
         if not entry_iso or not entry_iso.strip():
@@ -233,7 +247,7 @@ class PMGrowth:
         self.fixed_capital = fixed_capital
         self.tz = CL_TIMEZONE
         self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
-        logger.info("📈 PMGrowth v2.8.0 inicializado")
+        logger.info("📈 PMGrowth v2.9.0 inicializado")
 
     def allow_new_positions(self) -> bool:
         return True
@@ -345,7 +359,7 @@ class PMGrowth:
         if ret >= TAKE_PROFIT_PCT:
             return self._decision("CLOSE", ticker, "take_profit", fundamental)
 
-        # ── [C2] Curva desde disco — después de stops duros ────────────────
+        # ── [C2][AUD-P3] Curva desde disco — después de stops duros ────────
         curva = _load_price_curve(ticker)
 
         if curva:
@@ -387,6 +401,30 @@ class PMGrowth:
                         "days_held":       age,
                         "confidence":      conf,
                         "en_zona_valle":   en_zona_valle,
+                    },
+                )
+
+            # [AUD-P3] Rama simétrica: curva confirma caída y ya estamos en
+            # pérdida moderada (< 3%, 60% del stop duro de 5%) → cortar
+            # antes de esperar el stop_loss completo. Antes de este fix,
+            # una posición en pérdida con curva bajista no tenía ninguna
+            # salida propia por curva y quedaba esperando el stop duro,
+            # amplificando la asimetría ganancias-chicas / pérdidas-grandes.
+            if pnl < 0 and slope == "baja" and abs(pnl) < GROWTH_CURVE_LOSS_CUT_PCT * 100:
+                logger.info(
+                    f"📉 {ticker} CLOSE | PnL={pnl:.1f}% curva confirma caída "
+                    f"(ret_final={ret_a_final}%) → cortar pérdida moderada antes del stop duro"
+                )
+                return self._decision(
+                    "CLOSE", ticker, "growth_close_curve_confirms_down", fundamental,
+                    {
+                        "ret_pct":         pnl,
+                        "slope_futura":    slope,
+                        "ret_a_final_pct": ret_a_final,
+                        "dias_hasta_peak": dias_peak,
+                        "days_held":       age,
+                        "en_zona_valle":   en_zona_valle,
+                        "loss_cut_threshold_pct": -GROWTH_CURVE_LOSS_CUT_PCT * 100,
                     },
                 )
 
@@ -521,4 +559,4 @@ if __name__ == "__main__":
         "entry_date":      "2026-01-01",
     }
     print("🧪 Sin signal (stop loss):", pm.evaluate_position(pos_down, None))
-    print("✅ PMGrowth v2.8.0 READY")
+    print("✅ PMGrowth v2.9.0 READY")
