@@ -55,6 +55,25 @@
 #        superan `alpha_threshold` en magnitud. Se mantiene
 #        `valid_alphas` como alias del mismo valor por compatibilidad
 #        con cualquier consumidor existente que ya lea esa clave.
+#
+# FIX v4.7 (conversación 2026-08-25, diseño de ranking de noticias):
+#   [N1] Se agrega un ajuste final de alpha_score en base al ranking
+#        de noticias generado por news_ranker.py
+#        (/data/news_ranking.json). Si el ticker aparece en el top 15
+#        alcista o bajista, se aplica un nudge ADITIVO (no
+#        multiplicativo) sobre signed_alpha, con peso variable según
+#        la posición en el ranking (rank 1 = más peso, rank 15 =
+#        menos peso) — decisión del usuario, para que una noticia muy
+#        fuerte pese más que una al borde del top 15.
+#        El ajuste puede INVERTIR el signo que ya trae el modelo
+#        cuantitativo (decisión explícita del usuario: las noticias
+#        deben poder contradecir al modelo, no solo reforzarlo).
+#        Peso máximo conservador (MAX_NEWS_WEIGHT=0.08), por debajo
+#        del peso de fundamental (0.10) — es un componente nuevo sin
+#        historial de validación todavía.
+#        Si news_ranking.json no existe o el ticker no aparece en
+#        ninguna lista, el ajuste es 0 — comportamiento idéntico al
+#        de antes de este fix.
 # =========================================================
 
 import os
@@ -92,6 +111,13 @@ V6_3_THETA_BONUS         = 1.10
 # usarse en ningún cálculo de este archivo — ahora es la fuente
 # única para calcular above_threshold_count.
 ALPHA_THRESHOLD = 0.70
+
+# [N1] Ajuste de noticias — peso máximo conservador, por debajo de
+# fundamental (0.10). rank 1 del top 15 recibe este peso completo;
+# rank 15 recibe una fracción pequeña (ver _news_adjustment_for).
+MAX_NEWS_WEIGHT = float(os.getenv("NEWS_ALPHA_MAX_WEIGHT", "0.08"))
+NEWS_RANKING_FILE = DATA_PATH / "news_ranking.json"
+NEWS_TOP_N = int(os.getenv("NEWS_RANKER_TOP_N", "15"))
 
 # [F9] Excepciones "esperadas" — el propio código las levanta
 # deliberadamente para señalar "sin datos suficientes", no un bug.
@@ -142,6 +168,49 @@ def _get_latest_pred_path(ticker: str) -> Optional[Path]:
 
 
 # =========================================================
+# [N1] AJUSTE POR RANKING DE NOTICIAS
+# =========================================================
+
+def _load_news_ranking_map() -> Dict[str, float]:
+    """
+    Carga news_ranking.json (generado por news_ranker.py) y lo
+    convierte en un mapa {ticker: ajuste_ya_calculado}, con signo
+    incluido (+ para alcista, - para bajista) y magnitud según la
+    posición en el ranking (rank 1 = MAX_NEWS_WEIGHT completo,
+    rank 15 = una fracción pequeña).
+
+    Si el archivo no existe o está vacío, retorna {} — el ajuste
+    para todos los tickers será 0, comportamiento idéntico al de
+    antes de este fix.
+    """
+    data = load_json(NEWS_RANKING_FILE)
+    if not data:
+        return {}
+
+    adjustments: Dict[str, float] = {}
+
+    for item in data.get("bullish", []):
+        ticker = str(item.get("ticker", "")).upper()
+        rank   = item.get("rank")
+        if not ticker or rank is None:
+            continue
+        intensity = (NEWS_TOP_N + 1 - int(rank)) / NEWS_TOP_N
+        intensity = max(0.0, min(1.0, intensity))
+        adjustments[ticker] = intensity * MAX_NEWS_WEIGHT
+
+    for item in data.get("bearish", []):
+        ticker = str(item.get("ticker", "")).upper()
+        rank   = item.get("rank")
+        if not ticker or rank is None:
+            continue
+        intensity = (NEWS_TOP_N + 1 - int(rank)) / NEWS_TOP_N
+        intensity = max(0.0, min(1.0, intensity))
+        adjustments[ticker] = -intensity * MAX_NEWS_WEIGHT
+
+    return adjustments
+
+
+# =========================================================
 # ESTRUCTURAL
 # =========================================================
 
@@ -184,6 +253,7 @@ def compute_alpha_for_ticker(
     ticker: str,
     market_ctx: Dict,
     universe_returns: List[float],
+    news_adjustments: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
 
     # 1. PREDICTION + TIME DECAY
@@ -274,9 +344,16 @@ def compute_alpha_for_ticker(
     direction      = float(np.sign(pred_ret))
     signed_alpha   = float(unsigned_alpha * direction)
 
+    # [N1] Ajuste por ranking de noticias — aditivo, puede invertir
+    # el signo del modelo cuantitativo (decisión explícita del
+    # usuario). 0.0 si el ticker no aparece en ninguna lista o si
+    # news_ranking.json no existe.
+    news_adj = float((news_adjustments or {}).get(ticker.upper(), 0.0))
+    signed_alpha_final = float(np.clip(signed_alpha + news_adj, -1.0, 1.0))
+
     return {
         "ticker":      ticker,
-        "alpha_score": round(signed_alpha, 4),
+        "alpha_score": round(signed_alpha_final, 4),
         "components": {
             "structural":      round(struct["score"], 3),
             "relative_return": round(s_ret_rel, 3),
@@ -285,6 +362,7 @@ def compute_alpha_for_ticker(
             "time_decay":      round(time_decay, 3),
             "hit_rate":        round(s_hit, 3),
             "fundamental":     round(s_fund, 3),
+            "news_adjustment": round(news_adj, 4),   # [N1] trazabilidad
         },
         "flags": {
             "disagreement_penalty":  bool(disagreement),
@@ -292,13 +370,14 @@ def compute_alpha_for_ticker(
             "v6_3_theta_cleared":    bool(abs(pred_ret) >= theta_dynamic),
             "age_hours":             round(age_hours, 1),
             "theta_dynamic_pct":     round(theta_dynamic, 3),
+            "news_signal_applied":   news_adj != 0.0,   # [N1] trazabilidad
         },
         "debug": {
-            "pred_ret_pct":  round(pred_ret, 3),
-            "struct_trend":  round(struct["trend_pct"], 3),
+            "pred_ret_pct":       round(pred_ret, 3),
+            "struct_trend":       round(struct["trend_pct"], 3),
+            "alpha_before_news":  round(signed_alpha, 4),   # [N1] trazabilidad
         },
     }
-
 
 # =========================================================
 # 🚀 BATCH PRODUCTION
@@ -307,9 +386,16 @@ def compute_alpha_for_ticker(
 def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
     """Entrada: tickers.json → Salida: /data/alpha_last.json"""
 
-    logger.info(f"🔬 AlphaEngine V4.6 iniciado | {len(tickers)} tickers")
+    logger.info(f"🔬 AlphaEngine V4.7 iniciado | {len(tickers)} tickers")
 
     market_ctx = load_json(MARKET_FILE) or {}
+
+    # [N1] Cargar el ranking de noticias UNA vez para todo el batch
+    # (no por ticker) — mismo criterio de eficiencia que el resto
+    # del archivo (gc.collect por ticker, pre-scan del universo).
+    news_adjustments = _load_news_ranking_map()
+    if news_adjustments:
+        logger.info(f"📰 Ajustes de noticias cargados para {len(news_adjustments)} tickers")
 
     # Pre-scan universo para Z-score
     universe_preds: List[float] = []
@@ -334,7 +420,7 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
 
     for t in tickers:
         try:
-            result = compute_alpha_for_ticker(t, market_ctx, universe_preds)
+            result = compute_alpha_for_ticker(t, market_ctx, universe_preds, news_adjustments)
             results[t] = result
             if result["alpha_score"] != 0:
                 nonzero_alpha_count += 1
@@ -374,7 +460,7 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
 
     payload: Dict[str, Any] = {
         "timestamp":              datetime.now(timezone.utc).isoformat(),
-        "version":                "4.6",
+        "version":                "4.7",
         "universe_size":          len(tickers),
         "nonzero_alpha_count":    nonzero_alpha_count,     # [F10] antes "valid_alphas"
         "above_threshold_count":  above_threshold_count,   # [F10] candidatos realmente operables
@@ -387,7 +473,7 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
 
     save_json(ALPHA_FILE, payload)
     logger.info(
-        f"✅ Alpha V4.6 COMPLETADO | "
+        f"✅ Alpha V4.7 COMPLETADO | "
         f"{nonzero_alpha_count}/{len(tickers)} con score≠0 | "
         f"{above_threshold_count} sobre umbral {ALPHA_THRESHOLD} (operables reales) | "
         f"sin_datos={no_data_count} | bugs_inesperados={unexpected_count}"
