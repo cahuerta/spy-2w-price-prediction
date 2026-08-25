@@ -1,4 +1,4 @@
-# scheduler.py — v2.2
+# scheduler.py — v2.3
 # =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
@@ -9,8 +9,9 @@
 #   - Solo lunes a viernes
 #   - Alive log cada hora
 #   - Darwin Engine: resolver trades diario post-market (17:05 Chile)
-#   - Darwin Engine: ciclo evolutivo viernes post-market (18:00 Chile)
-#   - Darwin Engine: shadow evaluator nocturno diario (23:00 Chile)
+#   - Darwin Engine: ciclo evolutivo DIARIO post-market (18:00 Chile) [v2.3]
+#   - Darwin Engine: shadow evaluator nocturno diario (23:00 Chile) —
+#     ahora incluye executor shadows, no solo predictor shadows [v2.3]
 #   - Code Auditor Agent: auditoría de código diaria (01:00 Chile)
 #
 # Horario mercado US en hora Chile (verano UTC-3):
@@ -23,13 +24,35 @@
 #   15:30 → CIERRE    — solo cierra posiciones divergentes
 #   12:00-15:00 → Monitor horario (cada hora) — vigila posiciones abiertas
 #   17:05 → Darwin resolve trades
-#   18:00 viernes → Darwin evolución (executor + predictor arena)
-#   23:00 → Darwin shadow evaluator
+#   18:00 → Darwin evolución (executor + predictor arena) — TODOS los
+#           días hábiles desde v2.3 (antes: solo viernes)
+#   23:00 → Darwin shadow evaluator — predictor Y executor desde v2.3
+#           (antes: solo predictor)
 #
 # v2.2 — Agregado Code Auditor Agent:
 #   - Corre a las 01:00 Chile, todos los días
 #   - Lee repo completo de GitHub y detecta incoherencias
 #   - Guarda reporte en /data/audits/
+#
+# v2.3 — FIX [AUD-D2-cableado] (auditoría 2026-08-25, Problema 3):
+#   El sistema de shadow-trading del executor (executor_shadow_evaluator.py,
+#   fix [AUD-D2] en arena.py) nunca generó un solo archivo en disco porque
+#   _run_shadow_evaluation() solo se invocaba dentro de run_evolution_cycle(),
+#   que corría una vez por semana (viernes). Con cadencia semanal, cada
+#   shadow abre a lo sumo un trade por semana — juntar los 10 trades
+#   cerrados que exige MIN_TRADES_TO_COMPETE podía tardar meses, dejando
+#   al campeón (fitness real NEGATIVO, -1.8551) sin competencia posible.
+#
+#   Cambios:
+#   [S1] _trigger_shadow_evaluator ahora también llama a
+#        darwin_engine.arena._run_shadow_evaluation() para el executor,
+#        no solo al shadow evaluator de predictores — corre TODOS los
+#        días hábiles a las 23:00, no solo el viernes de promoción.
+#   [S2] El ciclo de evolución/promoción (_trigger_darwin_evolution)
+#        pasa de correr solo los viernes a correr TODOS los días
+#        hábiles a las 18:00 — decisión del usuario: la cadencia
+#        semanal demoró demasiado en producir un reemplazo de campeón,
+#        se prueba con cadencia diaria.
 # =========================================================
 
 import os
@@ -206,21 +229,35 @@ def _trigger_darwin_evolution(motivo: str):
 
 def _trigger_shadow_evaluator(motivo: str):
     print(f"🌙 Darwin shadow evaluator [{motivo}]")
+
+    # Shadow evaluator de PREDICTORES — sin cambios
     try:
         from darwin_engine.predictor_shadow_evaluator import run_shadow_evolution_cycle
         result = run_shadow_evolution_cycle()
         gen = result.get("generation", {})
         ev  = result.get("evaluation", {})
         print(
-            f"✅ Shadow evaluator | "
+            f"✅ Shadow evaluator (predictor) | "
             f"generadas={gen.get('predictions_generated', 0)} | "
             f"evaluadas={ev.get('evaluated', 0)} | "
             f"pendientes={ev.get('pending', 0)}"
         )
         if gen.get("status") == "locked":
-            print("⚠️  Shadow evaluator: lock activo, se saltó esta corrida")
+            print("⚠️  Shadow evaluator (predictor): lock activo, se saltó esta corrida")
     except Exception as e:
-        print(f"❌ Shadow evaluator error: {e}")
+        print(f"❌ Shadow evaluator (predictor) error: {e}")
+
+    # [S1] Shadow evaluator de EXECUTOR — fix auditoría 2026-08-25 (Problema 3).
+    # Antes solo corría dentro de run_evolution_cycle() (viernes). Con esto
+    # corre TODOS los días hábiles a las 23:00, para que los shadows del
+    # executor acumulen trades cerrados a ritmo diario, no semanal.
+    try:
+        from darwin_engine.arena import _load_all_active_genomes, _run_shadow_evaluation
+        _, shadow = _load_all_active_genomes()
+        _run_shadow_evaluation(shadow)
+        print(f"✅ Shadow evaluator (executor) | shadows evaluados={len(shadow)}")
+    except Exception as e:
+        print(f"❌ Shadow evaluator (executor) error: {e}")
 
 
 # ══════════════════════════════════════════════════════
@@ -275,7 +312,8 @@ def _loop():
         f"   🟢 APERTURA: {HORA_APERTURA:02d}:{MIN_APERTURA:02d} Chile\n"
         f"   🔴 CIERRE:   {HORA_CIERRE:02d}:{MIN_CIERRE:02d} Chile\n"
         f"   📡 MONITOR:  {MONITOR_HORA_INICIO:02d}:00-{MONITOR_HORA_FIN:02d}:00 Chile (cada hora)\n"
-        f"   🌙 SHADOW EVAL: {HORA_SHADOW_EVAL:02d}:{MIN_SHADOW_EVAL:02d} Chile"
+        f"   🧬 EVOLUCIÓN: 18:00 Chile (diario hábil desde v2.3, antes solo viernes)\n"
+        f"   🌙 SHADOW EVAL: {HORA_SHADOW_EVAL:02d}:{MIN_SHADOW_EVAL:02d} Chile (predictor + executor desde v2.3)"
     )
 
     apertura_hoy:         str | None = None
@@ -348,17 +386,23 @@ def _loop():
             _trigger_darwin_resolve("post_market_17:05")
             darwin_resolve_hoy = fecha_hoy
 
-        # ── 🧬 Darwin: ciclo evolutivo viernes 18:00 ──────
+        # ── 🧬 Darwin: ciclo evolutivo — DIARIO desde v2.3 ─
+        # [S2] Antes: solo viernes (ahora.weekday()==4). La cadencia
+        # semanal demoró demasiado en reemplazar al campeón (fitness
+        # real negativo desde el 24-abr) — se prueba con cadencia
+        # diaria en todos los días hábiles.
         if (
-            ahora.weekday() == 4
+            _es_dia_habil(ahora)
             and ahora.hour   == 18
             and ahora.minute < 10
             and darwin_evolution_hoy != fecha_hoy
         ):
-            _trigger_darwin_evolution("viernes_18:00")
+            _trigger_darwin_evolution(f"diario_18:00")
             darwin_evolution_hoy = fecha_hoy
 
         # ── 🌙 Darwin: shadow evaluator nocturno (v2.1) ────
+        # [S1] Desde v2.3 también evalúa shadows del executor, no solo
+        # del predictor — ver _trigger_shadow_evaluator().
         if (
             _es_dia_habil(ahora)
             and ahora.hour       == HORA_SHADOW_EVAL
@@ -393,4 +437,3 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
-            
