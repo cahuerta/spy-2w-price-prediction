@@ -1,11 +1,13 @@
-# scheduler.py — v2.3
+# scheduler.py — v2.4
 # =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
 # Responsabilidades:
 #   - Pipeline APERTURA: 11:30 Chile — predice + abre posiciones
 #   - Pipeline CIERRE:   15:30 Chile — solo cierra, no abre
-#   - Monitor horario:   12:00-15:00 Yahoo Finance (posiciones)
+#   - Monitor horario:   12:00-15:00 Yahoo Finance (posiciones) —
+#     desde v2.4, cada corrida trae noticias frescas ANTES de
+#     evaluar posiciones (news_ranker.py, ver _trigger_monitor)
 #   - Solo lunes a viernes
 #   - Alive log cada hora
 #   - Darwin Engine: resolver trades diario post-market (17:05 Chile)
@@ -22,7 +24,11 @@
 #   01:00 → Code Auditor Agent — auditoría completa del repo
 #   11:30 → APERTURA  — predicción + alpha + trading (abre Y cierra)
 #   15:30 → CIERRE    — solo cierra posiciones divergentes
-#   12:00-15:00 → Monitor horario (cada hora) — vigila posiciones abiertas
+#   12:00-15:00 → Monitor horario (cada hora): [v2.4] news_ranker.py
+#                 primero, después vigila posiciones abiertas — así
+#                 el ajuste de stop por noticia bajista (intraday_
+#                 tracker.py::[N2]) usa datos del mismo ciclo, nunca
+#                 de una corrida vieja.
 #   17:05 → Darwin resolve trades
 #   18:00 → Darwin evolución (executor + predictor arena) — TODOS los
 #           días hábiles desde v2.3 (antes: solo viernes)
@@ -123,6 +129,21 @@ def _trigger_pipeline(motivo: str, close_only: bool = False):
 
 def _trigger_monitor(motivo: str):
     print(f"📡 Monitor horario [{motivo}]")
+
+    # [v2.4][N2] Traer noticias frescas ANTES de evaluar posiciones —
+    # así intraday_tracker.py usa el ranking de ESTE ciclo, no uno
+    # de una hora atrás. Si falla, no bloquea el monitor de
+    # posiciones (que es la parte crítica) — solo se pierde el
+    # ajuste de noticias de este ciclo puntual.
+    try:
+        from news_ranker import run_news_ranking
+        news_result = run_news_ranking()
+        n_bullish = len(news_result.get("bullish", []))
+        n_bearish = len(news_result.get("bearish", []))
+        print(f"📰 News ranker OK | bullish={n_bullish} bearish={n_bearish}")
+    except Exception as e:
+        print(f"⚠️ News ranker falló (continuando con monitor igual): {e}")
+
     try:
         from intraday_tracker import evaluar_posiciones_abiertas
         from positions_meta import get_all
@@ -437,3 +458,4 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
+        
