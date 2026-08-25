@@ -41,6 +41,20 @@
 #        registra como error con reason="unexpected_bug" y traceback
 #        completo, para que un bug nuevo no vuelva a pasar
 #        desapercibido mezclado con "sin datos".
+#   [F10] `valid_alphas` contaba `alpha_score != 0`, pero el nombre
+#        del campo invitaba a leerlo como "candidatos operables" —
+#        confirmado en la auditoría: 119 tickers con alpha_score
+#        distinto de cero, pero solo 19 superan `alpha_threshold`
+#        (0.70), que es el umbral que trading_orchestrator.py
+#        realmente usa para decidir aperturas. Cualquier consumidor
+#        que asumiera "119 válidos = 119 operables" sobreestimaba el
+#        universo real en 6x.
+#        Fix: `valid_alphas` se renombra a `nonzero_alpha_count`
+#        (mismo valor, nombre honesto sobre lo que mide), y se agrega
+#        `above_threshold_count` — el conteo real de tickers que
+#        superan `alpha_threshold` en magnitud. Se mantiene
+#        `valid_alphas` como alias del mismo valor por compatibilidad
+#        con cualquier consumidor existente que ya lea esa clave.
 # =========================================================
 
 import os
@@ -71,6 +85,13 @@ MAX_PRED_AGE_HOURS       = 240
 MIN_STRUCTURAL_LIQUIDITY = 0.20
 DISAGREEMENT_HAIRCUT     = 0.75
 V6_3_THETA_BONUS         = 1.10
+
+# [F10] Umbral real de "candidato operable" — el mismo que
+# trading_orchestrator.py usa para decidir aperturas. Antes estaba
+# hardcodeado como 0.70 solo dentro del payload de salida, sin
+# usarse en ningún cálculo de este archivo — ahora es la fuente
+# única para calcular above_threshold_count.
+ALPHA_THRESHOLD = 0.70
 
 # [F9] Excepciones "esperadas" — el propio código las levanta
 # deliberadamente para señalar "sin datos suficientes", no un bug.
@@ -286,7 +307,7 @@ def compute_alpha_for_ticker(
 def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
     """Entrada: tickers.json → Salida: /data/alpha_last.json"""
 
-    logger.info(f"🔬 AlphaEngine V4.5 iniciado | {len(tickers)} tickers")
+    logger.info(f"🔬 AlphaEngine V4.6 iniciado | {len(tickers)} tickers")
 
     market_ctx = load_json(MARKET_FILE) or {}
 
@@ -306,7 +327,8 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
             continue
 
     results:     Dict[str, Any] = {}
-    valid_count: int            = 0
+    nonzero_alpha_count: int    = 0   # [F10] antes "valid_count" → payload "valid_alphas"
+    above_threshold_count: int  = 0   # [F10] nuevo — candidatos realmente operables
     no_data_count:  int         = 0
     unexpected_count: int       = 0
 
@@ -315,7 +337,9 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
             result = compute_alpha_for_ticker(t, market_ctx, universe_preds)
             results[t] = result
             if result["alpha_score"] != 0:
-                valid_count += 1
+                nonzero_alpha_count += 1
+            if abs(result["alpha_score"]) >= ALPHA_THRESHOLD:
+                above_threshold_count += 1
         except _EXPECTED_NO_DATA_ERRORS as e:
             # [F9] Caso esperado: el propio código levantó esto para
             # señalar "sin datos suficientes" (sin predicción, historial
@@ -349,19 +373,23 @@ def compute_and_persist_alpha(tickers: List[str]) -> Dict[str, Any]:
             gc.collect()
 
     payload: Dict[str, Any] = {
-        "timestamp":         datetime.now(timezone.utc).isoformat(),
-        "version":           "4.5",
-        "universe_size":     len(tickers),
-        "valid_alphas":      valid_count,
-        "no_data_count":     no_data_count,      # [F9] trazabilidad
-        "unexpected_errors": unexpected_count,   # [F9] trazabilidad — debería ser 0
-        "alpha_threshold":   0.70,
-        "results":           results,
+        "timestamp":              datetime.now(timezone.utc).isoformat(),
+        "version":                "4.6",
+        "universe_size":          len(tickers),
+        "nonzero_alpha_count":    nonzero_alpha_count,     # [F10] antes "valid_alphas"
+        "above_threshold_count":  above_threshold_count,   # [F10] candidatos realmente operables
+        "valid_alphas":           nonzero_alpha_count,     # [F10] alias por compatibilidad — mismo valor, mismo significado que antes
+        "no_data_count":          no_data_count,      # [F9] trazabilidad
+        "unexpected_errors":      unexpected_count,   # [F9] trazabilidad — debería ser 0
+        "alpha_threshold":        ALPHA_THRESHOLD,
+        "results":                results,
     }
 
     save_json(ALPHA_FILE, payload)
     logger.info(
-        f"✅ Alpha V4.5 COMPLETADO | {valid_count}/{len(tickers)} válidos | "
+        f"✅ Alpha V4.6 COMPLETADO | "
+        f"{nonzero_alpha_count}/{len(tickers)} con score≠0 | "
+        f"{above_threshold_count} sobre umbral {ALPHA_THRESHOLD} (operables reales) | "
         f"sin_datos={no_data_count} | bugs_inesperados={unexpected_count}"
     )
 
