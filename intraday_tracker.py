@@ -68,7 +68,17 @@ LAGGING_THRESHOLD   = float(os.getenv("INTRADAY_LAGGING",         "0.985"))
 DIVERGING_THRESHOLD = float(os.getenv("INTRADAY_DIVERGING",       "0.970"))
 
 # Multiplicador de desviación para cierre real (2σ bajo lower_band)
-DIVERGING_STD_MULT = float(os.getenv("INTRADAY_DIVERGING_STD_MULT", "2.0"))
+# [AUD-P9] auditoría 2026-08-25: 2.0 era demasiado sensible a ruido
+# intradía normal — subido a 3.0 (banda menos sensible).
+DIVERGING_STD_MULT = float(os.getenv("INTRADAY_DIVERGING_STD_MULT", "3.0"))
+
+# [AUD-P9] Piso de días mínimos antes de permitir CERRAR por divergencia
+# de curva. dia_actual=1 es el día de apertura — sin este piso, 46/231
+# trades (19.9%, según auditoría) cerraban con days_held=0. Excepción:
+# si la pérdida ya supera SAME_DAY_STOP_LOSS_OVERRIDE_PCT, el cierre
+# procede igual aunque sea el primer día (no proteger una caída fuerte).
+MIN_HOLD_DAYS_BEFORE_CURVE_EXIT = int(os.getenv("INTRADAY_MIN_HOLD_DAYS", "1"))
+SAME_DAY_STOP_LOSS_OVERRIDE_PCT = float(os.getenv("INTRADAY_SAME_DAY_STOP_LOSS", "4.0"))  # mismo % que STOP_LOSS_NEUTRAL_PCT en pm_neutral.py
 
 # PnL mínimo para proteger con trailing en vez de cerrar directo
 TRAILING_PNL_THRESHOLD = float(os.getenv("INTRADAY_TRAILING_PNL", "0.02"))  # 2%
@@ -532,7 +542,17 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         elif pnl > 0:
             sugerencia   = "TRAILING"
             razon_cierre = f"diverging + PnL={pnl:.1f}% positivo → trailing, no cerrar"
-            
+
+        elif dia_actual <= MIN_HOLD_DAYS_BEFORE_CURVE_EXIT and pnl > -SAME_DAY_STOP_LOSS_OVERRIDE_PCT:
+            # [AUD-P9] Piso de días mínimos: no cerrar por curva el mismo
+            # día de apertura, salvo que la pérdida ya sea severa
+            # (>= SAME_DAY_STOP_LOSS_OVERRIDE_PCT).
+            sugerencia   = "MANTENER"
+            razon_cierre = (
+                f"diverging + PnL={pnl:.1f}% negativo, pero día {dia_actual} "
+                f"<= {MIN_HOLD_DAYS_BEFORE_CURVE_EXIT} (piso mínimo) → "
+                f"esperar antes de cerrar por curva"
+            )
         else:
             sugerencia   = "CERRAR"
             razon_cierre = (
