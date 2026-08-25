@@ -1,0 +1,31 @@
+{
+  "genome_id": "H10_v1",
+  "horizon": 10,
+  "generation": 1,
+  "parent_ids": [],
+  "fitness": null,
+  "hit_rate": 0.4754,
+  "bias_score": null,
+  "n_evaluations": 4682,
+  "created_at": "2026-07-07T16:52:27.547912+00:00",
+  "features": [
+    "range",
+    "rv_20",
+    "rv_60",
+    "vol_chg",
+    "hurst_60",
+    "hurst_120",
+    "ret_lag_1",
+    "ret_lag_2",
+    "ret_lag_3",
+    "ret_lag_5",
+    "ret_lag_10",
+    "ret_lag_20"
+  ],
+  "model_params": {
+    "alpha_ridge": 1.0,
+    "max_pca": 16,
+    "clip_ret": 0.15,
+    "period": "max"
+  }
+}
