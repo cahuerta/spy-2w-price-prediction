@@ -1,6 +1,35 @@
 # =========================================================
 # backtest_evaluations.py — SHARPE/DRAWDOWN REAL DESDE EVALUACIONES
 # =========================================================
+#
+# FIX v1.1 [AUD-P8-consistencia] (auditoría 2026-08-25):
+#   [B1] _compute_result componía cada evaluación en np.cumprod() como
+#        si cada señal COMPRA/VENDE hubiera usado el 100% del capital
+#        de la cuenta, reinvertido de forma compuesta día a día —
+#        mismo patrón de composición que el auditor confirmó como
+#        incorrecto en backtest_real_trades.py (que sí alimenta
+#        real_performance_report.json). Este archivo no fue citado
+#        con un número específico mal reportado, pero comparte
+#        idéntica construcción matemática, así que tiene el mismo
+#        problema por definición.
+#
+#        Fix: cada retorno diario equivalente se pondera por
+#        POSITION_WEIGHT_PCT (mismo % que MAX_POSITION_PCT en
+#        capital_governor.py, 5% por defecto) antes de componerlo —
+#        simula que solo esa fracción del capital estaría expuesta a
+#        cada señal, no el 100%. Sigue siendo una capa HIPOTÉTICA
+#        (evalúa señales del modelo, no trades reales), así que no
+#        existe una curva de equity real que usar aquí — a diferencia
+#        de backtest_real_trades.py, que sí tiene equity_snapshots.json
+#        disponible para su bloque "real_account".
+#
+#        win_rate y avg_daily_return_pct NO cambian con este fix — no
+#        dependían de la composición, son promedios directos.
+#
+#        Esquema de salida (BacktestResult, claves del dict resultado
+#        de run_backtest_from_evaluations) sin cambios — compatible
+#        con cualquier código que ya lo consuma.
+# =========================================================
 import os
 import json
 import logging
@@ -20,6 +49,11 @@ EVAL_ROOT = DATA_PATH / "evaluations"
 
 TRADING_DAYS_YEAR = 252
 DEFAULT_HORIZON_DAYS = 10
+
+# [B1] Mismo % de capital por posición que capital_governor.py
+# (MAX_POSITION_PCT). Usado para no componer cada señal como si
+# hubiera usado el 100% del capital de la cuenta.
+POSITION_WEIGHT_PCT = float(os.getenv("MAX_POSITION_PCT", "0.05"))
 
 
 def _load_json(path: Path) -> Optional[Dict]:
@@ -105,7 +139,15 @@ def _compute_result(
     label: str,
     dated_returns: List[tuple],
     n_evaluations: int,
+    position_weight_pct: float = POSITION_WEIGHT_PCT,
 ) -> BacktestResult:
+    """
+    [B1] `position_weight_pct` pondera cada retorno diario equivalente
+    antes de componerlo — evita tratar cada señal como si hubiera
+    usado el 100% del capital. Parámetro opcional con default, así
+    que la firma sigue siendo compatible con cualquier llamada
+    existente que solo pase los tres primeros argumentos.
+    """
     trade_level_returns = [r for _, r, _ in dated_returns]
 
     by_date = defaultdict(list)
@@ -113,7 +155,10 @@ def _compute_result(
         if not date_str:
             continue
         daily_equiv = _daily_equivalent_return(total_ret, horizon_days)
-        by_date[date_str].append(daily_equiv)
+        # [B1] Escalar por el % de capital realmente asignable a una
+        # posición, no el 100% — antes se usaba daily_equiv directo acá.
+        weighted_daily_equiv = daily_equiv * position_weight_pct
+        by_date[date_str].append(weighted_daily_equiv)
 
     daily_series = sorted(
         (date_str, float(np.mean(vals))) for date_str, vals in by_date.items()
@@ -213,6 +258,8 @@ def run_backtest_from_evaluations() -> Dict[str, Any]:
 if __name__ == "__main__":
     result = run_backtest_from_evaluations()
 
+    print(f"\n[B1] Peso de posición usado en la simulación: {POSITION_WEIGHT_PCT:.1%} del capital por señal")
+
     print("\n=== ENSEMBLE (COMPRA/VENDE) ===")
     e = result["ensemble"]
     print(f"Trades: {e['n_trades']} (de {e['n_evaluations']} evaluaciones) | Días agregados: {e['n_days']}")
@@ -230,4 +277,5 @@ if __name__ == "__main__":
             f"{h}: trades={r['n_trades']} días={r['n_days']} "
             f"sharpe_clas={r['sharpe_classic']} sharpe_nw={r['sharpe_newey_west']} "
             f"dd={r['max_drawdown']} win={r['win_rate']} ret_total={r['total_return_pct']}%"
-        )
+    )
+    
