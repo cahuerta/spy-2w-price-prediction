@@ -10,8 +10,9 @@ sys.path.insert(0, ROOT_DIR)
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.decomposition import PCA
+from sklearn.model_selection import TimeSeriesSplit
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -44,6 +45,15 @@ CLIP_RET = 0.05
 # rate que solo coincide con el azar (~50-53%), no con edge genuino.
 DRIFT_WINDOW      = int(os.getenv("H1_DRIFT_WINDOW", "60"))
 DRIFT_MIN_PERIODS = int(os.getenv("H1_DRIFT_MIN_PERIODS", "30"))
+
+# [AUD-P10] Auditoría 2026-08-25 (Problema 4): ALPHA_H1=0.08 era una
+# constante hardcodeada sin justificación estadística — la
+# regularización Ridge más débil de los 10 horizontes, propensa a
+# sobreajustar ruido de 1 día (hit rate 47.44%, peor que el azar).
+# Se reemplaza por calibración walk-forward vía RidgeCV, por ticker,
+# en cada corrida — igual variabilidad que si cada ticker tuviera su
+# propio predictor, en vez de una constante única para los 191.
+ALPHA_GRID_H1 = np.logspace(-1, 1.2, 15)  # ~0.1 a ~16
 
 try:
     from data_provider import get_price_history
@@ -97,13 +107,47 @@ def make_features_h1(df: pd.DataFrame):
     return out
 
 # ======================================================
+# [AUD-P10] CALIBRACIÓN DE ALPHA RIDGE — WALK-FORWARD POR TICKER
+# ======================================================
+def _select_alpha_ridge_cv(X: np.ndarray, y: np.ndarray, n_pca: int) -> float:
+    """
+    Calibra alpha_ridge con RidgeCV sobre el espacio PCA, usando
+    TimeSeriesSplit para no filtrar información futura (walk-forward).
+    Se ejecuta por ticker, en cada corrida — reemplaza la constante
+    ALPHA_H1 hardcodeada. Si falla por cualquier motivo (pocos datos,
+    problema numérico), cae de vuelta a ALPHA_H1 sin interrumpir la
+    predicción.
+    """
+    try:
+        n_samples = len(y)
+        scaler_tmp = StandardScaler()
+        X_scaled   = scaler_tmp.fit_transform(X)
+        pca_tmp    = PCA(n_components=n_pca, random_state=42)
+        X_pca      = pca_tmp.fit_transform(X_scaled)
+
+        n_splits = min(5, max(2, n_samples // 30))
+        tscv     = TimeSeriesSplit(n_splits=n_splits)
+
+        ridge_cv = RidgeCV(alphas=ALPHA_GRID_H1, cv=tscv)
+        ridge_cv.fit(X_pca, y)
+        return float(ridge_cv.alpha_)
+    except Exception:
+        return ALPHA_H1
+
+
+# ======================================================
 # PREDICTOR H1
 # ======================================================
 def run_predictor_h1(ticker: str):
     raw = get_price_history(ticker=ticker, period="2y", interval="1d")
 
     # ── DARWIN: cargar genoma activo ──────────────────
-    _alpha    = ALPHA_H1
+    # [AUD-P10] _alpha_from_genome distingue "Darwin ya evolucionó un
+    # alpha propio para este horizonte" (None si no) de "usar el
+    # default". Si Darwin no tiene un valor propio todavía, el default
+    # ya no es la constante ALPHA_H1 — se calibra vía RidgeCV más abajo,
+    # una vez que X e y están listos.
+    _alpha_from_genome = None
     _max_pca  = MAX_PCA_COMPONENTS
     _clip_ret = CLIP_RET
     _decay    = 0.0               # [SW1] default neutro — sin cambio de comportamiento
@@ -112,7 +156,7 @@ def run_predictor_h1(ticker: str):
     if DARWIN_PREDICTOR:
         try:
             genome    = load_active_genome(HORIZON)
-            _alpha    = genome.model_params.get("alpha_ridge",         ALPHA_H1)
+            _alpha_from_genome = genome.model_params.get("alpha_ridge")  # None si Darwin no lo definió
             _max_pca  = genome.model_params.get("max_pca",             MAX_PCA_COMPONENTS)
             _clip_ret = genome.model_params.get("clip_ret",            CLIP_RET)
             _decay    = genome.model_params.get("sample_weight_decay", 0.0)  # [SW1]
@@ -167,6 +211,14 @@ def run_predictor_h1(ticker: str):
 
     n_samples, n_features = X.shape
     dynamic_pca = max(1, min(_max_pca, n_features, n_samples - 1))
+
+    # [AUD-P10] Si Darwin ya evolucionó un alpha propio para este
+    # horizonte, se respeta (no se pisa la evolución). Si no, se
+    # calibra por ticker vía RidgeCV en vez de usar la constante fija.
+    if _alpha_from_genome is not None:
+        _alpha = float(_alpha_from_genome)
+    else:
+        _alpha = _select_alpha_ridge_cv(X, y, dynamic_pca)
 
     model = Pipeline([
         ("scaler", StandardScaler()),
