@@ -85,6 +85,16 @@ TRAILING_PNL_THRESHOLD = float(os.getenv("INTRADAY_TRAILING_PNL", "0.02"))  # 2%
 # Caída desde máximo para activar trailing stop
 TRAILING_DROP_PCT      = float(os.getenv("INTRADAY_TRAILING_DROP", "0.05"))  # 5%
 
+# [N2] Diseño acordado 2026-08-25: si un ticker en cartera aparece en
+# el top 15 BAJISTA del ranking de noticias (news_ranker.py), se usa
+# un umbral de "diverging" más ajustado SOLO para esa posición, ese
+# día — reacciona antes a la caída en vez de esperar el 3% normal.
+# No toca el stop loss duro de los PM (última línea de defensa
+# intacta) — solo el umbral de sugerencia de este tracker.
+NEWS_RANKING_FILE    = DATA_PATH / "news_ranking.json"
+NEWS_TIGHT_STD_MULT  = float(os.getenv("INTRADAY_NEWS_STD_MULT",  "1.0"))   # vs 3.0 normal
+NEWS_TIGHT_THRESHOLD = float(os.getenv("INTRADAY_NEWS_THRESHOLD", "0.990"))  # vs 0.970 normal
+
 
 # =========================================================
 # HELPERS
@@ -105,6 +115,28 @@ def _save_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     tmp.replace(path)
+
+
+# =========================================================
+# [N2] TICKERS CON NOTICIA BAJISTA — stop más ajustado
+# =========================================================
+
+def _load_bearish_news_tickers() -> set:
+    """
+    Lee news_ranking.json (generado por news_ranker.py) y retorna el
+    conjunto de tickers en el top 15 bajista. Se usa para ajustar el
+    umbral de "diverging" en posiciones abiertas — no filtra por si
+    el ticker está en el universo, porque lo que importa acá es si
+    TENEMOS la posición, no si es candidato nuevo.
+    """
+    data = _load_json(NEWS_RANKING_FILE)
+    if not data:
+        return set()
+    return {
+        str(item.get("ticker", "")).upper()
+        for item in data.get("bearish", [])
+        if item.get("ticker")
+    }
 
 
 # =========================================================
@@ -439,7 +471,12 @@ def _evaluate_entry_timing(ticker: str) -> Optional[Dict]:
 # EVALUAR POSICIÓN ABIERTA VS CURVA
 # =========================================================
 
-def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Optional[Dict]:
+def _evaluate_open_position(
+    ticker: str,
+    dia_actual: int,
+    entry_date: str,
+    bearish_news_tickers: Optional[set] = None,
+) -> Optional[Dict]:
     """
     Evalúa si una posición abierta debe cerrarse ahora o mantenerse.
     Considera PnL actual: no sugiere cerrar posiciones ganadoras
@@ -451,7 +488,19 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
     para decidir si un cierre divergente tiene sentido estratégico
     (ej: diverging + PnL positivo + slope_futura=baja → PM puede cerrar
     tomando ganancia antes de caída esperada).
+
+    [N2] Si `bearish_news_tickers` es None, se carga fresco desde
+    news_ranking.json (llamada standalone). Si el ticker aparece ahí,
+    se usa un umbral de "diverging" más ajustado (reacciona antes)
+    solo para esta evaluación.
     """
+    if bearish_news_tickers is None:
+        bearish_news_tickers = _load_bearish_news_tickers()
+
+    has_bearish_news = ticker.upper() in bearish_news_tickers
+    std_mult_used  = NEWS_TIGHT_STD_MULT  if has_bearish_news else DIVERGING_STD_MULT
+    threshold_used = NEWS_TIGHT_THRESHOLD if has_bearish_news else DIVERGING_THRESHOLD
+
     precio_actual   = _get_current_price(ticker)
     precio_esperado = _get_expected_price_for_day(ticker, dia_actual)
 
@@ -470,7 +519,7 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
     if upper and lower and lower > 0:
         usar_bandas         = True
         std_band            = (upper - lower) / 3.0
-        diverging_threshold = lower - (DIVERGING_STD_MULT * std_band)
+        diverging_threshold = lower - (std_mult_used * std_band)
 
         if precio_actual > upper:
             curve_status = "ahead"
@@ -486,7 +535,7 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
             curve_status = "ahead"
         elif tracking_ratio >= LAGGING_THRESHOLD:
             curve_status = "on_track"
-        elif tracking_ratio >= DIVERGING_THRESHOLD:
+        elif tracking_ratio >= threshold_used:
             curve_status = "lagging"
         else:
             curve_status = "diverging"
@@ -571,6 +620,7 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         f"ratio={tracking_ratio:.3f} PnL={pnl:.1f}% → {curve_status} → {sugerencia}"
         + (f" [bandas]" if usar_bandas else " [fallback]")
         + f" [yahoo]"
+        + (" [⚠️ noticia bajista: stop ajustado]" if has_bearish_news else "")
     )
 
     result = {
@@ -589,6 +639,7 @@ def _evaluate_open_position(ticker: str, dia_actual: int, entry_date: str) -> Op
         "razon":                  razon_cierre,
         "uso_bandas":             usar_bandas,
         "fuente_precio":          "yahoo",
+        "news_bearish_alert":     has_bearish_news,   # [N2] trazabilidad
     }
 
     if usar_bandas:
@@ -677,10 +728,17 @@ def evaluar_posiciones_abiertas(tickers: List[str]) -> Dict[str, Dict]:
     posiciones = _get_open_positions_with_date(tickers_filter=tickers)
     resultado: Dict[str, Dict] = {}
 
+    # [N2] Cargar UNA vez para todas las posiciones de este ciclo,
+    # no una vez por ticker.
+    bearish_news_tickers = _load_bearish_news_tickers()
+    if bearish_news_tickers:
+        logger.info(f"⚠️ Tickers con noticia bajista hoy: {sorted(bearish_news_tickers)}")
+
     for pos in posiciones:
         try:
             señal = _evaluate_open_position(
-                pos["ticker"], pos["dia_actual"], pos["entry_date"]
+                pos["ticker"], pos["dia_actual"], pos["entry_date"],
+                bearish_news_tickers=bearish_news_tickers,
             )
             if señal:
                 resultado[pos["ticker"]] = {**señal, "evaluado_hora": hora_str}
