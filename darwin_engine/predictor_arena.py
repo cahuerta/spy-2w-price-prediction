@@ -26,6 +26,26 @@ FIXES:
         Esto significaba que el respaldo a GitHub nunca se disparaba
         cuando el campeón mejoraba orgánicamente sin que un shadow
         lo superara. Ahora se compara contra el hit_rate real anterior.
+
+  [AR2] (en _evaluate_shadow_hit_rates) excluye champion_baseline.json.
+
+  [AR3] (auditoría 2026-08-25, Calibración punto 3) _run_h_cycle:
+        al promover un shadow a campeón, el nuevo campeón heredaba
+        `hit_rate = best_shadow_hit` (validado con shadow_n >=
+        MIN_EVALS_TO_COMPETE evaluaciones simuladas) pero su propio
+        campo `n_evaluations` (contador de evaluaciones REALES del
+        evaluator en producción) seguía en 0 — un genoma recién
+        mutado nunca operó en producción todavía. El sistema
+        terminaba mostrando un hit_rate "de fábrica" como si fuera
+        un resultado validado en vivo (confirmado en
+        predictor_genomes/H{2,4,5,10}/champion.json: hit_rate con
+        valor pero n_evaluations=0).
+        Fix: si el genoma recién promovido tiene n_evaluations=0,
+        se fuerza hit_rate=None explícitamente en vez de heredar el
+        valor del shadow — el campeón queda "sin validar" hasta que
+        el evaluator en producción le genere evaluaciones reales
+        (momento en que _read_hit_rates_from_evaluator() lo
+        alimentará con datos genuinos en el próximo ciclo).
 """
 
 import json
@@ -219,7 +239,7 @@ def _write_genome_to_github(genome: PredictorGenome) -> bool:
             sha = r.json().get("sha")
 
         payload = {
-            "message":   f"darwin: H{genome.horizon} promote {genome.genome_id} hit={genome.hit_rate:.3f}",
+            "message":   f"darwin: H{genome.horizon} promote {genome.genome_id} hit={genome.hit_rate if genome.hit_rate is not None else 'None'}",
             "content":   encoded,
             "branch":    branch,
             "committer": {"name": "Darwin Engine", "email": "darwin@quantenterprise.cl"},
@@ -308,8 +328,28 @@ def _run_h_cycle(
                 continue
 
         if new_champion_data:
-            new_champion          = PredictorGenome.from_dict(new_champion_data)
-            new_champion.hit_rate = best_shadow_hit
+            new_champion = PredictorGenome.from_dict(new_champion_data)
+
+            # [AR3] El genoma recién promovido puede no tener
+            # evaluaciones REALES en producción todavía (n_evaluations
+            # heredado de la mutación, típicamente 0). Su hit_rate
+            # validado en shadow (best_shadow_hit) no debe presentarse
+            # como si fuera un resultado en vivo — se fuerza a None
+            # hasta que el evaluator real lo alimente con datos
+            # genuinos en un ciclo posterior.
+            inherited_n_evals = int(new_champion_data.get("n_evaluations", 0) or 0)
+            if inherited_n_evals == 0:
+                logger.warning(
+                    f"⚠️ H{horizon} nuevo campeón {new_champion.genome_id} promovido "
+                    f"con n_evaluations=0 (hit_rate shadow={best_shadow_hit:.2%} no "
+                    f"validado en producción) → hit_rate forzado a None hasta "
+                    f"evaluación real"
+                )
+                new_champion.hit_rate = None
+            else:
+                new_champion.hit_rate = best_shadow_hit
+            new_champion.data["n_evaluations"] = inherited_n_evals
+
             # [SW2] Preservar bias_score en el nuevo campeón
             if bias_score is not None:
                 new_champion.bias_score = bias_score
@@ -319,7 +359,8 @@ def _run_h_cycle(
             github_written = _write_genome_to_github(new_champion)
             logger.info(
                 f"🏆 H{horizon} NUEVO CAMPEÓN: {new_champion.genome_id} | "
-                f"hit={best_shadow_hit:.2%} vs anterior={hit_rate:.2%}"
+                f"hit_rate={new_champion.hit_rate if new_champion.hit_rate is not None else 'sin validar'} "
+                f"vs anterior={hit_rate:.2%}"
             )
     else:
         if not dry_run:
