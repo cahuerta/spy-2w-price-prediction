@@ -1,5 +1,5 @@
 """
-pm_defensive.py - DEFENSIVE POSITION MANAGER v2.1 PRODUCCION
+pm_defensive.py - DEFENSIVE POSITION MANAGER v2.2 PRODUCCION
 
 FIX v1.8:
   [F7] entry_price fallback a avg_entry_price — Alpaca devuelve
@@ -45,6 +45,22 @@ v2.1:
        pensado como último recurso, no como referencia de "pérdida
        moderada"), se cierra antes de esperar el time_exit o el stop
        catastrófico completo.
+
+v2.2 (auditoría 2026-08-26, Problema 1):
+  [AUD-P1] `anchor_exposure_pct` se inicializaba en 0.0 y NUNCA se
+       reasignaba en ningún otro punto del archivo — allow_new_positions()
+       comparaba siempre 0.0 < MAX_ANCHOR_EXPOSURE_PCT (0.30), condición
+       eternamente verdadera. Además evaluate_portfolio() (la función
+       que realmente abre anclas) nunca llamaba a allow_new_positions()
+       — el guardrail era código muerto, decorativo, fuera de la ruta
+       de ejecución real.
+       Fix: evaluate_portfolio() guarda las posiciones actuales en
+       self._current_positions al inicio; allow_new_positions() ahora
+       calcula la exposición real (valor de mercado de posiciones
+       ancla / capital total) antes de comparar; y evaluate_portfolio()
+       llama a allow_new_positions() antes de abrir anclas nuevas
+       (apertura proactiva) — si el guardrail bloquea, no se agregan
+       aperturas nuevas de anclas ese ciclo.
 """
 
 import os
@@ -259,7 +275,7 @@ class DefensiveDecision:
 
 
 # =========================================================
-# PM DEFENSIVO v2.1
+# PM DEFENSIVO v2.2
 # =========================================================
 
 class PMDefensive:
@@ -267,10 +283,11 @@ class PMDefensive:
     def __init__(self):
         self.tz                  = CL_TIMEZONE
         self.anchor_exposure_pct = 0.0
+        self._current_positions  = []  # [AUD-P1] usado por allow_new_positions
         self._anchor_universe    = _load_anchor_universe()
         self._anchor_tickers     = {a["ticker"].upper() for a in self._anchor_universe}
         logger.info(
-            f"PMDefensive v2.1 | anclas={len(self._anchor_tickers)}: "
+            f"PMDefensive v2.2 | anclas={len(self._anchor_tickers)}: "
             f"{sorted(self._anchor_tickers)}"
         )
 
@@ -523,6 +540,10 @@ class PMDefensive:
         total_capital:   float = 1000000,
     ) -> List[DefensiveDecision]:
 
+        # [AUD-P1] Guardar posiciones actuales — allow_new_positions()
+        # las necesita para calcular la exposición real a anclas.
+        self._current_positions = positions
+
         decisions    = []
         alpha_scores = _load_alpha_scores()
 
@@ -560,12 +581,22 @@ class PMDefensive:
                 decisions.extend(rotation_decisions)
                 rotations_done += 1
 
-        # Apertura proactiva de anchors
+        # [AUD-P1] Apertura proactiva de anchors — ahora SÍ pasa por el
+        # guardrail de exposición máxima antes de agregar aperturas nuevas.
         already_opening = {d.ticker for d in decisions if d.action == "OPEN"}
-        anchors_to_open = [
-            a for a in eligible_anchors
-            if a["ticker"].upper() not in already_opening
-        ]
+
+        if not self.allow_new_positions(total_capital):
+            logger.warning(
+                f"🛑 Guardrail de exposición a anclas activo "
+                f"({self.anchor_exposure_pct:.1%} >= {MAX_ANCHOR_EXPOSURE_PCT:.0%}) "
+                f"→ sin aperturas proactivas nuevas de anclas este ciclo"
+            )
+            anchors_to_open = []
+        else:
+            anchors_to_open = [
+                a for a in eligible_anchors
+                if a["ticker"].upper() not in already_opening
+            ]
 
         ts = datetime.now(self.tz).isoformat()
         for anchor in anchors_to_open[:3]:
@@ -586,14 +617,34 @@ class PMDefensive:
         holds  = len([d for d in decisions if d.action == "HOLD"])
 
         logger.info(
-            f"DEFENSIVE v2.1 | pos={len(positions)} anchors={len(anchors)} "
+            f"DEFENSIVE v2.2 | pos={len(positions)} anchors={len(anchors)} "
             f"| closes={closes} opens={opens} holds={holds} "
-            f"rotates={rotations_done} | capital=${total_capital:,.0f}"
+            f"rotates={rotations_done} | capital=${total_capital:,.0f} "
+            f"| anchor_exposure={self.anchor_exposure_pct:.1%}"
         )
 
         return decisions
 
     def allow_new_positions(self, total_capital: float) -> bool:
+        """
+        [AUD-P1] Ahora SÍ calcula la exposición real a anclas antes de
+        comparar — antes siempre comparaba contra el 0.0 del __init__,
+        que nunca se actualizaba, así que el guardrail nunca bloqueaba
+        nada. Usa self._current_positions, guardado por
+        evaluate_portfolio() al inicio de cada ciclo.
+        """
+        if total_capital <= 0:
+            self.anchor_exposure_pct = 0.0
+            return False
+
+        exposed = sum(
+            _safe_price(p, "price_now", "current_price", "entry_price", "avg_entry_price")
+            * float(p.get("qty", 0) or 0)
+            for p in self._current_positions
+            if p.get("is_anchor") or p.get("ticker", "").upper() in self._anchor_tickers
+        )
+
+        self.anchor_exposure_pct = exposed / total_capital
         return self.anchor_exposure_pct < MAX_ANCHOR_EXPOSURE_PCT
 
 
@@ -632,12 +683,14 @@ if __name__ == "__main__":
         },
     ]
 
-    print("\nPMDefensive v2.1 SELF-TEST:")
+    print("\nPMDefensive v2.2 SELF-TEST:")
     results = pm.evaluate_portfolio(test_positions, total_capital=85000)
 
     print("\nDECISIONES:")
     for d in results:
         print(f"  {d.action:6} {d.ticker:12} {d.reason}")
+
+    print(f"\nExposición a anclas calculada: {pm.anchor_exposure_pct:.2%}")
 
     jnj = next((d for d in results if d.ticker == "JNJ"),  None)
     ko  = next((d for d in results if d.ticker == "KO"),   None)
@@ -647,4 +700,4 @@ if __name__ == "__main__":
     assert ko  and ko.action  == "HOLD", f"❌ KO debe ser HOLD, es {ko}"
     assert stt and stt.action == "HOLD", f"❌ STT sin entry_date debe ser HOLD (age=0), es {stt}"
 
-    print("\n✅ v2.1 TEST OK — curva desde disco integrada, retrocompatibilidad v1.9 confirmada")
+    print("\n✅ v2.2 TEST OK — curva desde disco integrada, guardrail de exposición activo, retrocompatibilidad v1.9 confirmada")
