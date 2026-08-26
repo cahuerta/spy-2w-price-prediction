@@ -1,4 +1,4 @@
-# scheduler.py — v2.4
+# scheduler.py — v2.5
 # =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
@@ -22,6 +22,8 @@
 #
 # EJECUCIONES DIARIAS:
 #   01:00 → Code Auditor Agent — auditoría completa del repo
+#   11:00 → Macro Factors — oro/petróleo/DXY/VIX/etc, antes de la
+#           apertura, para que el régimen del día ya tenga los datos [v2.5]
 #   11:30 → APERTURA  — predicción + alpha + trading (abre Y cierra)
 #   15:30 → CIERRE    — solo cierra posiciones divergentes
 #   12:00-15:00 → Monitor horario (cada hora): [v2.4] news_ranker.py
@@ -92,6 +94,13 @@ MIN_SHADOW_EVAL  = int(os.getenv("SHADOW_EVAL_MIN",  "0"))
 # v2.2 — Code Auditor Agent
 HORA_AUDITOR = int(os.getenv("AUDITOR_HOUR", "1"))
 MIN_AUDITOR  = int(os.getenv("AUDITOR_MIN",  "0"))
+
+# [v2.5] Macro Factors — datos macro (oro, petróleo, DXY, VIX, etc.)
+# No cambian intradía de forma relevante, así que corre una vez al
+# día, antes de la apertura (11:30), para que market_quant_context.py
+# tenga /data/macro_context.json fresco cuando se evalúe el régimen.
+HORA_MACRO_FACTORS = int(os.getenv("MACRO_FACTORS_HOUR", "11"))
+MIN_MACRO_FACTORS  = int(os.getenv("MACRO_FACTORS_MIN",  "0"))
 
 
 # ══════════════════════════════════════════════════════
@@ -285,6 +294,26 @@ def _trigger_shadow_evaluator(motivo: str):
 # CODE AUDITOR AGENT (v2.2)
 # ══════════════════════════════════════════════════════
 
+def _trigger_macro_factors(motivo: str):
+    """
+    [v2.5] Ejecuta macro_factors.py — trae oro, petróleo, gas, cobre,
+    plata, DXY, TNX, VIX, SPY vía Yahoo Finance y calcula los scores
+    agregados (macro_stress_magnitude, macro_risk_off_score) que
+    market_quant_context.py ya sabe leer opcionalmente.
+    """
+    print(f"🌍 Macro Factors [{motivo}]")
+    try:
+        from macro_factors import run_macro_factors
+        result = run_macro_factors()
+        print(
+            f"✅ Macro Factors OK | {result.get('n_available')}/{result.get('n_configured')} factores | "
+            f"stress={result.get('macro_stress_magnitude')} | "
+            f"risk_off={result.get('macro_risk_off_score')}"
+        )
+    except Exception as e:
+        print(f"⚠️ Macro Factors falló (continuando igual): {e}")
+
+
 def _trigger_code_auditor(motivo: str):
     """
     v2.2 — Ejecuta el agente auditor de código.
@@ -330,6 +359,7 @@ def _loop():
     print(
         f"🕐 Quant Scheduler iniciado\n"
         f"   🔍 AUDITOR:  {HORA_AUDITOR:02d}:{MIN_AUDITOR:02d} Chile (diario)\n"
+        f"   🌍 MACRO:    {HORA_MACRO_FACTORS:02d}:{MIN_MACRO_FACTORS:02d} Chile (diario)\n"
         f"   🟢 APERTURA: {HORA_APERTURA:02d}:{MIN_APERTURA:02d} Chile\n"
         f"   🔴 CIERRE:   {HORA_CIERRE:02d}:{MIN_CIERRE:02d} Chile\n"
         f"   📡 MONITOR:  {MONITOR_HORA_INICIO:02d}:00-{MONITOR_HORA_FIN:02d}:00 Chile (cada hora)\n"
@@ -345,6 +375,7 @@ def _loop():
     darwin_evolution_hoy: str | None = None
     shadow_eval_hoy:      str | None = None
     auditor_hoy:          str | None = None
+    macro_factors_hoy:    str | None = None
 
     while True:
         ahora     = datetime.now(CHILE_TZ)
@@ -358,6 +389,16 @@ def _loop():
         ):
             _trigger_code_auditor("diario_01:00")
             auditor_hoy = fecha_hoy
+
+        # ── 🌍 MACRO FACTORS: 11:00 — antes de la apertura ────
+        if (
+            _es_dia_habil(ahora)
+            and ahora.hour       == HORA_MACRO_FACTORS
+            and MIN_MACRO_FACTORS <= ahora.minute < MIN_MACRO_FACTORS + 10
+            and macro_factors_hoy != fecha_hoy
+        ):
+            _trigger_macro_factors(f"diario_{HORA_MACRO_FACTORS:02d}:{MIN_MACRO_FACTORS:02d}")
+            macro_factors_hoy = fecha_hoy
 
         # ── 🟢 APERTURA: 11:30 — predice + abre + cierra ──
         if (
@@ -458,4 +499,3 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
-        
