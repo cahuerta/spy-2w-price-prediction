@@ -771,22 +771,22 @@ class TradingOrchestrator:
         # =========================================================
         # PASO 4: Construir cola de APERTURAS desde PM
         # =========================================================
+        # [AUD-P3][2026-08-26] Se eliminó el bloque ALPHA_INJECT que
+        # existía aquí: iteraba sobre TODO alpha_map (no sobre
+        # decisiones del PM) y agregaba aperturas directas con
+        # target_pct=0.05 fijo, sin pasar por ningún criterio de
+        # calidad del Portfolio Manager, sin distinguir anclas, y con
+        # un umbral (self._alpha_threshold(mode)) que ni siquiera
+        # coincidía con el que alpha_engine_v4.py usa para reportar
+        # "candidatos operables" (0.70 fijo vs 0.65/0.75/0.85
+        # dinámico aquí). Ahora TODA apertura sale exclusivamente de
+        # pm_decisions — mismo criterio de calidad y sizing para
+        # cualquier posición nueva, sin vía paralela sin control.
         for decision in pm_decisions:
             if decision.get("action") in ["OPEN", "ROTATE"]:
                 opens.append(decision)
 
         threshold = self._alpha_threshold(mode)
-
-        for ticker, data in alpha_map.items():
-            score = data.get("alpha_score", 0)
-            if ticker not in portfolio_tickers and score >= threshold:
-                opens.append({
-                    "action":     "OPEN",
-                    "ticker":     ticker,
-                    "target_pct": 0.05,
-                    "reason":     f"ALPHA_INJECT_{score:.3f}",
-                    "alpha":      score,
-                })
 
         # =========================================================
         # [IT2][IT3] TRACKER VALIDA TIMING DE ENTRADAS
