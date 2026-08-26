@@ -1,5 +1,5 @@
 # =========================================================
-# market_quant_context.py — V3.3 ADAPTIVE REGIME
+# market_quant_context.py — V3.4 ADAPTIVE REGIME + MACRO
 # =========================================================
 # V3.2 → V3.3:
 #   [A1] classify_regime lee umbrales desde regime_thresholds.json
@@ -26,6 +26,29 @@
 #        Este diccionario no se usa en este archivo (solo en
 #        regime_threshold_learner.py), pero se corrige aquí también
 #        para que ambas copias queden consistentes hasta centralizarlo.
+#
+# V3.4 (2026-08-26): integración de factores macro (macro_factors.py)
+#   [M1] classify_regime() recibe dos parámetros OPCIONALES nuevos
+#        (macro_stress, macro_risk_off), default None — si no se
+#        pasan, o si son None, el comportamiento es IDÉNTICO a V3.3.
+#        Ningún llamador existente que no los use se rompe.
+#   [M2] DEFAULT_THRESHOLDS gana una sección "macro" nueva, sin tocar
+#        "defensive"/"growth". load_thresholds() usa .get("macro", ...)
+#        con fallback — un regime_thresholds.json real ya persistido
+#        en producción (sin la clave "macro" todavía) sigue
+#        cargándose sin error; la sección macro se completa con
+#        defaults la primera vez, sin pisar los umbrales de
+#        defensive/growth ya aprendidos.
+#   [M3] _load_macro_scores() lee /data/macro_context.json (generado
+#        por macro_factors.py, proceso separado) — este archivo NO
+#        hace llamadas nuevas a Yahoo Finance, solo lee lo que
+#        macro_factors.py ya calculó y guardó.
+#   [M4] QuantMarketContext gana 3 campos nuevos con default (no
+#        rompe construcciones existentes): macro_stress_magnitude,
+#        macro_risk_off_score, macro_source.
+#   [M5] save_market_snapshot() agrega los dos scores al snapshot
+#        diario — regime_threshold_learner.py los necesita para poder
+#        ajustar los umbrales macro.
 # =========================================================
 
 import os
@@ -33,7 +56,7 @@ import json
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, asdict
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -54,9 +77,10 @@ CORR_LOOKBACK  = 30
 DATA_PATH          = Path(os.getenv("DATA_PATH", "/data"))
 MARKET_HISTORY_DIR = DATA_PATH / "market_history"
 THRESHOLDS_FILE    = DATA_PATH / "regime_thresholds.json"
+MACRO_CONTEXT_FILE = DATA_PATH / "macro_context.json"  # [M3]
 
 # =========================================================
-# [A2] UMBRALES POR DEFECTO — REALISTAS
+# [A2][M2] UMBRALES POR DEFECTO — REALISTAS
 # =========================================================
 DEFAULT_THRESHOLDS = {
     "defensive": {
@@ -68,6 +92,12 @@ DEFAULT_THRESHOLDS = {
         "trend_min": 0.05,
         "vol_max":   0.15,
         "corr_max":  0.55,
+    },
+    # [M2] Sección nueva — no reemplaza nada de defensive/growth.
+    "macro": {
+        "stress_magnitude_min":       2.0,   # |zscore| promedio >= esto → contribuye a defensive
+        "risk_off_score_min":         1.5,   # risk_off_score >= esto → contribuye a defensive
+        "risk_off_score_max_growth": -0.3,   # risk_off_score >= esto → bloquea growth
     },
     "meta": {
         "version":        1,
@@ -92,6 +122,15 @@ THRESHOLD_LIMITS = {
         "vol_max":   (0.08,  0.25),
         "corr_max":  (0.35,  0.70),
     },
+    # [M2] mismos límites que regime_threshold_learner.py — no se usa
+    # en este archivo (solo en el learner), se mantiene por
+    # consistencia hasta centralizarlo, igual que ya se hacía con
+    # defensive/growth (ver nota [A5] arriba).
+    "macro": {
+        "stress_magnitude_min":      (1.0,  3.0),
+        "risk_off_score_min":        (0.5,  2.5),
+        "risk_off_score_max_growth": (-1.0, 0.0),
+    },
 }
 
 
@@ -104,6 +143,11 @@ def load_thresholds() -> Dict:
         try:
             data = json.loads(THRESHOLDS_FILE.read_text())
             if "defensive" in data and "growth" in data:
+                # [M2] Compatibilidad: un archivo ya persistido sin la
+                # clave "macro" se completa con el default, sin tocar
+                # defensive/growth ya aprendidos.
+                if "macro" not in data:
+                    data["macro"] = DEFAULT_THRESHOLDS["macro"].copy()
                 return data
         except Exception:
             pass
@@ -139,6 +183,33 @@ def _scalar(x, default: float = 0.0) -> float:
 
 
 # =========================================================
+# [M3] CARGA DE FACTORES MACRO
+# =========================================================
+
+def _load_macro_scores() -> tuple:
+    """
+    [M3] Lee /data/macro_context.json (generado por macro_factors.py,
+    proceso separado — este archivo no llama a Yahoo Finance).
+    Retorna (macro_stress_magnitude, macro_risk_off_score, source).
+    Si el archivo no existe o falta algún campo, retorna (None, None,
+    "unavailable") — classify_regime() ya maneja None sin romper
+    nada (ver [M1]).
+    """
+    if not MACRO_CONTEXT_FILE.exists():
+        return None, None, "unavailable"
+    try:
+        data = json.loads(MACRO_CONTEXT_FILE.read_text())
+        stress   = data.get("macro_stress_magnitude")
+        risk_off = data.get("macro_risk_off_score")
+        stress   = float(stress)   if stress   is not None else None
+        risk_off = float(risk_off) if risk_off is not None else None
+        source   = "measured" if (stress is not None or risk_off is not None) else "unavailable"
+        return stress, risk_off, source
+    except Exception:
+        return None, None, "unavailable"
+
+
+# =========================================================
 # DATACLASS SALIDA
 # =========================================================
 
@@ -153,6 +224,10 @@ class QuantMarketContext:
     n_observations: int
     corr_source: Literal["measured", "historical", "knn", "unavailable"]
     thresholds_used: Dict
+    # [M4] Campos nuevos con default — no rompe construcciones existentes.
+    macro_stress_magnitude: Optional[float] = None
+    macro_risk_off_score:   Optional[float] = None
+    macro_source: Literal["measured", "unavailable"] = "unavailable"
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -214,7 +289,13 @@ def load_market_history() -> pd.DataFrame:
 
 
 def save_market_snapshot(ctx: QuantMarketContext, spy_price: float) -> None:
-    """[A3] Snapshot diario para aprendizaje del learner."""
+    """
+    [A3] Snapshot diario para aprendizaje del learner.
+    [M5] Se agregan macro_stress_magnitude y macro_risk_off_score al
+    snapshot — regime_threshold_learner.py los necesita para poder
+    ajustar los umbrales macro. Snapshots viejos sin estas claves
+    siguen siendo válidos (el learner usa .get() con default None).
+    """
     MARKET_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.utcnow().date().isoformat()
     path  = MARKET_HISTORY_DIR / f"{today}.json"
@@ -229,6 +310,8 @@ def save_market_snapshot(ctx: QuantMarketContext, spy_price: float) -> None:
         "cross_asset_correlation": ctx.cross_asset_correlation,
         "spy_price":               round(float(spy_price), 4),
         "thresholds_used":         ctx.thresholds_used,
+        "macro_stress_magnitude":  ctx.macro_stress_magnitude,  # [M5]
+        "macro_risk_off_score":    ctx.macro_risk_off_score,    # [M5]
     }
     path.write_text(json.dumps(snapshot, indent=2))
 
@@ -272,16 +355,46 @@ def classify_downside(dd: float) -> Literal["low", "medium", "high", "unknown"]:
 
 
 def classify_regime(
-    vol: float, dd: float, corr: float, trend: float, thresholds: Dict,
+    vol: float,
+    dd: float,
+    corr: float,
+    trend: float,
+    thresholds: Dict,
+    macro_stress: Optional[float] = None,     # [M1]
+    macro_risk_off: Optional[float] = None,   # [M1]
 ) -> Literal["growth", "neutral", "defensive"]:
+    """
+    [M1] macro_stress y macro_risk_off son OPCIONALES (default None).
+    Si no se pasan, o si macro_context.json no tiene datos ese día,
+    el comportamiento es IDÉNTICO a V3.3 — ningún llamador existente
+    que no los use se rompe.
+    """
     if any(np.isnan(x) for x in [vol, dd, corr, trend]):
         return "neutral"
+
     td = thresholds["defensive"]
     tg = thresholds["growth"]
-    if dd <= td["dd_max"] or vol >= td["vol_min"] or corr >= td["corr_min"]:
+    tm = thresholds.get("macro", DEFAULT_THRESHOLDS["macro"])  # [M2] fallback seguro
+
+    # [M1] El estrés macro solo puede EMPUJAR hacia defensive, nunca
+    # bloquear defensive ni forzar growth por sí solo.
+    macro_triggers_defensive = (
+        (macro_stress   is not None and macro_stress   >= tm.get("stress_magnitude_min", 2.0))
+        or (macro_risk_off is not None and macro_risk_off >= tm.get("risk_off_score_min", 1.5))
+    )
+
+    if dd <= td["dd_max"] or vol >= td["vol_min"] or corr >= td["corr_min"] or macro_triggers_defensive:
         return "defensive"
-    if trend > tg["trend_min"] and vol <= tg["vol_max"] and corr < tg["corr_max"]:
+
+    # [M1] El estrés macro solo puede BLOQUEAR growth, nunca forzarlo.
+    macro_blocks_growth = (
+        macro_risk_off is not None
+        and macro_risk_off >= tm.get("risk_off_score_max_growth", -0.3)
+    )
+
+    if trend > tg["trend_min"] and vol <= tg["vol_max"] and corr < tg["corr_max"] and not macro_blocks_growth:
         return "growth"
+
     return "neutral"
 
 
@@ -344,7 +457,10 @@ def run_market_state() -> QuantMarketContext:
     if corr == 0.0:
         source = "unavailable"
 
-    regime = classify_regime(vol, dd, corr, trend, thresholds)
+    # [M3] Cargar factores macro — no hace llamadas nuevas a Yahoo.
+    macro_stress, macro_risk_off, macro_source = _load_macro_scores()
+
+    regime = classify_regime(vol, dd, corr, trend, thresholds, macro_stress, macro_risk_off)
 
     ctx = QuantMarketContext(
         regime=regime,
@@ -358,7 +474,11 @@ def run_market_state() -> QuantMarketContext:
         thresholds_used={
             "defensive": thresholds["defensive"],
             "growth":    thresholds["growth"],
+            "macro":     thresholds.get("macro", DEFAULT_THRESHOLDS["macro"]),  # [M2]
         },
+        macro_stress_magnitude=macro_stress,   # [M4]
+        macro_risk_off_score=macro_risk_off,   # [M4]
+        macro_source=macro_source,             # [M4]
     )
 
     save_market_snapshot(ctx, spy_price)
