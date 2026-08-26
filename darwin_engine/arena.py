@@ -26,6 +26,27 @@ FIX v1.2 [AUD-D2]:
        MISMO ciclo que el campeón (mismo momento, mismo alpha_map,
        portfolio propio independiente). El campeón sigue midiéndose
        exclusivamente con sus trades reales — sin cambios ahí.
+
+FIX v1.3 [AUD-P2] (auditoría 2026-08-26, Problema 2):
+  [P2] MIN_IMPROVEMENT_PCT=0.05 era un delta ABSOLUTO fijo sobre un
+       fitness que en 19 generaciones osciló entre -0.60 y +0.38, con
+       3 generaciones devolviendo NaN — un umbral fijo así es
+       estadísticamente inalcanzable dado ese nivel de ruido: un
+       candidato podía tener mejor fitness real y aun así nunca
+       superar 0.05 de diferencia por pura varianza, sin que eso
+       dijera nada sobre si la diferencia era genuina o ruido.
+
+       Fix: se reemplaza el delta absoluto por un test de
+       significancia estadística (Mann-Whitney U, no paramétrico —
+       no asume distribución normal de los retornos) entre los
+       retornos reales del campeón (pnl_real_pct de sus trades) y los
+       retornos simulados del candidato (pnl_real_pct de sus shadow
+       trades). Solo se promueve si hay al menos 10 muestras de cada
+       lado, el test da p < 0.10 (el candidato es significativamente
+       mejor, no solo mejor "por casualidad"), y su fitness combinado
+       sigue siendo mayor. Si scipy no está disponible o hay menos de
+       10 muestras de un lado, cae de vuelta al criterio anterior
+       (delta absoluto MIN_IMPROVEMENT_PCT) — no bloquea el ciclo.
 """
 
 import json
@@ -51,6 +72,14 @@ from darwin_engine.mutator import generate_next_generation, random_genome
 from darwin_engine.trade_tracker import get_resolved_trades, get_tracker_summary
 from darwin_engine.executor_shadow_evaluator import get_shadow_resolved_trades, run_all_shadows
 
+# [AUD-P2] scipy es opcional — si no está instalado, el criterio cae
+# de vuelta al delta absoluto de siempre (ver _select_champion).
+try:
+    from scipy import stats as _scipy_stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 logger = logging.getLogger("arena")
 
 DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
@@ -63,6 +92,11 @@ MIN_IMPROVEMENT_PCT   = float(os.getenv("DARWIN_MIN_IMPROVE", "0.05"))
 MAX_SHADOW_GENOMES    = int(os.getenv("DARWIN_MAX_SHADOW",    "8"))
 GENERATION_SIZE       = int(os.getenv("DARWIN_GEN_SIZE",      "5"))
 GITHUB_ENABLED        = os.getenv("GITHUB_TOKEN") is not None
+
+# [AUD-P2] Mínimo de muestras por lado para poder correr el test
+# estadístico, y umbral de significancia (p-value).
+STAT_TEST_MIN_SAMPLES = int(os.getenv("DARWIN_STAT_MIN_SAMPLES", "10"))
+STAT_TEST_P_VALUE     = float(os.getenv("DARWIN_STAT_P_VALUE",   "0.10"))
 
 
 # ══════════════════════════════════════════════════════
@@ -216,7 +250,62 @@ def _evaluate_all_genomes(
 
 
 # ══════════════════════════════════════════════════════
-# SELECCIÓN: ¿PROMOVER NUEVO CAMPEÓN?  [F4][AUD-D2]
+# [AUD-P2] TEST DE SIGNIFICANCIA ESTADÍSTICA
+# ══════════════════════════════════════════════════════
+
+def _extract_returns(trades: List[Dict]) -> List[float]:
+    """Extrae pnl_real_pct válidos (finitos) de una lista de trades."""
+    out = []
+    for t in trades:
+        v = t.get("pnl_real_pct")
+        if v is None:
+            continue
+        try:
+            f = float(v)
+            if math.isfinite(f):
+                out.append(f)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _is_significantly_better(
+    champion_genome_id: str,
+    candidate_genome_id: str,
+) -> Optional[bool]:
+    """
+    [AUD-P2] Test de Mann-Whitney U (no paramétrico, no asume
+    distribución normal) entre los retornos reales del campeón y los
+    retornos simulados (shadow) del candidato.
+
+    Retorna:
+      True  → el candidato es significativamente mejor (p < STAT_TEST_P_VALUE)
+      False → no hay evidencia suficiente de que sea mejor
+      None  → no se pudo correr el test (scipy ausente o muestra
+              insuficiente) — el llamador debe usar el criterio de
+              respaldo (delta absoluto).
+    """
+    if not SCIPY_AVAILABLE:
+        return None
+
+    champ_returns = _extract_returns(get_resolved_trades(executor_genome_id=champion_genome_id))
+    cand_returns  = _extract_returns(get_shadow_resolved_trades(candidate_genome_id))
+
+    if len(champ_returns) < STAT_TEST_MIN_SAMPLES or len(cand_returns) < STAT_TEST_MIN_SAMPLES:
+        return None
+
+    try:
+        _, p_value = _scipy_stats.mannwhitneyu(
+            cand_returns, champ_returns, alternative="greater"
+        )
+        return bool(p_value < STAT_TEST_P_VALUE)
+    except Exception as e:
+        logger.warning(f"⚠️ mannwhitneyu falló ({champion_genome_id} vs {candidate_genome_id}): {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════
+# SELECCIÓN: ¿PROMOVER NUEVO CAMPEÓN?  [F4][AUD-D2][AUD-P2]
 # ══════════════════════════════════════════════════════
 
 def _select_champion(
@@ -236,6 +325,14 @@ def _select_champion(
     y siempre da 0 para shadows, dejándolos incapaces de competir
     sin importar su fitness. El campeón sigue contándose con sus
     trades reales, sin cambios.
+
+    [AUD-P2] La decisión final de promoción ya no es un delta
+    absoluto fijo (MIN_IMPROVEMENT_PCT) sobre un fitness ruidoso —
+    primero se intenta un test de significancia estadística
+    (Mann-Whitney U) entre los retornos reales del campeón y los
+    simulados del mejor candidato. Si el test no se puede correr
+    (pocas muestras o scipy ausente), se cae de vuelta al criterio
+    anterior de delta absoluto, sin bloquear el ciclo.
     """
     raw_champion_fitness = fitness_results.get(
         current_champion.genome_id, {}
@@ -304,17 +401,44 @@ def _select_champion(
         )
         return best_candidate, True
 
+    # [AUD-P2] Intentar primero el test de significancia estadística.
+    stat_result = _is_significantly_better(
+        current_champion.genome_id, best_candidate.genome_id
+    )
+
+    if stat_result is not None:
+        if stat_result and best_fitness > champion_fitness:
+            logger.info(
+                f"🏆 NUEVO CAMPEÓN (test estadístico): {best_candidate.genome_id} | "
+                f"fitness={best_fitness:.4f} vs actual={champion_fitness:.4f} | "
+                f"p<{STAT_TEST_P_VALUE} (Mann-Whitney U, n>={STAT_TEST_MIN_SAMPLES}/lado)"
+            )
+            return best_candidate, True
+        else:
+            logger.info(
+                f"👑 Campeón se mantiene (test estadístico): {current_champion.genome_id} | "
+                f"candidato {best_candidate.genome_id} no alcanzó significancia "
+                f"(p>={STAT_TEST_P_VALUE}) o fitness no mejoró"
+            )
+            return current_champion, False
+
+    # [AUD-P2] Respaldo: sin scipy o sin muestra suficiente de un lado
+    # → criterio anterior (delta absoluto), sin bloquear el ciclo.
+    logger.info(
+        f"ℹ️ Test estadístico no disponible ({current_champion.genome_id} vs "
+        f"{best_candidate.genome_id}) — usando criterio de respaldo (delta absoluto)"
+    )
     improvement = best_fitness - champion_fitness
     if improvement >= MIN_IMPROVEMENT_PCT:
         logger.info(
-            f"🏆 NUEVO CAMPEÓN: {best_candidate.genome_id} | "
+            f"🏆 NUEVO CAMPEÓN (delta absoluto): {best_candidate.genome_id} | "
             f"fitness={best_fitness:.4f} vs actual={champion_fitness:.4f} "
             f"(mejora={improvement:+.4f})"
         )
         return best_candidate, True
     else:
         logger.info(
-            f"👑 Campeón se mantiene: {current_champion.genome_id} | "
+            f"👑 Campeón se mantiene (delta absoluto): {current_champion.genome_id} | "
             f"mejor candidato={best_candidate.genome_id} "
             f"mejora={improvement:+.4f} < mínimo={MIN_IMPROVEMENT_PCT}"
         )
@@ -658,6 +782,9 @@ def get_arena_status() -> Dict:
             "max_shadow_genomes":    MAX_SHADOW_GENOMES,
             "generation_size":       GENERATION_SIZE,
             "github_enabled":        GITHUB_ENABLED,
+            "stat_test_enabled":     SCIPY_AVAILABLE,     # [AUD-P2] trazabilidad
+            "stat_test_min_samples": STAT_TEST_MIN_SAMPLES,
+            "stat_test_p_value":     STAT_TEST_P_VALUE,
         },
     }
 
