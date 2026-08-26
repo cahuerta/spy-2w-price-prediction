@@ -1,5 +1,5 @@
 # =========================================================
-# regime_threshold_learner.py — ADAPTIVE REGIME LEARNER V1.0
+# regime_threshold_learner.py — ADAPTIVE REGIME LEARNER V1.1
 # =========================================================
 # Evalúa si los regímenes declarados fueron correctos
 # comparando con el retorno real de SPY N días después.
@@ -28,6 +28,33 @@
 #        a -0.20. Con "defensive" disparándose casi todos los días,
 #        "growth"/"neutral" casi nunca se evaluaban, y por eso los
 #        umbrales de growth nunca se movieron de sus defaults.
+#
+# V1.2 (2026-08-26): aprendizaje también para los umbrales macro
+#   (macro_factors.py / market_quant_context.py [M1]-[M5]).
+#   [ML1] DEFAULT_THRESHOLDS y THRESHOLD_LIMITS ganan la sección
+#         "macro" — mismos valores que market_quant_context.py, para
+#         que ambas copias queden consistentes (mismo patrón de
+#         duplicación ya documentado en [A1] hasta centralizarlo).
+#   [ML2] evaluate_snapshot() ahora también sugiere ajustes para los
+#         umbrales macro, con la MISMA dirección que ya aplica a
+#         dd_max/vol_min/corr_min (defensive) y
+#         trend_min/vol_max/corr_max (growth) — el archivo no
+#         distingue hoy cuál condición específica disparó el régimen
+#         (ya funcionaba así antes de este cambio: ajusta las tres
+#         condiciones de defensive juntas sin saber cuál de las tres
+#         fue la que realmente activó el régimen), así que extender
+#         el mismo criterio a macro es consistente con el diseño
+#         existente, no una desviación de él.
+#   [ML3] Nuevas constantes MACRO_LEARNING_RATE / MACRO_MISS_PENALTY,
+#         separadas de LEARNING_RATE/MISS_PENALTY — los umbrales
+#         macro están en escala de z-score (rango ~1-3), muy distinta
+#         a la escala de dd_max/corr (rango ~0-1), así que reusar el
+#         mismo delta absoluto habría sido demasiado lento o
+#         demasiado brusco según el caso.
+#   [ML4] Snapshots viejos sin macro_stress_magnitude/
+#         macro_risk_off_score (generados antes de V3.4 de
+#         market_quant_context.py) se evalúan igual — los ajustes
+#         macro simplemente no se generan ese ciclo (no hay error).
 # =========================================================
 
 import json
@@ -53,6 +80,11 @@ LEARNING_RATE     = 0.008   # ajuste por evaluación (gradual)
 MISS_PENALTY      = 0.015   # ajuste extra cuando pierde una caída fuerte
 STRONG_MOVE_PCT   = 0.04    # >4% = movimiento fuerte de mercado
 
+# [ML3] Tasas de aprendizaje específicas para umbrales macro — escala
+# de z-score (rango ~1-3), distinta a la escala de dd_max/corr (~0-1).
+MACRO_LEARNING_RATE = 0.05
+MACRO_MISS_PENALTY  = 0.10
+
 # Límites de umbrales (no pueden salirse de rango)
 # [A1] dd_max corregido: (lo, hi) con lo < hi, igual que los demás
 THRESHOLD_LIMITS = {
@@ -66,11 +98,23 @@ THRESHOLD_LIMITS = {
         "vol_max":   (0.08,  0.25),
         "corr_max":  (0.35,  0.70),
     },
+    # [ML1] Mismos límites que market_quant_context.py.
+    "macro": {
+        "stress_magnitude_min":      (1.0,  3.0),
+        "risk_off_score_min":        (0.5,  2.5),
+        "risk_off_score_max_growth": (-1.0, 0.0),
+    },
 }
 
 DEFAULT_THRESHOLDS = {
     "defensive": {"dd_max": -0.08, "vol_min": 0.25, "corr_min": 0.75},
     "growth":    {"trend_min": 0.05, "vol_max": 0.15, "corr_max": 0.55},
+    # [ML1] Sección nueva — no reemplaza defensive/growth.
+    "macro": {
+        "stress_magnitude_min":       2.0,
+        "risk_off_score_min":         1.5,
+        "risk_off_score_max_growth": -0.3,
+    },
     "meta": {
         "version": 1,
         "created_at": datetime.utcnow().isoformat(),
@@ -100,6 +144,11 @@ def load_thresholds() -> Dict:
             if "defensive" in data and "growth" in data:
                 if "meta" not in data:
                     data["meta"] = DEFAULT_THRESHOLDS["meta"].copy()
+                # [ML1] Compatibilidad: archivo ya persistido sin
+                # "macro" se completa con el default, sin tocar
+                # defensive/growth ya aprendidos.
+                if "macro" not in data:
+                    data["macro"] = DEFAULT_THRESHOLDS["macro"].copy()
                 return data
         except Exception:
             pass
@@ -166,9 +215,22 @@ def evaluate_snapshot(
 
     Retorna: (outcome, regime, ajustes_sugeridos)
     outcome: "hit" | "miss" | "false_alarm" | "neutral_miss"
+
+    [ML2] Además de los ajustes clásicos (dd_max/vol_min/corr_min,
+    trend_min/vol_max/corr_max), ahora también sugiere ajustes para
+    los umbrales macro cuando el snapshot los tiene disponibles
+    (snapshots generados antes de V3.4 no los tienen — [ML4] — y
+    simplemente no generan ajuste macro ese ciclo, sin error).
     """
-    regime     = snapshot.get("regime", "neutral")
+    regime      = snapshot.get("regime", "neutral")
     adjustments = {}
+
+    # [ML4] Puede ser None si el snapshot es anterior a V3.4 o si
+    # macro_context.json no tenía datos ese día.
+    has_macro = (
+        snapshot.get("macro_stress_magnitude") is not None
+        or snapshot.get("macro_risk_off_score") is not None
+    )
 
     if regime == "defensive":
         if spy_return < -0.01:
@@ -178,6 +240,10 @@ def evaluate_snapshot(
             adjustments["defensive.dd_max"]   = +LEARNING_RATE  # menos negativo = más fácil activar
             adjustments["defensive.vol_min"]  = -LEARNING_RATE  # más bajo = más fácil activar
             adjustments["defensive.corr_min"] = -LEARNING_RATE
+            if has_macro:
+                # [ML2] Más fácil activar defensive por vía macro también.
+                adjustments["macro.stress_magnitude_min"] = -MACRO_LEARNING_RATE
+                adjustments["macro.risk_off_score_min"]   = -MACRO_LEARNING_RATE
             logger.info(f"✅ DEFENSIVE HIT | spy_ret={spy_return:.2%} → ajustando umbrales más sensibles")
         else:
             # ❌ FALSA ALARMA: declaró defensive pero mercado subió
@@ -186,6 +252,10 @@ def evaluate_snapshot(
             adjustments["defensive.dd_max"]   = -LEARNING_RATE
             adjustments["defensive.vol_min"]  = +LEARNING_RATE
             adjustments["defensive.corr_min"] = +LEARNING_RATE
+            if has_macro:
+                # [ML2] Más difícil activar defensive por vía macro también.
+                adjustments["macro.stress_magnitude_min"] = +MACRO_LEARNING_RATE
+                adjustments["macro.risk_off_score_min"]   = +MACRO_LEARNING_RATE
             logger.info(f"❌ DEFENSIVE FALSE ALARM | spy_ret={spy_return:.2%} → ajustando umbrales menos sensibles")
 
     elif regime == "growth":
@@ -195,6 +265,9 @@ def evaluate_snapshot(
             adjustments["growth.trend_min"] = -LEARNING_RATE  # más fácil activar growth
             adjustments["growth.vol_max"]   = +LEARNING_RATE
             adjustments["growth.corr_max"]  = +LEARNING_RATE
+            if has_macro:
+                # [ML2] Más fácil que macro permita growth (menos bloqueo).
+                adjustments["macro.risk_off_score_max_growth"] = +MACRO_LEARNING_RATE
             logger.info(f"✅ GROWTH HIT | spy_ret={spy_return:.2%} → ajustando umbrales más sensibles")
         else:
             # ❌ FALSA ALARMA: declaró growth pero mercado cayó
@@ -202,6 +275,9 @@ def evaluate_snapshot(
             adjustments["growth.trend_min"] = +LEARNING_RATE
             adjustments["growth.vol_max"]   = -LEARNING_RATE
             adjustments["growth.corr_max"]  = -LEARNING_RATE
+            if has_macro:
+                # [ML2] Más estricto para permitir growth (más bloqueo).
+                adjustments["macro.risk_off_score_max_growth"] = -MACRO_LEARNING_RATE
             logger.info(f"❌ GROWTH FALSE ALARM | spy_ret={spy_return:.2%} → ajustando umbrales menos sensibles")
 
     elif regime == "neutral":
@@ -212,6 +288,9 @@ def evaluate_snapshot(
             adjustments["defensive.dd_max"]   = +MISS_PENALTY
             adjustments["defensive.vol_min"]  = -MISS_PENALTY
             adjustments["defensive.corr_min"] = -MISS_PENALTY
+            if has_macro:
+                adjustments["macro.stress_magnitude_min"] = -MACRO_MISS_PENALTY
+                adjustments["macro.risk_off_score_min"]   = -MACRO_MISS_PENALTY
             logger.warning(f"⚠️ NEUTRAL MISS (debió ser DEFENSIVE) | spy_ret={spy_return:.2%} → ajuste agresivo")
         elif spy_return > STRONG_MOVE_PCT:
             # ❌ MISS: estaba neutral pero mercado subió fuerte — debería haber sido GROWTH
@@ -219,6 +298,8 @@ def evaluate_snapshot(
             adjustments["growth.trend_min"] = -MISS_PENALTY
             adjustments["growth.vol_max"]   = +MISS_PENALTY
             adjustments["growth.corr_max"]  = +MISS_PENALTY
+            if has_macro:
+                adjustments["macro.risk_off_score_max_growth"] = +MACRO_MISS_PENALTY
             logger.info(f"⚠️ NEUTRAL MISS (debió ser GROWTH) | spy_ret={spy_return:.2%}")
         else:
             outcome = "correct_neutral"
@@ -275,7 +356,7 @@ def run_learning_cycle() -> Dict:
 
     Retorna resumen del ciclo.
     """
-    logger.info(f"🧠 RegimeLearner V1.0 | horizon={EVAL_HORIZON_DAYS}d")
+    logger.info(f"🧠 RegimeLearner V1.2 | horizon={EVAL_HORIZON_DAYS}d")
 
     if not MARKET_HISTORY_DIR.exists():
         logger.warning("⚠️ Sin historial de mercado — nada que aprender todavía")
@@ -341,6 +422,7 @@ def run_learning_cycle() -> Dict:
         "thresholds_now": {
             "defensive": thresholds["defensive"],
             "growth":    thresholds["growth"],
+            "macro":     thresholds.get("macro", DEFAULT_THRESHOLDS["macro"]),  # [ML1]
         },
         "cumulative": {
             "total_evals":      total,
@@ -355,7 +437,8 @@ def run_learning_cycle() -> Dict:
         f"spy_ret={spy_return:.2%} | evals={total}"
     )
     logger.info(f"📊 Umbrales actuales: defensive.dd_max={thresholds['defensive']['dd_max']:.4f} "
-                f"vol_min={thresholds['defensive']['vol_min']:.4f}")
+                f"vol_min={thresholds['defensive']['vol_min']:.4f} | "
+                f"macro.stress_min={thresholds.get('macro', {}).get('stress_magnitude_min')}")
 
     return summary
 
