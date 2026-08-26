@@ -9,6 +9,21 @@ market_qualitative_evaluator.py — V3 PRODUCCIÓN REAL
 ✔ Logging robusto
 ✔ Listo para cron diario
 ✔ NO mezcla cuantitativo
+
+FIX [ALPACA-NEWS] (2026-08-26):
+  fetch_market_news() ahora suma las noticias de Alpaca News API a las
+  de RSS, ANTES del filtro por dominio confiable y del loop de
+  evaluación individual. Se reutiliza get_alpaca_market_news() de
+  news_ranker.py (mismo batch que ya usa el ranking por ticker) — sin
+  llamada nueva a ningún proveedor, sin tocar el resto de este
+  archivo: mismo formato "Título: ...\nResumen: ...", mismo
+  MAX_TOTAL_NEWS, mismo evaluate_single_news(), misma agregación
+  ponderada, mismo QualitativeMarketImpact.
+
+  Nota de nombres: este archivo y news_ranker.py tenían cada uno su
+  propia función fetch_market_news(). Para evitar la colisión al
+  importar, la de news_ranker.py se importa con alias
+  (_alpaca_fetch_market_news).
 """
 
 from dataclasses import dataclass, asdict
@@ -75,8 +90,40 @@ class QualitativeMarketImpact:
         return asdict(self)
 
 # =========================================================
-# FETCH RSS
+# FETCH RSS + ALPACA
 # =========================================================
+
+def _fetch_alpaca_news_items() -> List[str]:
+    """
+    [ALPACA-NEWS] Trae noticias de Alpaca News API reutilizando
+    news_ranker.py (mismo batch que ya usa el ranking por ticker), y
+    las devuelve en el mismo formato de texto "Título: ...\nResumen: ..."
+    que ya produce fetch_market_news() para las de RSS más abajo.
+
+    No filtra por TRUSTED_DOMAINS porque Alpaca ya sirve solo
+    fuentes financieras (Benzinga) — no son links de RSS genéricos.
+    """
+    try:
+        from news_ranker import fetch_market_news as _alpaca_fetch_market_news
+    except Exception as e:
+        logger.warning(f"news_ranker no disponible ({e}) — solo RSS este ciclo")
+        return []
+
+    try:
+        raw_items = _alpaca_fetch_market_news()
+    except Exception as e:
+        logger.warning(f"Alpaca fetch falló: {e}")
+        return []
+
+    items = []
+    for entry in raw_items:
+        title   = (entry.get("headline", "") or "")[:120]
+        summary = (entry.get("summary", "") or "")[:600]
+        items.append(f"Título: {title}\nResumen: {summary}")
+
+    logger.info(f"Alpaca news items: {len(items)}")
+    return items
+
 
 def fetch_market_news() -> List[str]:
     news_items = []
@@ -99,7 +146,13 @@ def fetch_market_news() -> List[str]:
         except Exception as e:
             logger.warning(f"RSS error {feed_url}: {e}")
 
-    logger.info(f"Total trusted news collected: {len(news_items)}")
+    logger.info(f"Trusted RSS news collected: {len(news_items)}")
+
+    # [ALPACA-NEWS] Sumar noticias de Alpaca ANTES del corte final
+    # a MAX_TOTAL_NEWS — se mezclan con las de RSS en un solo pool.
+    news_items.extend(_fetch_alpaca_news_items())
+
+    logger.info(f"Total trusted+alpaca news collected: {len(news_items)}")
     return news_items[:MAX_TOTAL_NEWS]
 
 # =========================================================
