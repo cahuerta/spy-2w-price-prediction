@@ -81,6 +81,11 @@ logger = logging.getLogger("trade_tracker")
 
 DATA_PATH    = Path(os.getenv("DATA_PATH", "/data"))
 TRACKER_DIR  = DATA_PATH / "darwin" / "trades"
+
+# [Problema 3] Comisión del broker como % del monto, para aislarla del
+# movimiento de precio puro. 0.0 por defecto = sin cambio de comportamiento
+# hasta que se configure el valor real del broker.
+COMMISSION_PCT = float(os.getenv("BROKER_COMMISSION_PCT", "0.0"))
 PRED_DIR     = DATA_PATH / "predictions"
 
 ALPACA_KEY    = os.getenv("ALPACA_API_KEY")
@@ -469,6 +474,21 @@ def register_close(
     solo la dirección que tenía la predicción H10 ESE día, no el tipo
     de posición realmente ejecutada, así que no debe invertir el signo
     del PnL.
+
+    FIX (auditoría 2026-08-27, Problema 3):
+    pnl_real_pct mezclaba en un solo número el movimiento de precio y
+    la comisión del broker, sin dejar rastro de cuánto era cada cosa.
+    Ahora se calcula pnl_gross_pct (precio puro, sin comisión) aparte,
+    y pnl_real_pct = pnl_gross_pct - COMMISSION_PCT (configurable por
+    env var BROKER_COMMISSION_PCT, default 0.0 — sin cambio de
+    comportamiento si no se configura nada). Ambos quedan guardados en
+    el trade para poder auditar la fricción por separado del error de
+    modelo (que ya se mide en oportunidad_pct, calculado en
+    resolve_pending_trades). También se marca closed_at_loss_time_exit
+    cuando la razón de cierre es "non_anchor_time_exit" y el PnL fue
+    negativo — el auditor encontró que esa razón de salida es la única
+    con volumen relevante y PnL sistemáticamente negativo (-0.55%
+    promedio); el campo solo la deja visible, no cambia la decisión.
     """
     # [T1] No procesar tickers europeos
     ticker_upper = ticker.upper()
@@ -499,7 +519,12 @@ def register_close(
     horizon_days = int(trade.get("horizon_days", 6))
 
     # [T8] Siempre posición larga — el sistema no opera en corto.
-    pnl_real_pct = (exit_price - entry_price) / entry_price * 100
+    # [Problema 3] pnl_gross_pct = movimiento de precio puro, sin comisión.
+    # pnl_real_pct = lo que efectivamente queda después de la comisión del
+    # broker. Con COMMISSION_PCT=0.0 (default) ambos son iguales — no
+    # cambia nada hasta que se configure la comisión real.
+    pnl_gross_pct = (exit_price - entry_price) / entry_price * 100
+    pnl_real_pct  = pnl_gross_pct - COMMISSION_PCT
 
     pnl_real_usd = pnl_real_pct / 100 * entry_price * int(trade.get("shares", 0))
 
@@ -510,6 +535,12 @@ def register_close(
     )
     days_held = (exit_date - entry_date_obj).days
 
+    # [Problema 3] Deja visible el patrón que encontró el auditor: la
+    # única razón de salida con volumen relevante y PnL sistemáticamente
+    # negativo. No cambia ninguna decisión, solo lo etiqueta para poder
+    # filtrar/auditar después.
+    closed_at_loss_time_exit = (reason == "non_anchor_time_exit" and pnl_real_pct < 0)
+
     trade.update({
         "status":                "closed_pending_resolution",
         "exit_price":            round(exit_price, 4),
@@ -518,9 +549,11 @@ def register_close(
         "reason_close":          reason,
         "alpha_score_exit":      round(alpha_score, 4),
         "days_held":             days_held,
+        "pnl_gross_pct":         round(pnl_gross_pct, 4),
         "pnl_real_pct":          round(pnl_real_pct, 4),
         "pnl_real_usd":          round(pnl_real_usd, 2),
         "closed_before_horizon": days_held < horizon_days,
+        "closed_at_loss_time_exit": closed_at_loss_time_exit,
     })
 
     path = TRACKER_DIR / f"{trade['trade_id']}.json"
@@ -587,6 +620,10 @@ def resolve_pending_trades() -> List[Dict]:
 
         entry_price = float(trade["entry_price"])
         pnl_real    = float(trade.get("pnl_real_pct", 0))
+        # [Problema 3] Compat: trades cerrados antes de este fix no tienen
+        # pnl_gross_pct — se usa pnl_real como equivalente (COMMISSION_PCT
+        # era 0.0 de todas formas en esos casos).
+        pnl_gross   = float(trade.get("pnl_gross_pct", pnl_real))
 
         price_at_horizon = _get_price_at_date(ticker, horizon_date)
         if not price_at_horizon:
@@ -597,6 +634,10 @@ def resolve_pending_trades() -> List[Dict]:
         pnl_teorico = (price_at_horizon - entry_price) / entry_price * 100
 
         oportunidad     = pnl_teorico - pnl_real
+        # [Problema 3] slippage_pct: fricción de ejecución pura (comisión +
+        # spread de la orden de cierre), separada del error de timing del
+        # modelo que ya mide oportunidad_pct.
+        slippage_pct    = pnl_gross - pnl_teorico
         predictor_right = pnl_teorico > 0
         executor_right  = pnl_real >= pnl_teorico if trade.get("closed_before_horizon") else True
 
@@ -605,6 +646,7 @@ def resolve_pending_trades() -> List[Dict]:
             "price_at_horizon":     round(price_at_horizon, 4),
             "pnl_teorico_pct":      round(pnl_teorico, 4),
             "oportunidad_pct":      round(oportunidad, 4),
+            "slippage_pct":         round(slippage_pct, 4),
             "predictor_was_right":  predictor_right,
             "executor_was_right":   executor_right,
             "resolved_at":          datetime.now(timezone.utc).isoformat(),
@@ -618,6 +660,7 @@ def resolve_pending_trades() -> List[Dict]:
             f"PnL real={pnl_real:+.2f}% | "
             f"PnL teórico={pnl_teorico:+.2f}% | "
             f"Oportunidad={oportunidad:+.2f}% | "
+            f"Slippage={slippage_pct:+.2f}% | "
             f"Predictor={'✅' if predictor_right else '❌'} | "
             f"Executor={'✅' if executor_right else '❌'}"
         )
@@ -700,4 +743,4 @@ def get_tracker_summary() -> Dict[str, Any]:
         "total_pnl_pct": round(total_pnl,  4),
         "win_rate":      round(win_rate,   4),
         "n_pnl_samples": len(pnl_list),
-    }
+  }
