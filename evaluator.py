@@ -63,6 +63,18 @@ HIT_SIGN_MIN_PCT = float(os.getenv("HIT_SIGN_MIN_PCT", "0.05"))
 #        pred_data["prediction"] (price_pred, ret_ens_pct).
 #        Fix: para h==10 no se lee de `curve`, se lee directo de
 #        `old_p` (la predicción H10 ya cargada al inicio de la función).
+#
+#   [E9] FIX get_price_at_date sin fallback (auditoría 2026-08-27):
+#        Cuando target_date cae en el día de hoy (predictor_shadow_evaluator.py
+#        madura un horizonte exactamente hoy), Alpaca devuelve
+#        "subscription does not permit querying recent SIP data" y la
+#        función retornaba None sin más — mismo síntoma que [T6] en
+#        darwin_engine/trade_tracker.py, pero esta función pública
+#        (importada también por predictor_shadow_evaluator.py) no tenía
+#        ese fallback. Se replica aquí la misma cascada: Alpaca primero,
+#        y si falla, data_provider.get_price_history() (Cache → Chile →
+#        EODHD → Yahoo → Twelve). Detección de columnas defensiva igual
+#        a trade_tracker.py, sin asumir nombres exactos entre providers.
 # ======================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -239,18 +251,8 @@ def _get_alpaca_client() -> StockHistoricalDataClient:
     return _alpaca_client
 
 
-def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
-    """
-    [E2] Precio de cierre en target_date.
-    Fallback al día hábil anterior si es feriado o fin de semana.
-    """
-    key = f"{ticker}_{target_date}"
-    if key in PRICE_CACHE:
-        return PRICE_CACHE[key]
-
-    if _is_alpaca_unsupported(ticker):
-        return None
-
+def _get_price_at_date_alpaca(ticker: str, target_date: date_type) -> Optional[float]:
+    """Intenta obtener el precio de cierre en target_date desde Alpaca."""
     try:
         client  = _get_alpaca_client()
         request = StockBarsRequest(
@@ -269,12 +271,119 @@ def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
         if bars.empty:
             return None
 
-        price = float(bars["close"].iloc[-1])
+        return float(bars["close"].iloc[-1])
+    except Exception as e:
+        logger.warning(f"_get_price_at_date_alpaca({ticker}, {target_date}): {e}")
+        return None
+
+
+def _pd_to_date(series):
+    """Convierte una serie (datetime, str, o índice) a objetos date puros."""
+    import pandas as pd
+    return pd.to_datetime(series).dt.date
+
+
+def _pd_is_datetimeish(series) -> bool:
+    """Heurística simple: ¿la serie parece de tipo fecha/datetime?"""
+    try:
+        import pandas as pd
+        return pd.api.types.is_datetime64_any_dtype(series)
+    except Exception:
+        return False
+
+
+def _get_price_at_date_fallback(ticker: str, target_date: date_type) -> Optional[float]:
+    """
+    [E9] Fallback usando data_provider (cascada Cache → Chile → EODHD →
+    Yahoo → Twelve). Se usa cuando Alpaca falla o no tiene permiso de
+    datos (ej. "subscription does not permit querying recent SIP data").
+    Mismo mecanismo que trade_tracker.py [T6].
+
+    Detecta el esquema del DataFrame de forma defensiva, sin asumir
+    nombres exactos de columnas (pueden venir de distintos providers).
+    """
+    try:
+        from data_provider import get_price_history
+    except Exception as e:
+        logger.warning(f"_get_price_at_date_fallback: data_provider no disponible: {e}")
+        return None
+
+    try:
+        df = get_price_history(ticker, period="1mo", interval="1d")
+        if df is None or df.empty:
+            return None
+
+        df = df.reset_index()
+
+        date_col = None
+        for cand in ("date", "Date", "timestamp", "Timestamp", "index"):
+            if cand in df.columns:
+                date_col = cand
+                break
+        if date_col is None:
+            first_col = df.columns[0]
+            if _pd_is_datetimeish(df[first_col]):
+                date_col = first_col
+        if date_col is None:
+            logger.warning(f"_get_price_at_date_fallback({ticker}): no se identificó columna de fecha")
+            return None
+
+        df["_date_norm"] = _pd_to_date(df[date_col])
+
+        close_col = None
+        for cand in ("close", "Close", "Adj Close", "adj_close", "AdjClose"):
+            if cand in df.columns:
+                close_col = cand
+                break
+        if close_col is None:
+            logger.warning(f"_get_price_at_date_fallback({ticker}): no se identificó columna de cierre")
+            return None
+
+        row = df[df["_date_norm"] <= target_date]
+        if row.empty:
+            return None
+
+        price = row.iloc[-1][close_col]
+        if price is None:
+            return None
+        return float(price)
+    except Exception as e:
+        logger.warning(f"_get_price_at_date_fallback({ticker}, {target_date}): {e}")
+        return None
+
+
+def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
+    """
+    [E2] Precio de cierre en target_date.
+    Fallback al día hábil anterior si es feriado o fin de semana.
+
+    [E9] Orden: Alpaca primero (rápido, ya autenticado) → fallback a
+    data_provider (Cache/Chile/EODHD/Yahoo/Twelve) si Alpaca falla o
+    no tiene permiso de datos (ej. SIP data restringido para el día
+    en curso). Resultado cacheado en PRICE_CACHE en ambos casos, así
+    que el fallback nunca se ejecuta más de una vez por (ticker, fecha).
+    """
+    key = f"{ticker}_{target_date}"
+    if key in PRICE_CACHE:
+        return PRICE_CACHE[key]
+
+    if _is_alpaca_unsupported(ticker):
+        return None
+
+    price = _get_price_at_date_alpaca(ticker, target_date)
+    if price is not None:
         PRICE_CACHE[key] = price
         return price
-    except Exception as e:
-        logger.warning(f"get_price_at_date({ticker}, {target_date}): {e}")
-        return None
+
+    logger.info(f"↪️ get_price_at_date {ticker} — Alpaca sin precio, probando fallback data_provider")
+    price = _get_price_at_date_fallback(ticker, target_date)
+    if price is not None:
+        logger.info(f"✅ get_price_at_date {ticker} resuelto vía fallback data_provider: ${price:.4f}")
+        PRICE_CACHE[key] = price
+        return price
+
+    logger.warning(f"⚠️ get_price_at_date {ticker} — sin precio en Alpaca ni en fallback")
+    return None
 
 
 # ======================================================
