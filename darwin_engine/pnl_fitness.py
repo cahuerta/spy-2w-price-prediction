@@ -24,6 +24,24 @@ FIX v1.2 [AUD-P6] (auditoría 2026-08-24):
        siempre el de una posición larga, sin excepción. Mismo fix
        aplicado en darwin_engine/trade_tracker.py (fuente canónica de
        pnl_real_pct/pnl_teorico_pct).
+
+FIX v1.3 (auditoría 2026-08-27, Problema 1):
+  [F6] _load_resolved_trades(genome_type="executor") solo leía
+       TRACKER_DIR (trades REALES). Únicamente el campeón opera con
+       dinero real, así que para todo mutante (v2, v3, v6_x, v7_x)
+       esto siempre devolvía [] → fitness=0.0 idéntico para todos,
+       antes de llegar siquiera al test estadístico — Darwin comparaba
+       ruido contra ruido. Ya el conteo de elegibilidad en arena.py
+       (_select_champion, [AUD-D2]) usa
+       executor_shadow_evaluator.get_shadow_resolved_trades() para
+       decidir si un shadow puede competir, pero el VALOR de fitness
+       en sí seguía sin ese fallback.
+       Fix: si TRACKER_DIR no tiene trades reales para el genome_id
+       (genome_type="executor"), se cae automáticamente a
+       get_shadow_resolved_trades() — mismo criterio, mismo dato que
+       ya usa arena.py, ahora también para el número que decide quién
+       gana. El campeón nunca cae a esta rama porque siempre tiene
+       trades reales.
 """
 
 import json
@@ -110,19 +128,32 @@ def _load_resolved_trades(genome_id: str, genome_type: str) -> List[Dict]:
     """
     Carga trades resueltos atribuidos a un genome específico.
     genome_type: "executor" | "predictor"
-    """
-    if not TRACKER_DIR.exists():
-        return []
 
-    field = f"{genome_type}_genome_id"
+    [F6] Para "executor": si no hay trades REALES para este genome_id
+    (TRACKER_DIR solo lo alimenta el campeón — ningún mutante opera
+    dinero real), se cae a los trades simulados que el shadow
+    evaluator ya acumula en /data/darwin/shadow_trades/{genome_id}/.
+    Mismo dato que arena.py usa para decidir elegibilidad — ahora
+    también sirve para calcular el fitness en sí. El campeón siempre
+    tiene trades reales, así que nunca entra a esta rama.
+    """
+    field  = f"{genome_type}_genome_id"
     trades = []
 
-    for path in TRACKER_DIR.glob("*.json"):
-        t = _load_json(path)
-        if t.get("status") == "resolved" and t.get(field) == genome_id:
-            trades.append(t)
+    if TRACKER_DIR.exists():
+        for path in TRACKER_DIR.glob("*.json"):
+            t = _load_json(path)
+            if t.get("status") == "resolved" and t.get(field) == genome_id:
+                trades.append(t)
 
-    trades.sort(key=lambda x: x.get("resolved_at", ""), reverse=True)
+    if not trades and genome_type == "executor":
+        try:
+            from darwin_engine.executor_shadow_evaluator import get_shadow_resolved_trades
+            trades = get_shadow_resolved_trades(genome_id)
+        except Exception as e:
+            logger.warning(f"_load_resolved_trades: fallback shadow no disponible para {genome_id}: {e}")
+
+    trades.sort(key=lambda x: x.get("resolved_at") or x.get("exit_date", ""), reverse=True)
     return trades
 
 
@@ -486,4 +517,5 @@ def get_fitness_summary() -> Dict:
         ],
         "status": "ok",
       }
+
       
