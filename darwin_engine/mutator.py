@@ -30,6 +30,25 @@ FIX [AUD-D1] (bug Darwin #1 — colisión de genome_id):
   (ej. "executor_v2_1".."executor_v2_5"). Confirmado que
   ExecutorGenome.load_champion() usa glob("executor_*.json"), que
   sigue matcheando este formato de ID sin cambios adicionales.
+
+FIX (auditoría 2026-08-27, Problema 2):
+  Mutación de "early_exit.loss_cut_pct" era puramente aleatoria y
+  simétrica dentro de (-5.0, -1.0), sin memoria de resultados. Los
+  mutantes convergieron todos a -1.0 (stop más ajustado permitido) y
+  llevan generaciones perdiendo el test estadístico frente al campeón
+  (-2.5) sin que el mutador lo detecte ni corrija el rumbo.
+
+  Fix autocontenido en este archivo (sin tocar arena.py): se persiste
+  un pequeño estado en GENOME_DIR/_mutation_direction_state.json con
+  el mejor fitness visto y cuántas generaciones van sin mejora. Si el
+  fitness del mejor genoma no mejora durante STAGNATION_THRESHOLD
+  generaciones seguidas, se invierte el sesgo direccional para el
+  grupo "risk": en vez de moverse simétricamente, la mutación de
+  loss_cut_pct empuja explícitamente en la dirección contraria a la
+  ya explorada (ej. si veníamos ajustando el stop, ahora se ensancha).
+  Esto no depende del test de Mann-Whitney de arena.py — usa
+  estancamiento de fitness como proxy, disponible aquí mismo vía
+  ranked_genomes[0].fitness.
 """
 
 import json
@@ -85,6 +104,55 @@ MUTATION_LIMITS = {
 
 # Magnitud del cambio por mutación (fracción del rango)
 MUTATION_STRENGTH = 0.20
+
+# [Problema 2] Estado de sesgo direccional para mutaciones de riesgo
+DIRECTION_STATE_FILE = GENOME_DIR / "_mutation_direction_state.json"
+STAGNATION_THRESHOLD = 5  # generaciones sin mejora antes de invertir el sesgo
+DIRECTIONAL_GENES = {"early_exit.loss_cut_pct"}  # genes con sesgo direccional activo
+
+
+def _load_direction_state() -> Dict:
+    if DIRECTION_STATE_FILE.exists():
+        try:
+            return json.loads(DIRECTION_STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"best_fitness_seen": None, "stagnant_generations": 0, "risk_direction": "widen"}
+
+
+def _save_direction_state(state: Dict) -> None:
+    try:
+        DIRECTION_STATE_FILE.write_text(json.dumps(state))
+    except Exception as e:
+        logger.warning(f"No se pudo guardar _mutation_direction_state.json: {e}")
+
+
+def _update_direction_state(best_fitness: Optional[float]) -> str:
+    """
+    Actualiza el estado de estancamiento y devuelve la dirección de
+    sesgo vigente para el grupo "risk" ("widen" = stop más ancho,
+    "tighten" = stop más ajustado).
+    """
+    state = _load_direction_state()
+
+    if best_fitness is not None:
+        prev = state["best_fitness_seen"]
+        if prev is not None and best_fitness <= prev:
+            state["stagnant_generations"] += 1
+        else:
+            state["stagnant_generations"] = 0
+        state["best_fitness_seen"] = max(best_fitness, prev) if prev is not None else best_fitness
+
+    if state["stagnant_generations"] >= STAGNATION_THRESHOLD:
+        state["risk_direction"] = "tighten" if state["risk_direction"] == "widen" else "widen"
+        state["stagnant_generations"] = 0
+        logger.info(
+            f"🔄 Sin mejora de fitness en {STAGNATION_THRESHOLD} generaciones — "
+            f"invirtiendo sesgo de riesgo a '{state['risk_direction']}'"
+        )
+
+    _save_direction_state(state)
+    return state["risk_direction"]
 
 
 # ══════════════════════════════════════════════════════
@@ -163,6 +231,7 @@ def mutate(
     genome: ExecutorGenome,
     n_mutations: int = 1,
     bias: Optional[str] = None,
+    risk_direction: Optional[str] = None,
 ) -> ExecutorGenome:
     """
     Genera una variante mutada del genome.
@@ -176,6 +245,11 @@ def mutate(
                      "risk"       → muta profit_lock y loss_cut
                      "weights"    → muta pesos H
                      None         → mutación aleatoria
+        risk_direction: para genes en DIRECTIONAL_GENES (ej. loss_cut_pct),
+                     fuerza la dirección del delta en vez de simétrica:
+                     "widen"   → stop más ancho (más negativo)
+                     "tighten" → stop más ajustado (menos negativo)
+                     None      → delta simétrico de siempre
 
     Returns:
         Nuevo ExecutorGenome (el padre no se modifica)
@@ -206,7 +280,15 @@ def mutate(
 
         # Calcular rango de mutación
         mutation_range = (hi - lo) * MUTATION_STRENGTH
-        delta = random.uniform(-mutation_range, mutation_range)
+
+        if risk_direction and gene_path in DIRECTIONAL_GENES:
+            # Delta de un solo signo: exploramos a propósito la
+            # dirección contraria a la que llevamos generaciones
+            # explorando sin resultado.
+            magnitude = random.uniform(0, mutation_range)
+            delta = -magnitude if risk_direction == "widen" else magnitude
+        else:
+            delta = random.uniform(-mutation_range, mutation_range)
 
         # Aplicar mutación
         if isinstance(current_val, int):
@@ -367,13 +449,18 @@ def generate_next_generation(
     # Determinar sesgo según métricas actuales
     bias = _determine_bias(fitness_context or {})
 
+    # [Problema 2] Actualizar/consultar sesgo direccional de riesgo
+    # según estancamiento de fitness entre ciclos
+    risk_direction = _update_direction_state(best.fitness)
+    mutate_risk_direction = risk_direction if bias == "risk" else None
+
     children = []
 
     # 1. Mutación sesgada del mejor
-    children.append(mutate(best, n_mutations=1, bias=bias))
+    children.append(mutate(best, n_mutations=1, bias=bias, risk_direction=mutate_risk_direction))
 
     # 2. Mutación sesgada del mejor (segundo gen diferente)
-    children.append(mutate(best, n_mutations=2, bias=bias))
+    children.append(mutate(best, n_mutations=2, bias=bias, risk_direction=mutate_risk_direction))
 
     # 3. Crossover best_gene
     if second.genome_id != best.genome_id:
@@ -383,7 +470,7 @@ def generate_next_generation(
         children.append(crossover(best, second, strategy="weighted"))
     else:
         children.append(mutate(best, n_mutations=1, bias="weights"))
-        children.append(mutate(best, n_mutations=2, bias="risk"))
+        children.append(mutate(best, n_mutations=2, bias="risk", risk_direction=risk_direction))
 
     # 5. Mutación de exploración (sin sesgo, más fuerte)
     children.append(_mutate_strong(best))
