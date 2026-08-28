@@ -146,6 +146,19 @@ def should_open(
 
     direction = "COMPRA" if alpha_score > 0 else "VENDE"
 
+    # FIX (auditoría 2026-08-28, Problema 1 / Bug A):
+    # El sistema real nunca abre posiciones cortas (trade_tracker.py lo
+    # documenta explícitamente) — solo compra. El shadow, en cambio,
+    # simulaba también las señales "VENDE" como si fueran compras,
+    # calculando el PnL siempre como posición larga (ver pnl_pct más
+    # abajo en evaluate_shadow_cycle). Resultado: una señal bajista que
+    # ACIERTA (el precio cae) se registraba como pérdida, y una que
+    # FALLA (el precio sube) se registraba como ganancia — invertido.
+    # El shadow debe simular exactamente lo que el sistema real puede
+    # hacer, ni más ni menos: si no compra en corto, tampoco lo simula.
+    if direction == "VENDE":
+        return None
+
     agreeing = 0
     evidence = []
     for h_key, sig in h_signals.items():
@@ -363,3 +376,4 @@ def get_shadow_resolved_trades(genome_id: str, last_n: int = 200) -> List[Dict]:
 
     trades.sort(key=lambda t: t.get("exit_date", ""), reverse=True)
     return trades[:last_n]
+      
