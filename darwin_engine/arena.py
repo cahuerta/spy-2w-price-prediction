@@ -47,6 +47,23 @@ FIX v1.3 [AUD-P2] (auditoría 2026-08-26, Problema 2):
        sigue siendo mayor. Si scipy no está disponible o hay menos de
        10 muestras de un lado, cae de vuelta al criterio anterior
        (delta absoluto MIN_IMPROVEMENT_PCT) — no bloquea el ciclo.
+
+FIX v1.1 (auditoría 2026-08-28, Problema 1 / Bug C):
+  [F8] Mann-Whitney U pregunta "¿los valores de un grupo tienden a
+       ser más grandes, en general?" — compara la distribución
+       completa (esencialmente la mediana), no el promedio. Los
+       retornos reales tienen cola larga (muchas pérdidas chicas,
+       pocas ganancias grandes), así que la mediana puede ser ~0
+       aunque el promedio sea claramente positivo. Confirmado en
+       producción: executor_v4 con mediana=0.0% pero media=+1.22%
+       daba p=0.649 (sin significancia) pese a tener +1.11 puntos de
+       fitness sobre el campeón — el test bloqueaba una promoción
+       legítima.
+       Fix: _is_significantly_better() ahora usa un bootstrap sobre
+       la diferencia de MEDIAS (remuestreo con reemplazo de cada
+       lado, p-value = fracción de remuestreos donde el candidato no
+       queda por encima). Compara promedios directamente, sin asumir
+       normalidad ni simetría, y ya no depende de scipy.
 """
 
 import json
@@ -72,8 +89,9 @@ from darwin_engine.mutator import generate_next_generation, random_genome
 from darwin_engine.trade_tracker import get_resolved_trades, get_tracker_summary
 from darwin_engine.executor_shadow_evaluator import get_shadow_resolved_trades, run_all_shadows
 
-# [AUD-P2] scipy es opcional — si no está instalado, el criterio cae
-# de vuelta al delta absoluto de siempre (ver _select_champion).
+# [AUD-P2→F8] scipy ya no es necesario para el test de significancia
+# (ver _is_significantly_better, ahora bootstrap puro con numpy). Se
+# deja la detección por si algún otro punto del código lo usa.
 try:
     from scipy import stats as _scipy_stats
     SCIPY_AVAILABLE = True
@@ -97,6 +115,9 @@ GITHUB_ENABLED        = os.getenv("GITHUB_TOKEN") is not None
 # estadístico, y umbral de significancia (p-value).
 STAT_TEST_MIN_SAMPLES = int(os.getenv("DARWIN_STAT_MIN_SAMPLES", "10"))
 STAT_TEST_P_VALUE     = float(os.getenv("DARWIN_STAT_P_VALUE",   "0.10"))
+
+# [F8] Nº de remuestreos del bootstrap sobre la diferencia de medias.
+STAT_TEST_BOOTSTRAP_ITERS = int(os.getenv("DARWIN_BOOTSTRAP_ITERS", "5000"))
 
 
 # ══════════════════════════════════════════════════════
@@ -274,20 +295,36 @@ def _is_significantly_better(
     candidate_genome_id: str,
 ) -> Optional[bool]:
     """
-    [AUD-P2] Test de Mann-Whitney U (no paramétrico, no asume
-    distribución normal) entre los retornos reales del campeón y los
-    retornos simulados (shadow) del candidato.
+    [F8] FIX (auditoría 2026-08-28, Problema 1 / Bug C):
+    Antes usaba Mann-Whitney U, que pregunta "¿los valores de un grupo
+    tienden a ser más grandes, en general?" — compara la distribución
+    completa (esencialmente la mediana), no el promedio.
+
+    Los retornos reales tienen cola larga: muchas pérdidas chicas y
+    pocas ganancias grandes. Con ese patrón la MEDIANA puede ser ~0
+    aunque el PROMEDIO (lo que de verdad importa para la plata, y lo
+    que ya usa el fitness vía Sharpe) sea claramente positivo.
+    Confirmado en producción: executor_v4 con mediana=0.0% pero
+    media=+1.22% le daba p=0.649 en Mann-Whitney (sin significancia)
+    pese a tener +1.11 puntos de fitness sobre el campeón — el test
+    bloqueaba una promoción legítima.
+
+    Ahora: bootstrap de la diferencia de MEDIAS entre candidato y
+    campeón. Remuestrea con reemplazo ambos grupos por separado
+    STAT_TEST_BOOTSTRAP_ITERS veces, arma la distribución de
+    (media_candidato - media_campeón), y el p-value es la fracción de
+    remuestreos donde esa diferencia es <= 0 (candidato no mejor).
+    No asume distribución normal ni simetría — funciona igual de bien
+    con colas largas, porque compara promedios directamente en vez de
+    orden/mediana. No depende de scipy.
 
     Retorna:
-      True  → el candidato es significativamente mejor (p < STAT_TEST_P_VALUE)
+      True  → el candidato es significativamente mejor en promedio
+              (p < STAT_TEST_P_VALUE)
       False → no hay evidencia suficiente de que sea mejor
-      None  → no se pudo correr el test (scipy ausente o muestra
-              insuficiente) — el llamador debe usar el criterio de
-              respaldo (delta absoluto).
+      None  → muestra insuficiente de un lado — el llamador debe usar
+              el criterio de respaldo (delta absoluto).
     """
-    if not SCIPY_AVAILABLE:
-        return None
-
     champ_returns = _extract_returns(get_resolved_trades(executor_genome_id=champion_genome_id))
     cand_returns  = _extract_returns(get_shadow_resolved_trades(candidate_genome_id))
 
@@ -295,12 +332,19 @@ def _is_significantly_better(
         return None
 
     try:
-        _, p_value = _scipy_stats.mannwhitneyu(
-            cand_returns, champ_returns, alternative="greater"
-        )
+        champ_arr = np.asarray(champ_returns, dtype=float)
+        cand_arr  = np.asarray(cand_returns, dtype=float)
+
+        rng = np.random.default_rng()
+        boot_champ_means = rng.choice(champ_arr, size=(STAT_TEST_BOOTSTRAP_ITERS, len(champ_arr)), replace=True).mean(axis=1)
+        boot_cand_means  = rng.choice(cand_arr,  size=(STAT_TEST_BOOTSTRAP_ITERS, len(cand_arr)),  replace=True).mean(axis=1)
+
+        diffs   = boot_cand_means - boot_champ_means
+        p_value = float(np.mean(diffs <= 0))
+
         return bool(p_value < STAT_TEST_P_VALUE)
     except Exception as e:
-        logger.warning(f"⚠️ mannwhitneyu falló ({champion_genome_id} vs {candidate_genome_id}): {e}")
+        logger.warning(f"⚠️ bootstrap de medias falló ({champion_genome_id} vs {candidate_genome_id}): {e}")
         return None
 
 
@@ -411,7 +455,7 @@ def _select_champion(
             logger.info(
                 f"🏆 NUEVO CAMPEÓN (test estadístico): {best_candidate.genome_id} | "
                 f"fitness={best_fitness:.4f} vs actual={champion_fitness:.4f} | "
-                f"p<{STAT_TEST_P_VALUE} (Mann-Whitney U, n>={STAT_TEST_MIN_SAMPLES}/lado)"
+                f"p<{STAT_TEST_P_VALUE} (bootstrap de medias, n>={STAT_TEST_MIN_SAMPLES}/lado)"
             )
             return best_candidate, True
         else:
@@ -443,7 +487,6 @@ def _select_champion(
             f"mejora={improvement:+.4f} < mínimo={MIN_IMPROVEMENT_PCT}"
         )
         return current_champion, False
-
 
 # ══════════════════════════════════════════════════════
 # CONTEXTO DE FITNESS PARA SESGO INTELIGENTE
@@ -782,9 +825,11 @@ def get_arena_status() -> Dict:
             "max_shadow_genomes":    MAX_SHADOW_GENOMES,
             "generation_size":       GENERATION_SIZE,
             "github_enabled":        GITHUB_ENABLED,
-            "stat_test_enabled":     SCIPY_AVAILABLE,     # [AUD-P2] trazabilidad
+            "stat_test_enabled":     True,     # [F8] bootstrap de medias, no requiere scipy
+            "stat_test_method":      "bootstrap_mean_diff",
             "stat_test_min_samples": STAT_TEST_MIN_SAMPLES,
             "stat_test_p_value":     STAT_TEST_P_VALUE,
+            "stat_test_bootstrap_iters": STAT_TEST_BOOTSTRAP_ITERS,
         },
     }
 
