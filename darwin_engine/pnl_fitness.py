@@ -42,6 +42,25 @@ FIX v1.3 (auditoría 2026-08-27, Problema 1):
        ya usa arena.py, ahora también para el número que decide quién
        gana. El campeón nunca cae a esta rama porque siempre tiene
        trades reales.
+
+FIX v1.4 (auditoría 2026-08-28, Problema 1 / Bug B):
+  [F7] compute_executor_fitness() restaba penalizacion*0.5 y sumaba
+       premio*0.3 al fitness — ambos derivados de oportunidad_pct y
+       closed_before_horizon, campos que SOLO existen para trades
+       reales (los llena trade_tracker.resolve_pending_trades() días
+       después de cerrado el trade, consultando el precio en la fecha
+       de horizonte original). Los trades de los shadows nunca pasan
+       por ese proceso — dan 0 siempre. Resultado: el campeón se
+       restaba en promedio ~1.33 puntos que ningún shadow paga jamás,
+       sin ser una ventaja real del shadow, solo un hueco de datos que
+       distorsionaba la comparación entre "quién decide mejor cuándo
+       entrar/salir".
+       Fix: penalizacion_oport y premio_timing se siguen calculando y
+       guardando en el resultado (visibles para auditar "¿dejó plata
+       sobre la mesa?" cuando SÍ hay datos), pero salen de la fórmula
+       de fitness competitivo: fitness = sharpe - (max_dd * 2). Así
+       campeón y shadows se comparan con exactamente los mismos
+       ingredientes.
 """
 
 import json
@@ -279,7 +298,19 @@ def compute_executor_fitness(genome_id: str) -> Dict:
     ]
     premio = float(np.mean(oport_ganada)) if oport_ganada else 0.0
 
-    fitness = sharpe - (max_dd * 2) - (penalizacion * 0.5) + (premio * 0.3)
+    # FIX (auditoría 2026-08-28, Problema 1 / Bug B):
+    # penalizacion/premio dependen de oportunidad_pct + closed_before_horizon,
+    # que solo existen para trades REALES (los llena resolve_pending_trades()
+    # días después de cerrado el trade). Los trades de los shadows nunca
+    # pasan por ese proceso, así que para ellos este término siempre da 0 —
+    # el campeón se restaba puntos que ningún shadow paga jamás, sin que
+    # fuera una ventaja real, solo un hueco de datos.
+    #
+    # Se sigue calculando y guardando (penalizacion_oport / premio_timing
+    # abajo) para poder auditar "¿dejó plata sobre la mesa?" cuando SÍ hay
+    # datos — pero ya no forma parte del fitness competitivo, que debe
+    # poder compararse en igualdad de condiciones entre campeón y shadows.
+    fitness = sharpe - (max_dd * 2)
 
     result = {
         "genome_id":          genome_id,
