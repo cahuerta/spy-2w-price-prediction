@@ -64,6 +64,29 @@ FIX v1.1 (auditoría 2026-08-28, Problema 1 / Bug C):
        lado, p-value = fracción de remuestreos donde el candidato no
        queda por encima). Compara promedios directamente, sin asumir
        normalidad ni simetría, y ya no depende de scipy.
+
+FIX v1.4 [AUD-U1] (auditoría 2026-08-29, Problema 2 — causa raíz):
+  [U1] _load_alpha_map() construía el universo de apertura de los
+       shadows leyendo alpha_last.json COMPLETO, sin aplicar el
+       filtro ALPACA_UNSUPPORTED (tickers/sufijos europeos y
+       canadienses no ejecutables) que sí aplica register_open() en
+       trade_tracker.py antes de que un trade real pueda existir.
+
+       Resultado: los shadows podían "operar" activos que el campeón
+       jamás podría tocar en la realidad — compitiendo sobre
+       distribuciones de oportunidades distintas, no las mismas
+       condiciones. Esto inflaba artificialmente la varianza del
+       lado candidato (confirmado en producción: std=7.21% shadow
+       vs std=4.23% campeón, casi el doble) y le restaba poder al
+       test de significancia de _is_significantly_better(), que
+       nunca lograba detectar mejoras reales (p≈0.245 con datos que
+       deberían haber dado una promoción).
+
+       Fix: _load_alpha_map() ahora excluye los mismos tickers y
+       sufijos no soportados que trade_tracker.py, usando la MISMA
+       constante ALPACA_UNSUPPORTED (importada, no duplicada) — el
+       universo de apertura de los shadows queda así idéntico al que
+       realmente puede operar el campeón.
 """
 
 import json
@@ -86,7 +109,7 @@ from darwin_engine.pnl_fitness import (
     get_fitness_summary,
 )
 from darwin_engine.mutator import generate_next_generation, random_genome
-from darwin_engine.trade_tracker import get_resolved_trades, get_tracker_summary
+from darwin_engine.trade_tracker import get_resolved_trades, get_tracker_summary, ALPACA_UNSUPPORTED
 from darwin_engine.executor_shadow_evaluator import get_shadow_resolved_trades, run_all_shadows
 
 # [AUD-P2→F8] scipy ya no es necesario para el test de significancia
@@ -347,7 +370,6 @@ def _is_significantly_better(
         logger.warning(f"⚠️ bootstrap de medias falló ({champion_genome_id} vs {candidate_genome_id}): {e}")
         return None
 
-
 # ══════════════════════════════════════════════════════
 # SELECCIÓN: ¿PROMOVER NUEVO CAMPEÓN?  [F4][AUD-D2][AUD-P2]
 # ══════════════════════════════════════════════════════
@@ -557,23 +579,52 @@ def _build_fitness_context() -> Dict:
 ALPHA_FILE = DATA_PATH / "alpha_last.json"
 PRED_DIR   = DATA_PATH / "predictions"
 
+# [AUD-U1] Mismos sufijos no ejecutables en Alpaca que ya usa
+# trade_tracker.py (register_open, etc.) — se repite aquí en vez de
+# importarse porque en trade_tracker.py está definida localmente
+# dentro de cada función, no como constante de módulo. Si se mueve
+# a una constante compartida ahí, actualizar también acá.
+_ALPACA_UNSUPPORTED_SUFFIXES = (".PA", ".DE", ".SW", ".TO", ".MC", ".AS", ".MI", ".BR")
+
+
+def _is_alpaca_unsupported(ticker: str) -> bool:
+    t = ticker.upper()
+    return t in ALPACA_UNSUPPORTED or any(t.endswith(s) for s in _ALPACA_UNSUPPORTED_SUFFIXES)
+
 
 def _load_alpha_map() -> Dict[str, Dict]:
     """
     Mismo alpha_last.json que ya consume trading_orchestrator.py y
     trade_tracker.py — ningún dato nuevo, ninguna llamada adicional
     a un proveedor externo.
+
+    [AUD-U1] Excluye tickers ALPACA_UNSUPPORTED / sufijos europeos y
+    canadienses — el mismo filtro que register_open() aplica antes
+    de que un trade real pueda existir. Sin esto, los shadows abrían
+    posiciones simuladas en activos que el campeón nunca podría
+    operar en la realidad, compitiendo sobre universos distintos.
     """
     try:
         if not ALPHA_FILE.exists():
             logger.warning("⚠️ alpha_last.json no encontrado — shadows sin universo este ciclo")
             return {}
         data = json.loads(ALPHA_FILE.read_text())
-        return {
+        raw  = {
             t.upper(): d
             for t, d in data.get("results", {}).items()
             if isinstance(d, dict)
         }
+        filtered = {
+            t: d for t, d in raw.items()
+            if not _is_alpaca_unsupported(t)
+        }
+        skipped = len(raw) - len(filtered)
+        if skipped:
+            logger.info(
+                f"⏭ _load_alpha_map — {skipped} ticker(s) no soportados en Alpaca "
+                f"excluidos del universo de shadows (mismas condiciones que el campeón)"
+            )
+        return filtered
     except Exception as e:
         logger.warning(f"⚠️ _load_alpha_map falló: {e}")
         return {}
