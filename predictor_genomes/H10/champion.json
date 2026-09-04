@@ -4,9 +4,9 @@
   "generation": 1,
   "parent_ids": [],
   "fitness": null,
-  "hit_rate": 0.4576,
+  "hit_rate": 0.4583,
   "bias_score": null,
-  "n_evaluations": 4996,
+  "n_evaluations": 5069,
   "created_at": "2026-07-07T16:52:27.547912+00:00",
   "features": [
     "range",
