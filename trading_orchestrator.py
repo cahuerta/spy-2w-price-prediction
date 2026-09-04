@@ -1,6 +1,19 @@
 # =========================================================
-# trading_orchestrator.py — v4.7 TRACKER-PM INTEGRATION + FIX AUDITORIA P1
+# trading_orchestrator.py — v4.8 GENOMA REAL CONECTADO (FIX AUDITORIA P2)
 # =========================================================
+# v4.8 [AUD-P2] (2026-09-04):
+#   El SHIELD BLOCK (alpha_score >= ALPHA_SHIELD → bloquea CLOSE) y el
+#   barrido ALPHA_KILL (alpha_score <= ALPHA_KILL → fuerza CLOSE) eran
+#   dos umbrales fijos, completamente desconectados de ExecutorGenome
+#   — el genoma que Darwin evoluciona hace 4+ meses. Cualquier campeón
+#   nuevo promovido por Darwin no cambiaba en nada el trading real.
+#   Fix: ambos puntos ahora consultan ExecutorGenome.load_champion()
+#   .evaluate() — sus 4 reglas (profit-lock/loss-cut, días mínimos
+#   según confianza de entrada, escudo anti-kill con confirmación real
+#   de H, y score ponderado multi-horizonte) reemplazan los umbrales
+#   fijos. Si evaluate() falla por cualquier motivo, HOLD por defecto
+#   (fail-safe: no fuerza cierres por un error de lectura de datos).
+#
 # v4.7:
 #   [AUD-P1] Fix Problema 1 de auditoría (fallos de registro de trades
 #            silenciados en Darwin):
@@ -44,6 +57,11 @@ from pm_growth import PMGrowth
 from pm_neutral import PMNeutral
 from pm_defensive import PMDefensive
 
+# [AUD-P2] Genoma real del executor — reemplaza umbrales fijos ALPHA_SHIELD/ALPHA_KILL
+from darwin_engine.executor_genome import ExecutorGenome
+from darwin_engine.trade_tracker import _read_h_signals
+from darwin_engine.pnl_fitness import _get_h_hit_rates
+
 # ── DARWIN TRACKING ───────────────────────────────────────────────
 try:
     from darwin_engine.trade_tracker import register_open, register_close
@@ -83,6 +101,51 @@ def _load_active_genome_ids() -> tuple:
     except Exception as e:
         logger.warning(f"⚠️ No se pudo leer champion.json: {e} → usando defaults")
     return "executor_v1", "predictor_v1"
+
+
+def _genome_decision(
+    ticker: str,
+    position: Dict,
+    alpha_score: float,
+    genome: "ExecutorGenome",
+    h_hit_rates: Dict[str, float],
+) -> Dict:
+    """
+    [AUD-P2] Consulta al genoma campeón real (evaluate()) para decidir
+    HOLD/CLOSE de una posición abierta, en vez de los umbrales fijos
+    ALPHA_SHIELD/ALPHA_KILL. Fail-safe: si falta algún dato o algo
+    falla, retorna HOLD (nunca fuerza un cierre por un error de lectura).
+    """
+    try:
+        entry_date_str = position.get("entry_date")
+        entry_date = (
+            datetime.strptime(entry_date_str, "%Y-%m-%d").date()
+            if entry_date_str else datetime.now(timezone.utc).date()
+        )
+        days_held = (datetime.now(timezone.utc).date() - entry_date).days
+
+        h_signals_at_entry = _read_h_signals(ticker, entry_date)
+        h_signals_now       = _read_h_signals(ticker, datetime.now(timezone.utc).date())
+
+        entry_price   = float(position.get("avg_entry_price") or 0)
+        current_price = float(
+            position.get("current_price") or position.get("price_now") or entry_price
+        )
+        current_pnl_pct = (
+            (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
+        )
+
+        return genome.evaluate(
+            trade           = {"h_signals_at_entry": h_signals_at_entry},
+            current_pnl_pct = current_pnl_pct,
+            alpha_score     = alpha_score,
+            h_signals       = h_signals_now,
+            h_hit_rates     = h_hit_rates,
+            days_held       = days_held,
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ _genome_decision falló para {ticker}: {e} → HOLD (fail-safe)")
+        return {"action": "HOLD", "reason": "GENOME_ERROR_FAILSAFE", "confidence": 0.0}
 
 
 def _record_tracking_failure(kind: str, ticker: str, error: str) -> None:
@@ -598,6 +661,10 @@ class TradingOrchestrator:
         closes = []
         opens  = []
 
+        # [AUD-P2] Genoma real cargado una vez por ciclo (no por ticker)
+        genome      = ExecutorGenome.load_champion()
+        h_hit_rates = _get_h_hit_rates()
+
         for decision in pm_decisions:
             if decision.get("action") == "CLOSE":
                 ticker = decision.get("ticker", "").upper()
@@ -612,23 +679,44 @@ class TradingOrchestrator:
                     continue
 
                 alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
-                if alpha_score >= self.alpha_hold_shield:
-                    logger.info(f"🛡 SHIELD BLOCK {ticker} | alpha={alpha_score:.3f}")
+                # [AUD-P2] Reemplaza el SHIELD BLOCK fijo (alpha >= 0.75)
+                genome_dec = _genome_decision(
+                    ticker, real_positions[ticker], alpha_score, genome, h_hit_rates
+                )
+                if genome_dec["action"] == "HOLD":
+                    logger.info(
+                        f"🧬 GENOME HOLD {ticker} | alpha={alpha_score:.3f} | "
+                        f"pm_reason={reason} | genoma={genome_dec['reason']}"
+                    )
                     continue
 
-                closes.append({"action": "CLOSE", "ticker": ticker, "reason": reason})
-
-        for ticker in portfolio_tickers:
-            alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
-            if alpha_score <= self.alpha_kill:
-                if ticker not in real_positions:
-                    continue
                 closes.append({
                     "action": "CLOSE",
                     "ticker": ticker,
-                    "reason": f"ALPHA_KILL_{alpha_score:.3f}",
+                    "reason": f"{reason}|GENOME_{genome_dec['reason']}",
                 })
-                logger.warning(f"💀 KILL {ticker} | alpha={alpha_score:.3f}")
+
+        # [AUD-P2] Reemplaza el barrido ALPHA_KILL fijo (alpha <= -0.40):
+        # cualquier posición real que el genoma marque CLOSE, aunque el
+        # PM no haya propuesto cerrarla, se cierra igual (cubre lo que
+        # antes cubría KILL, ahora con las 4 reglas reales del genoma).
+        ya_en_cierre = {c["ticker"] for c in closes}
+        for ticker in portfolio_tickers:
+            if ticker in ya_en_cierre or ticker not in real_positions:
+                continue
+            alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
+            genome_dec  = _genome_decision(
+                ticker, real_positions[ticker], alpha_score, genome, h_hit_rates
+            )
+            if genome_dec["action"] == "CLOSE":
+                closes.append({
+                    "action": "CLOSE",
+                    "ticker": ticker,
+                    "reason": f"GENOME_{genome_dec['reason']}",
+                })
+                logger.warning(
+                    f"🧬 GENOME CLOSE {ticker} | alpha={alpha_score:.3f} | {genome_dec['reason']}"
+                )
 
         closes = list({c["ticker"]: c for c in closes}.values())
 
