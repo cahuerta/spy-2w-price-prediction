@@ -4,9 +4,9 @@
   "generation": 1,
   "parent_ids": [],
   "fitness": null,
-  "hit_rate": 0.4838,
-  "bias_score": 0.5127,
-  "n_evaluations": 6435,
+  "hit_rate": 0.484,
+  "bias_score": 0.5143,
+  "n_evaluations": 6548,
   "created_at": "2026-07-07T16:52:27.547376+00:00",
   "features": [
     "range",
@@ -27,5 +27,5 @@
     "period": "max",
     "sample_weight_decay": 0.0
   },
-  "bias_score_updated_at": "2026-09-02T22:01:20.503776+00:00"
+  "bias_score_updated_at": "2026-09-04T22:01:10.783535+00:00"
 }
