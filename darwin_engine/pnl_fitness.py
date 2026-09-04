@@ -61,6 +61,21 @@ FIX v1.4 (auditoría 2026-08-28, Problema 1 / Bug B):
        de fitness competitivo: fitness = sharpe - (max_dd * 2). Así
        campeón y shadows se comparan con exactamente los mismos
        ingredientes.
+
+FIX v1.5 [F8] (2026-09-01, Problema 1 — bug de signo en compute_combined_fitness):
+  [F8] compute_combined_fitness() combinaba predictor (40%) + executor (60%)
+       y aplicaba `combined *= 0.7` como "penalización" cuando alguno de los
+       dos fitness era muy malo (< -0.5). Si `combined` ya era negativo,
+       multiplicar por 0.7 lo acerca a cero — es decir, MEJORA el score de
+       un genoma malo en vez de empeorarlo. Esto corrompía la selección de
+       campeón en todo el motor evolutivo.
+       Fix: en vez de parchar el multiplicador, se simplifica la decisión.
+       `combined_fitness` pasa a ser directamente el fitness del executor
+       (`e_fitness`) — quien decide mejor cuándo entrar/salir gana, sin
+       combinarse con el predictor ni aplicar penalización alguna. El
+       fitness del predictor se sigue calculando y guardando (columna
+       `predictor_fitness`, visible para diagnóstico/dashboard), pero deja
+       de participar en la decisión de quién es campeón.
 """
 
 import json
@@ -430,6 +445,12 @@ def compute_combined_fitness(
     executor_genome_id: str,
 ) -> Dict:
     """
+    [F8] combined_fitness = fitness del executor (e_fitness), sin combinar
+    con el predictor y sin el multiplicador de "penalización" que tenía
+    el signo invertido (ver FIX v1.5 en el encabezado del archivo).
+    El fitness del predictor se sigue calculando y guardando (visible
+    para diagnóstico/dashboard), pero ya no participa en la decisión.
+
     [F3] Usa math.isnan() para detectar nan en e_fitness/p_fitness.
     numpy evalúa nan < -0.5 como False, dejando pasar el nan al combined.
     """
@@ -447,15 +468,8 @@ def compute_combined_fitness(
         logger.warning(f"⚠️ e_fitness nan/inf para {executor_genome_id} → usando 0.0")
         e_fitness = 0.0
 
-    combined = (p_fitness * 0.40) + (e_fitness * 0.60)
-
-    # Penalización si uno de los dos es muy malo
-    if p_fitness < -0.5 or e_fitness < -0.5:
-        combined *= 0.7
-        logger.warning(
-            f"⚠️ Penalización combinada | "
-            f"pred={p_fitness:.3f} exec={e_fitness:.3f}"
-        )
+    # [F8] combined = fitness real del executor, y nada más.
+    combined = e_fitness
 
     result = {
         "predictor_genome_id": predictor_genome_id,
@@ -478,8 +492,8 @@ def compute_combined_fitness(
     logger.info(
         f"⚡ Combined fitness | "
         f"pred={predictor_genome_id} exec={executor_genome_id} | "
-        f"combined={combined:.4f} "
-        f"(pred={p_fitness:.4f} exec={e_fitness:.4f})"
+        f"combined={combined:.4f} (= fitness del executor) "
+        f"(pred_fitness={p_fitness:.4f}, informativo, no usado)"
     )
     return result
 
@@ -487,17 +501,14 @@ def compute_combined_fitness(
 # ══════════════════════════════════════════════════════
 # RANKING DE TODOS LOS GENOMAS CONOCIDOS
 # ══════════════════════════════════════════════════════
-
 def rank_all_genomes() -> List[Dict]:
     """
     Lee todos los fitness guardados y los rankea.
     """
     if not FITNESS_DIR.exists():
         return []
-
     scores = []
     seen   = set()
-
     for path in FITNESS_DIR.glob("combined_*.json"):
         data = _load_json(path)
         if not data:
@@ -507,28 +518,21 @@ def rank_all_genomes() -> List[Dict]:
             continue
         seen.add(key)
         scores.append(data)
-
     scores.sort(key=lambda x: x.get("combined_fitness", -999), reverse=True)
     return scores
-
-
 def get_current_champion() -> Optional[Dict]:
     """Retorna el genome con mayor fitness combinado."""
     ranking = rank_all_genomes()
     return ranking[0] if ranking else None
-
-
 def get_fitness_summary() -> Dict:
     """Resumen del estado actual de todos los genomas. Para el dashboard."""
     ranking = rank_all_genomes()
-
     if not ranking:
         return {
             "total_genomes": 0,
             "champion": None,
             "status": "no_data",
         }
-
     champion = ranking[0]
     return {
         "total_genomes": len(ranking),
@@ -548,5 +552,4 @@ def get_fitness_summary() -> Dict:
         ],
         "status": "ok",
       }
-
       
