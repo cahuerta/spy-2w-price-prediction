@@ -23,6 +23,20 @@ EVAL_DIR  = "/data/evaluations"
 #         final_ret_pct, trajectory, consensus_std, confidence.
 #         Consumible por intraday_tracker y dashboard.
 #         Misma salida de siempre + dos campos nuevos.
+# FIXES v7.7 [AUD-D2] (auditoría 2026-09-05, Problema 2):
+#   [D2] adjust_factor era 0.15 fijo — H10 dominaba 85-100% del
+#        precio final pese a tener el peor hit rate del ensemble
+#        (48.07% global, peor que el azar). El sistema ya calculaba
+#        el hit rate propio de H10 por ticker (_load_horizon_weights
+#        incluye H10 en su rango) pero lo descartaba antes de usarlo
+#        en este punto. Fix: adjust_factor ahora escala con
+#        1 - hit_rate(H10) (clip 0.15-0.60) vía _h10_hit_rate() — si
+#        H10 anda mal en ese ticker, la curva de H1-H9 puede
+#        corregirlo más; si anda bien, domina casi igual que antes.
+#        Sin muestras suficientes → 0.15 de siempre, sin cambio.
+#        NO se modifica la forma del JSON de salida (compatibilidad
+#        con el resto del sistema) — solo cambia cómo se calcula
+#        internamente el valor de adjust_factor.
 # ======================================================
 
 
@@ -104,6 +118,38 @@ def _load_horizon_weights(ticker: str) -> Dict[str, float]:
     norm   = exp_v / exp_v.sum()
 
     return {k: float(w) for k, w in zip(keys, norm)}
+
+
+# ======================================================
+# [AUD-D2] HIT RATE PROPIO DE H10 (2026-09-05, Problema 2)
+# ======================================================
+def _h10_hit_rate(ticker: str) -> Optional[float]:
+    """
+    [AUD-D2] Hit rate real de H10 por ticker (misma fuente y mismo
+    MIN_SAMPLES=10 que _load_horizon_weights, pero SIN pasar por el
+    softmax de normalización — acá se necesita el rate crudo (0-1)
+    para decidir cuánto puede corregirlo la curva de H1-H9, no un
+    peso relativo ya normalizado contra los demás horizontes).
+    Retorna None si no hay 10 muestras — el llamador debe usar el
+    comportamiento anterior (0.15 fijo) como fallback en ese caso.
+    """
+    eval_path = Path(EVAL_DIR) / ticker
+    if not eval_path.exists():
+        return None
+
+    hits: List[bool] = []
+    for f in sorted(eval_path.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            diag = (data.get("models_diagnostics") or {}).get("H10")
+            if diag and diag.get("hit_sign") is not None:
+                hits.append(bool(diag["hit_sign"]))
+        except Exception:
+            continue
+
+    if len(hits) < 10:
+        return None
+    return float(np.mean(hits))
 
 
 # ======================================================
@@ -385,7 +431,21 @@ class MasterOrchestrator:
 
         consensus        = np.std([r["price_pred"] for r in self.results if r["horizon"] < 10])
         consensus_weight = 1 / (1 + consensus / self.price_today)
-        adjust_factor    = 0.15 * consensus_weight
+
+        # [AUD-D2][2026-09-05] Antes: adjust_factor = 0.15 fijo, sin
+        # relación con qué tan confiable es H10 en este ticker. Ahora:
+        # se usa el hit rate real de H10 (mismo hit_sign que ya se
+        # registra en evaluator.py) para decidir cuánto puede
+        # corregirlo la curva de H1-H9 — si H10 anda mal en este
+        # ticker, se le permite más corrección; si anda bien, domina
+        # casi igual que antes. Sin muestras suficientes de H10 →
+        # fallback al 0.15 de siempre (comportamiento sin cambios).
+        h10_rate = _h10_hit_rate(self.ticker)
+        if h10_rate is not None:
+            base_adjust = float(np.clip(1.0 - h10_rate, 0.15, 0.60))
+        else:
+            base_adjust = 0.15
+        adjust_factor = base_adjust * consensus_weight
 
         final_price  = h10_price * (1 + curve_adjust / 100 * adjust_factor)
         ret_adjusted = ((final_price - self.price_today) / self.price_today) * 100
@@ -522,4 +582,3 @@ if __name__ == "__main__":
         print(json.dumps(result["curve_analysis"], indent=2))
     if result.get("horizon_weights"):
         print(f"\n⚖️  Pesos usados: {result['horizon_weights']}")
-                        
