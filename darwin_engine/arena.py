@@ -87,6 +87,29 @@ FIX v1.4 [AUD-U1] (auditoría 2026-08-29, Problema 2 — causa raíz):
        constante ALPACA_UNSUPPORTED (importada, no duplicada) — el
        universo de apertura de los shadows queda así idéntico al que
        realmente puede operar el campeón.
+
+FIX v1.5 [AUD-D1] (auditoría 2026-09-05, Problema 1):
+  [D1] _prune_shadow_genomes() archivaba (de forma IRREVERSIBLE,
+       src.rename() fuera de GENOME_DIR) a cualquier genoma shadow
+       que no quedara en el top-MAX_SHADOW_GENOMES por
+       combined_fitness DEL DÍA. No distinguía "genoma malo" de
+       "mejor histórico con un mal día puntual de fitness" — una vez
+       archivado, _load_all_active_genomes() solo lee GENOME_DIR
+       (glob), así que el genoma desaparecía para siempre: nunca más
+       acumulaba shadow trades ni podía alcanzar MIN_TRADES_TO_COMPETE
+       para ser comparado formalmente contra el campeón vía
+       _is_significantly_better().
+       Confirmado en producción: executor_v6_4 archivado con
+       executor_fitness=+1.0659 (combined_fitness=+0.6475), ~12x
+       mejor que el campeón vigente executor_v1 (-0.1112). v2, v3,
+       v6 en la misma situación.
+       Fix: elitismo — nunca se archiva al mejor del ranking actual
+       ni a ningún genoma que ya acumuló >= MIN_TRADES_TO_COMPETE
+       shadow trades (es decir, ya tiene evidencia suficiente para
+       competir formalmente; archivarlo tira esa evidencia a la
+       basura). Solo se archivan genomas sin evidencia suficiente Y
+       fuera del top-MAX_SHADOW_GENOMES — los "hijos" nuevos de cada
+       generación que aún no demostraron nada.
 """
 
 import json
@@ -816,6 +839,13 @@ def _prune_shadow_genomes(
     shadow: List[ExecutorGenome],
     fitness_results: Dict,
 ) -> None:
+    """
+    [AUD-D1] Poda con elitismo: nunca archiva al mejor del ranking
+    actual ni a ningún genoma que ya acumuló evidencia suficiente
+    (>= MIN_TRADES_TO_COMPETE shadow trades) para competir formalmente
+    contra el campeón. Solo archiva "hijos" nuevos sin evidencia aún
+    y fuera del top-MAX_SHADOW_GENOMES.
+    """
     if len(shadow) <= MAX_SHADOW_GENOMES:
         return
 
@@ -827,7 +857,19 @@ def _prune_shadow_genomes(
         reverse=True,
     )
 
-    to_archive  = ranked_shadow[MAX_SHADOW_GENOMES:]
+    # [AUD-D1] Elitismo: proteger al mejor histórico vivo (aunque hoy
+    # tenga un mal día de fitness) y a cualquier candidato que ya
+    # acumuló suficientes shadow trades para ser evaluado formalmente.
+    protected_ids = {ranked_shadow[0].genome_id}
+    for g in ranked_shadow:
+        if len(get_shadow_resolved_trades(g.genome_id)) >= MIN_TRADES_TO_COMPETE:
+            protected_ids.add(g.genome_id)
+
+    to_archive = [
+        g for g in ranked_shadow[MAX_SHADOW_GENOMES:]
+        if g.genome_id not in protected_ids
+    ]
+
     archive_dir = GENOME_DIR / "archived"
     archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -840,6 +882,13 @@ def _prune_shadow_genomes(
                 f"📦 Archivado: {genome.genome_id} | "
                 f"fitness={fitness_results.get(genome.genome_id, {}).get('combined_fitness', 0):.4f}"
             )
+
+    if len(protected_ids) > MAX_SHADOW_GENOMES:
+        logger.info(
+            f"🛡️ Elitismo: {len(protected_ids)} genomas protegidos de poda "
+            f"(por encima del límite {MAX_SHADOW_GENOMES}) — mejor histórico "
+            f"y/o candidatos con evidencia suficiente para competir."
+        )
 
 
 # ══════════════════════════════════════════════════════
