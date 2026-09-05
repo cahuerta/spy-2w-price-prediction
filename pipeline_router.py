@@ -1,5 +1,5 @@
 # =========================================================
-# pipeline_router.py — PIPELINE ROUTER v2.6
+# pipeline_router.py — PIPELINE ROUTER v2.7
 # =========================================================
 # v2.2: [F7] Intraday tracker como paso 10.5
 # v2.3: [F8] Intraday evaluator como paso 4.6
@@ -15,6 +15,18 @@
 #        run_intraday_tracker() eliminado en tracker v3.0.
 #        Reemplazado por evaluar_posiciones_abiertas(tickers)
 #        que recibe la lista exacta del portfolio actual.
+# v2.7: [AUD-P4] (2026-09-04) COMMIT ya no se llama a sí mismo por
+#        HTTP (httpx.post a /internal/pipeline/commit). Root cause
+#        confirmada: desde que el servicio pasó a correr por Docker
+#        (21-ago-2026, Dockerfile agregado para Claude Code CLI del
+#        auditor), esa auto-llamada dejó de completarse — 13 días
+#        sin market_context.json actualizado y sin nuevos trades de
+#        Darwin, con el fallo cayendo en un except genérico sin
+#        alertar a nadie. Fix: se escribe directo a disco en el
+#        mismo proceso (mismo patrón .tmp + .replace() que ya usa
+#        el screener en el paso 1), sin salir por red. El endpoint
+#        /internal/pipeline/commit de main.py queda intacto por si
+#        algo externo lo usa, pero este pipeline ya no depende de él.
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -23,7 +35,6 @@ import logging
 import traceback
 import os
 import gc
-import httpx
 import asyncio
 from pathlib import Path
 import json
@@ -252,9 +263,14 @@ async def _run_pipeline_logic(request: Request):
         gc.collect()  # [F9] liberar trading orchestrator
 
         # ── 10. COMMIT ────────────────────────────────────
+        # [AUD-P4][2026-09-04] Antes: se armaba commit_payload y se
+        # mandaba por httpx.post a /internal/pipeline/commit (self-HTTP).
+        # Ahora: se escribe directo a disco, mismo proceso, mismo
+        # patrón .tmp + .replace() que usa el screener en el paso 1.
+        # No depende de que el contenedor pueda llamarse a sí mismo
+        # por red — elimina el punto de falla que empezó el 21-ago
+        # (cambio de deploy nativo → Docker).
         logger.info("💾 [10/10] Committing pipeline results...")
-        PIPELINE_KEY = os.getenv("PIPELINE_KEY")
-        BASE_URL     = str(request.base_url).rstrip("/")
 
         commit_payload = {
             "screener":   screener_out,
@@ -267,18 +283,26 @@ async def _run_pipeline_logic(request: Request):
             },
         }
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{BASE_URL}/internal/pipeline/commit",
-                json=commit_payload,
-                headers={"X-PIPELINE-KEY": PIPELINE_KEY},
-                timeout=30,
-            )
+        try:
+            market_ctx_file = DATA_PATH / "market_context.json"
+            market_ctx_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_mc = market_ctx_file.with_suffix(".tmp")
+            tmp_mc.write_text(json.dumps(commit_payload["market_ctx"], indent=2))
+            tmp_mc.replace(market_ctx_file)
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"Pipeline commit failed: {resp.status_code} {resp.text}")
+            screener_commit_file = DATA_PATH / "screener_candidates.json"
+            tmp_sc = screener_commit_file.with_suffix(".tmp")
+            tmp_sc.write_text(json.dumps(commit_payload["screener"], indent=2))
+            tmp_sc.replace(screener_commit_file)
 
-        logger.info("✅ Pipeline committed")
+            pipeline_audit_file = DATA_PATH / "last_pipeline.json"
+            tmp_pa = pipeline_audit_file.with_suffix(".tmp")
+            tmp_pa.write_text(json.dumps(commit_payload, indent=2))
+            tmp_pa.replace(pipeline_audit_file)
+        except Exception as e:
+            raise RuntimeError(f"Pipeline commit failed (escritura directa): {e}")
+
+        logger.info("✅ Pipeline committed (escritura directa, sin HTTP)")
 
         gc.collect()  # [F9] liberar después del commit
 
