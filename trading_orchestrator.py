@@ -626,9 +626,26 @@ class TradingOrchestrator:
 
         broker_real_tickers = self._get_broker_positions_tickers()
         broker_positions    = load_positions()
-        disk_tickers        = {p["ticker"].upper() for p in broker_positions}
-        real_positions      = broker_real_tickers | disk_tickers
-        portfolio_tickers   = real_positions
+
+        # [AUD-P1][2026-09-07] BUG PROPIO: real_positions era la unión de
+        # dos sets de strings (broker_real_tickers | disk_tickers), pero
+        # el fix del genoma (2026-09-04) le hacía real_positions[ticker]
+        # como si fuera un diccionario → TypeError: 'set' object is not
+        # subscriptable en CADA ciclo con al menos una posición abierta.
+        # El error ocurre armando los argumentos de _genome_decision(),
+        # antes de entrar a la función, así que su fail-safe interno
+        # nunca llegaba a ejecutarse. Fix: real_positions pasa a ser un
+        # diccionario ticker -> position_dict (con precio ya enriquecido
+        # vía `positions`), no un set. disk_tickers se mantiene como set
+        # de strings porque el resto del archivo (línea ~830) lo sigue
+        # usando así.
+        by_ticker           = {p["ticker"].upper(): p for p in positions}
+        disk_tickers        = set(by_ticker.keys())
+        real_positions      = {
+            t: by_ticker.get(t, {"ticker": t})
+            for t in (broker_real_tickers | disk_tickers)
+        }
+        portfolio_tickers   = set(real_positions.keys())
 
         # [AUD-P1] Reconciliación diaria broker↔Darwin — informativa, no bloquea.
         if DARWIN_TRACKING:
@@ -680,9 +697,16 @@ class TradingOrchestrator:
 
                 alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
                 # [AUD-P2] Reemplaza el SHIELD BLOCK fijo (alpha >= 0.75)
-                genome_dec = _genome_decision(
-                    ticker, real_positions[ticker], alpha_score, genome, h_hit_rates
-                )
+                try:
+                    genome_dec = _genome_decision(
+                        ticker, real_positions[ticker], alpha_score, genome, h_hit_rates
+                    )
+                except Exception as e:
+                    # [AUD-P1] Red de seguridad: un fallo armando los
+                    # argumentos (o dentro de evaluate()) no debe abortar
+                    # el ciclo completo de cierres/aperturas.
+                    logger.error(f"❌ GENOME decision falló para {ticker}: {e} → HOLD")
+                    continue
                 if genome_dec["action"] == "HOLD":
                     logger.info(
                         f"🧬 GENOME HOLD {ticker} | alpha={alpha_score:.3f} | "
@@ -705,9 +729,13 @@ class TradingOrchestrator:
             if ticker in ya_en_cierre or ticker not in real_positions:
                 continue
             alpha_score = alpha_map.get(ticker, {}).get("alpha_score", 0)
-            genome_dec  = _genome_decision(
-                ticker, real_positions[ticker], alpha_score, genome, h_hit_rates
-            )
+            try:
+                genome_dec  = _genome_decision(
+                    ticker, real_positions[ticker], alpha_score, genome, h_hit_rates
+                )
+            except Exception as e:
+                logger.error(f"❌ GENOME CLOSE check falló para {ticker}: {e} → HOLD")
+                continue
             if genome_dec["action"] == "CLOSE":
                 closes.append({
                     "action": "CLOSE",
