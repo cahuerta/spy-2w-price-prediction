@@ -1,4 +1,4 @@
-# scheduler.py — v2.6
+# scheduler.py — v2.7
 # =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
@@ -75,19 +75,47 @@
 #   Fix: ambas ahora corren en procesos hijos separados
 #   (multiprocessing.Process, contexto "spawn"), mismo patrón que
 #   pipeline_router.py. _trigger_code_auditor ya usaba subprocess.run()
-#   y no se toca. _trigger_monitor y _trigger_darwin_resolve se dejan
-#   igual por ahora — son más livianos (posiciones abiertas puntuales,
-#   no el universo completo de tickers).
+#   y no se toca.
+#
+# v2.7 — [F14] (2026-09-11) FIX CRASH OOM — parte 3: concurrencia.
+#   Con [F12]/[F13] cada paso pesado corre aislado, PERO si dos caen
+#   encima (ej. apertura 11:30 se demora y el monitor de las 12:00 se
+#   dispara igual) hay DOS procesos hijos pesados corriendo a la vez,
+#   sumando RAM sobre el mismo límite de 512MB del contenedor —
+#   aislar cada uno no evita que se acumulen si corren en paralelo.
+#   Fix:
+#   [F14a] _trigger_monitor ahora también corre en proceso hijo
+#          separado (news_ranker + evaluar_posiciones_abiertas),
+#          escribiendo su resultado a un JSON temporal que el proceso
+#          padre lee después para decidir si dispara cierre defensivo
+#          (esa llamada HTTP sí se queda en el proceso padre, es liviana).
+#   [F14b] Guarda de concurrencia: antes de lanzar monitor, darwin
+#          evolution o shadow evaluator, se revisa si el pipeline
+#          principal (`pipeline_router._pipeline_running`) sigue
+#          activo — de ser así, esa ejecución se salta en vez de sumar
+#          otro proceso pesado encima. Como scheduler.py y
+#          pipeline_router.py corren en el mismo proceso de Python,
+#          esto es una simple lectura de atributo de módulo, sin
+#          necesidad de archivos ni IPC adicional.
 # =========================================================
 
 import os
+import json
 import time
 import threading
 import subprocess
 import multiprocessing
 import requests
+from pathlib import Path
 from datetime import datetime
 import pytz
+
+# [F14b] Import del módulo (no de la variable) para leer siempre el
+# valor actual de _pipeline_running — un `from ... import _pipeline_running`
+# copiaría el valor solo al momento del import y quedaría desactualizado.
+import pipeline_router
+
+DATA_PATH = Path(os.getenv("DATA_PATH", "/data"))
 
 CHILE_TZ     = pytz.timezone("America/Santiago")
 PIPELINE_URL = os.getenv(
@@ -151,15 +179,56 @@ def _mp_shadow_evaluator():
     _run_shadow_evaluation(shadow)
 
 
-def _run_in_subprocess_sync(target, step_name: str, timeout_sec: int = DARWIN_SUBPROCESS_TIMEOUT_SEC) -> bool:
+def _mp_monitor_worker(result_path: str):
     """
-    [F13] Corre `target()` en un proceso hijo separado y espera a que
-    termine (bloqueante — el scheduler ya corre en su propio hilo
-    daemon, así que bloquear acá no afecta a FastAPI). No pasa
-    objetos de vuelta: cada target ya escribe su resultado a disco
-    por su cuenta, igual que antes. Retorna True si terminó OK.
+    [F14a] Corre en proceso hijo: trae noticias frescas y evalúa las
+    posiciones abiertas. Como el proceso padre necesita saber qué
+    tickers cerrar (para disparar el cierre defensivo por HTTP), el
+    resultado se escribe a un JSON temporal en vez de perderse al
+    terminar el proceso hijo.
     """
-    proc = _mp_ctx.Process(target=target, name=step_name)
+    result = {"cerrar": [], "trailing": [], "mantener": [], "n_posiciones": 0}
+
+    try:
+        from news_ranker import run_news_ranking
+        news_result = run_news_ranking()
+        result["news_bullish"] = len(news_result.get("bullish", []))
+        result["news_bearish"] = len(news_result.get("bearish", []))
+    except Exception as e:
+        result["news_error"] = str(e)
+
+    try:
+        from intraday_tracker import evaluar_posiciones_abiertas
+        from positions_meta import get_all
+
+        meta    = get_all()
+        tickers = list(meta.keys())
+        result["n_posiciones"] = len(tickers)
+
+        if tickers:
+            eval_out = evaluar_posiciones_abiertas(tickers)
+            for t, s in eval_out.items():
+                sug = s.get("sugerencia")
+                if sug == "CERRAR":
+                    result["cerrar"].append(t)
+                elif sug == "TRAILING":
+                    result["trailing"].append([t, s.get("pnl_actual_pct", 0)])
+                elif sug == "MANTENER":
+                    result["mantener"].append(t)
+    except Exception as e:
+        result["error"] = str(e)
+
+    Path(result_path).write_text(json.dumps(result))
+
+
+def _run_in_subprocess_sync(target, step_name: str, args: tuple = (), timeout_sec: int = DARWIN_SUBPROCESS_TIMEOUT_SEC) -> bool:
+    """
+    [F13] Corre `target(*args)` en un proceso hijo separado y espera a
+    que termine (bloqueante — el scheduler ya corre en su propio hilo
+    daemon, así que bloquear acá no afecta a FastAPI). Retorna True si
+    terminó OK (exitcode 0 y sin exceder el timeout).
+    """
+    proc = _mp_ctx.Process(target=target, args=args, name=step_name)
     proc.start()
     proc.join(timeout_sec)
 
@@ -175,6 +244,17 @@ def _run_in_subprocess_sync(target, step_name: str, timeout_sec: int = DARWIN_SU
 
     print(f"✅ [F13] {step_name} completado en proceso hijo (pid={proc.pid})")
     return True
+
+
+def _pipeline_esta_corriendo() -> bool:
+    """
+    [F14b] Lee el flag global de pipeline_router.py — como scheduler.py
+    y pipeline_router.py corren en el mismo proceso de Python, esto es
+    una lectura directa de atributo de módulo, siempre actualizada.
+    getattr con default False por si el nombre del flag cambia algún
+    día en pipeline_router.py — evita que scheduler.py crashee por eso.
+    """
+    return bool(getattr(pipeline_router, "_pipeline_running", False))
 
 
 # ══════════════════════════════════════════════════════
@@ -213,45 +293,60 @@ def _trigger_pipeline(motivo: str, close_only: bool = False):
 def _trigger_monitor(motivo: str):
     print(f"📡 Monitor horario [{motivo}]")
 
-    # [v2.4][N2] Traer noticias frescas ANTES de evaluar posiciones —
-    # así intraday_tracker.py usa el ranking de ESTE ciclo, no uno
-    # de una hora atrás. Si falla, no bloquea el monitor de
-    # posiciones (que es la parte crítica) — solo se pierde el
-    # ajuste de noticias de este ciclo puntual.
-    try:
-        from news_ranker import run_news_ranking
-        news_result = run_news_ranking()
-        n_bullish = len(news_result.get("bullish", []))
-        n_bearish = len(news_result.get("bearish", []))
-        print(f"📰 News ranker OK | bullish={n_bullish} bearish={n_bearish}")
-    except Exception as e:
-        print(f"⚠️ News ranker falló (continuando con monitor igual): {e}")
+    # [F14b] Si el pipeline principal sigue corriendo (ej. apertura
+    # demorada), no sumar otro proceso pesado encima — se salta esta
+    # corrida del monitor y se retoma en la próxima hora.
+    if _pipeline_esta_corriendo():
+        print("⏭️  [F14b] Monitor SKIP — pipeline principal todavía corriendo")
+        return
+
+    # [F14a] Corre en proceso hijo separado (news_ranker +
+    # evaluar_posiciones_abiertas), escribiendo su resultado a un JSON
+    # temporal que se lee acá para decidir el cierre defensivo.
+    result_path = str(DATA_PATH / f"tmp_monitor_result_{os.getpid()}.json")
+    ok = _run_in_subprocess_sync(
+        _mp_monitor_worker, "monitor", args=(result_path,), timeout_sec=5 * 60
+    )
+
+    if not ok:
+        print("❌ Monitor falló o excedió tiempo — sin cambios en posiciones")
+        return
 
     try:
-        from intraday_tracker import evaluar_posiciones_abiertas
-        from positions_meta import get_all
+        result_file = Path(result_path)
+        if not result_file.exists():
+            print("❌ Monitor: proceso hijo terminó pero no dejó resultado")
+            return
 
-        meta    = get_all()
-        tickers = list(meta.keys())
+        result = json.loads(result_file.read_text())
+        result_file.unlink(missing_ok=True)
 
-        if not tickers:
+        if result.get("news_error"):
+            print(f"⚠️ News ranker falló (continuando con monitor igual): {result['news_error']}")
+        else:
+            print(
+                f"📰 News ranker OK | bullish={result.get('news_bullish', 0)} "
+                f"bearish={result.get('news_bearish', 0)}"
+            )
+
+        if result.get("error"):
+            print(f"❌ Monitor error: {result['error']}")
+            return
+
+        if result.get("n_posiciones", 0) == 0:
             print("✅ Monitor OK | sin posiciones abiertas")
             return
 
-        result = evaluar_posiciones_abiertas(tickers)
-        n_pos  = len(result)
-        print(f"✅ Monitor OK | posiciones={n_pos}")
-
-        cerrar   = [t for t, s in result.items() if s.get("sugerencia") == "CERRAR"]
-        trailing = [t for t, s in result.items() if s.get("sugerencia") == "TRAILING"]
-        mantener = [t for t, s in result.items() if s.get("sugerencia") == "MANTENER"]
+        cerrar   = result.get("cerrar", [])
+        trailing = result.get("trailing", [])
+        mantener = result.get("mantener", [])
+        print(f"✅ Monitor OK | posiciones={result.get('n_posiciones', 0)}")
 
         if mantener:
             print(f"✅ MANTENER: {mantener}")
 
         if trailing:
-            for t in trailing:
-                pnl = result[t].get("pnl_actual_pct", 0)
+            for t, pnl in trailing:
                 print(f"🛡 TRAILING {t} | PnL={pnl:.1f}% → no cerrar, dejar correr")
 
         if cerrar:
@@ -259,7 +354,7 @@ def _trigger_monitor(motivo: str):
             _trigger_defensive_close(cerrar)
 
     except Exception as e:
-        print(f"❌ Monitor error: {e}")
+        print(f"❌ Monitor error post-proceso: {e}")
 
 
 def _trigger_defensive_close(tickers: list):
@@ -304,6 +399,14 @@ def _trigger_darwin_resolve(motivo: str):
 
 def _trigger_darwin_evolution(motivo: str):
     print(f"🧬 Darwin evolution cycle [{motivo}]")
+
+    # [F14b] Evitar sumar este proceso pesado si el pipeline principal
+    # sigue corriendo a esta hora (poco común a las 18:00, pero cubre
+    # el caso de una apertura muy demorada).
+    if _pipeline_esta_corriendo():
+        print("⏭️  [F14b] Darwin evolution SKIP — pipeline principal todavía corriendo")
+        return
+
     # [F13] Corre en proceso hijo separado — executor arena + predictor
     # arena, con mutaciones y guardado de genomas, aislado del proceso
     # principal de FastAPI para liberar su memoria real al terminar.
@@ -312,6 +415,13 @@ def _trigger_darwin_evolution(motivo: str):
 
 def _trigger_shadow_evaluator(motivo: str):
     print(f"🌙 Darwin shadow evaluator [{motivo}]")
+
+    # [F14b] Misma guarda de concurrencia — a las 23:00 es muy poco
+    # probable que el pipeline siga activo, pero el chequeo es barato.
+    if _pipeline_esta_corriendo():
+        print("⏭️  [F14b] Shadow evaluator SKIP — pipeline principal todavía corriendo")
+        return
+
     # [F13] Corre en proceso hijo separado — este era el candidato más
     # fuerte al OOM: 12 genomas shadow del executor evaluados contra
     # ~500-700 tickers, más el shadow eval de predictores H1-H10,
@@ -528,4 +638,3 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
-        
