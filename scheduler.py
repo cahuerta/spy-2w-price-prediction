@@ -1,4 +1,4 @@
-# scheduler.py — v2.5
+# scheduler.py — v2.6
 # =========================================================
 # Corre como thread daemon dentro del proceso FastAPI.
 #
@@ -61,12 +61,30 @@
 #        hábiles a las 18:00 — decisión del usuario: la cadencia
 #        semanal demoró demasiado en producir un reemplazo de campeón,
 #        se prueba con cadencia diaria.
+#
+# v2.6 — [F13] (2026-09-11) FIX CRASH OOM — parte 2.
+#   El fix [F12] en pipeline_router.py aisló model_runner/evaluator/
+#   alpha_engine en procesos hijos, pero el servicio siguió cayendo
+#   por "Ran out of memory (used over 512MB)". Root cause adicional:
+#   _trigger_shadow_evaluator (23:00, evalúa 12 genomas shadow del
+#   executor contra ~500-700 tickers + shadow eval de predictores
+#   H1-H10) y _trigger_darwin_evolution (18:00, executor arena +
+#   predictor arena) corrían DIRECTO en el hilo del scheduler, dentro
+#   del mismo proceso de FastAPI — sin aislar memoria, igual que los
+#   pasos del pipeline antes del fix [F12].
+#   Fix: ambas ahora corren en procesos hijos separados
+#   (multiprocessing.Process, contexto "spawn"), mismo patrón que
+#   pipeline_router.py. _trigger_code_auditor ya usaba subprocess.run()
+#   y no se toca. _trigger_monitor y _trigger_darwin_resolve se dejan
+#   igual por ahora — son más livianos (posiciones abiertas puntuales,
+#   no el universo completo de tickers).
 # =========================================================
 
 import os
 import time
 import threading
 import subprocess
+import multiprocessing
 import requests
 from datetime import datetime
 import pytz
@@ -101,6 +119,62 @@ MIN_AUDITOR  = int(os.getenv("AUDITOR_MIN",  "0"))
 # tenga /data/macro_context.json fresco cuando se evalúe el régimen.
 HORA_MACRO_FACTORS = int(os.getenv("MACRO_FACTORS_HOUR", "11"))
 MIN_MACRO_FACTORS  = int(os.getenv("MACRO_FACTORS_MIN",  "0"))
+
+# [F13] Timeout máximo para los procesos hijos pesados del scheduler
+DARWIN_SUBPROCESS_TIMEOUT_SEC = int(os.getenv("DARWIN_SUBPROCESS_TIMEOUT_SEC", str(20 * 60)))
+
+# [F13] Contexto "spawn": el proceso hijo arranca limpio, sin heredar
+# threads ni estado del proceso padre (FastAPI/Uvicorn + este mismo
+# hilo del scheduler). Mismo patrón que pipeline_router.py [F12].
+_mp_ctx = multiprocessing.get_context("spawn")
+
+
+# ══════════════════════════════════════════════════════
+# [F13] WORKERS DE PROCESO HIJO — funciones top-level para que
+# multiprocessing con contexto "spawn" pueda picklearlas. Cada una
+# importa su módulo pesado DENTRO de la función, así el import (y
+# la memoria que carga) ocurre solo dentro del proceso hijo.
+# ══════════════════════════════════════════════════════
+
+def _mp_darwin_evolution():
+    from darwin_engine.arena import run_evolution_cycle
+    from darwin_engine.predictor_arena import run_predictor_evolution
+    run_evolution_cycle()
+    run_predictor_evolution()
+
+
+def _mp_shadow_evaluator():
+    from darwin_engine.predictor_shadow_evaluator import run_shadow_evolution_cycle
+    from darwin_engine.arena import _load_all_active_genomes, _run_shadow_evaluation
+    run_shadow_evolution_cycle()
+    _, shadow = _load_all_active_genomes()
+    _run_shadow_evaluation(shadow)
+
+
+def _run_in_subprocess_sync(target, step_name: str, timeout_sec: int = DARWIN_SUBPROCESS_TIMEOUT_SEC) -> bool:
+    """
+    [F13] Corre `target()` en un proceso hijo separado y espera a que
+    termine (bloqueante — el scheduler ya corre en su propio hilo
+    daemon, así que bloquear acá no afecta a FastAPI). No pasa
+    objetos de vuelta: cada target ya escribe su resultado a disco
+    por su cuenta, igual que antes. Retorna True si terminó OK.
+    """
+    proc = _mp_ctx.Process(target=target, name=step_name)
+    proc.start()
+    proc.join(timeout_sec)
+
+    if proc.is_alive():
+        print(f"⏱️ [F13] {step_name} no terminó en {timeout_sec}s — terminando proceso hijo")
+        proc.terminate()
+        proc.join(10)
+        return False
+
+    if proc.exitcode != 0:
+        print(f"❌ [F13] {step_name} falló en proceso hijo (exitcode={proc.exitcode})")
+        return False
+
+    print(f"✅ [F13] {step_name} completado en proceso hijo (pid={proc.pid})")
+    return True
 
 
 # ══════════════════════════════════════════════════════
@@ -230,64 +304,19 @@ def _trigger_darwin_resolve(motivo: str):
 
 def _trigger_darwin_evolution(motivo: str):
     print(f"🧬 Darwin evolution cycle [{motivo}]")
-
-    try:
-        from darwin_engine.arena import run_evolution_cycle
-        result = run_evolution_cycle()
-        print(
-            f"✅ Executor ciclo | "
-            f"campeón={result.get('champion_after')} | "
-            f"promovido={result.get('was_promoted')} | "
-            f"nueva_gen={len(result.get('new_generation', []))}"
-        )
-    except Exception as e:
-        print(f"❌ Executor arena error: {e}")
-
-    try:
-        from darwin_engine.predictor_arena import run_predictor_evolution
-        pred_result = run_predictor_evolution()
-        print(
-            f"✅ Predictor ciclo | "
-            f"H evaluados={pred_result.get('h_evaluated')} | "
-            f"promovidos={pred_result.get('promotions')}"
-        )
-        for r in pred_result.get("ranking", []):
-            print(f"   H{r['horizon']}: {r['hit_rate']:.2%}")
-    except Exception as e:
-        print(f"❌ Predictor arena error: {e}")
+    # [F13] Corre en proceso hijo separado — executor arena + predictor
+    # arena, con mutaciones y guardado de genomas, aislado del proceso
+    # principal de FastAPI para liberar su memoria real al terminar.
+    _run_in_subprocess_sync(_mp_darwin_evolution, "darwin_evolution")
 
 
 def _trigger_shadow_evaluator(motivo: str):
     print(f"🌙 Darwin shadow evaluator [{motivo}]")
-
-    # Shadow evaluator de PREDICTORES — sin cambios
-    try:
-        from darwin_engine.predictor_shadow_evaluator import run_shadow_evolution_cycle
-        result = run_shadow_evolution_cycle()
-        gen = result.get("generation", {})
-        ev  = result.get("evaluation", {})
-        print(
-            f"✅ Shadow evaluator (predictor) | "
-            f"generadas={gen.get('predictions_generated', 0)} | "
-            f"evaluadas={ev.get('evaluated', 0)} | "
-            f"pendientes={ev.get('pending', 0)}"
-        )
-        if gen.get("status") == "locked":
-            print("⚠️  Shadow evaluator (predictor): lock activo, se saltó esta corrida")
-    except Exception as e:
-        print(f"❌ Shadow evaluator (predictor) error: {e}")
-
-    # [S1] Shadow evaluator de EXECUTOR — fix auditoría 2026-08-25 (Problema 3).
-    # Antes solo corría dentro de run_evolution_cycle() (viernes). Con esto
-    # corre TODOS los días hábiles a las 23:00, para que los shadows del
-    # executor acumulen trades cerrados a ritmo diario, no semanal.
-    try:
-        from darwin_engine.arena import _load_all_active_genomes, _run_shadow_evaluation
-        _, shadow = _load_all_active_genomes()
-        _run_shadow_evaluation(shadow)
-        print(f"✅ Shadow evaluator (executor) | shadows evaluados={len(shadow)}")
-    except Exception as e:
-        print(f"❌ Shadow evaluator (executor) error: {e}")
+    # [F13] Corre en proceso hijo separado — este era el candidato más
+    # fuerte al OOM: 12 genomas shadow del executor evaluados contra
+    # ~500-700 tickers, más el shadow eval de predictores H1-H10,
+    # todo antes corría directo en el hilo del scheduler.
+    _run_in_subprocess_sync(_mp_shadow_evaluator, "shadow_evaluator")
 
 
 # ══════════════════════════════════════════════════════
@@ -499,3 +528,4 @@ def start_scheduler():
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
     print("🚀 Quant Scheduler iniciado")
+        
