@@ -26,6 +26,12 @@ PRICE_CACHE: Dict[str, float] = {}
 # Predicciones con |pred| < umbral → hit_sign=None (sin señal)
 HIT_SIGN_MIN_PCT = float(os.getenv("HIT_SIGN_MIN_PCT", "0.05"))
 
+# [E10] Historial diario de calidad del modelo — un registro pequeño
+# por día, en vez de que el dashboard reprocese los ~15,000 archivos
+# de evaluaciones históricas en cada request. Ver _update_daily_history().
+MODEL_QUALITY_HISTORY_FILE = Path(DATA_PATH) / "model_quality_history.json"
+MODEL_QUALITY_HISTORY_MAX_DAYS = int(os.getenv("MODEL_QUALITY_HISTORY_MAX_DAYS", "400"))
+
 # ======================================================
 # FIXES v2.3:
 #
@@ -75,6 +81,23 @@ HIT_SIGN_MIN_PCT = float(os.getenv("HIT_SIGN_MIN_PCT", "0.05"))
 #        y si falla, data_provider.get_price_history() (Cache → Chile →
 #        EODHD → Yahoo → Twelve). Detección de columnas defensiva igual
 #        a trade_tracker.py, sin asumir nombres exactos entre providers.
+#
+#   [E10] (2026-09-15) Historial diario de model-quality.
+#        Root cause de un crash OOM confirmado en Render: el dashboard
+#        (/dashboard/model-quality en performance_router.py) recalculaba
+#        el hit_rate abriendo y parseando los ~15,000 archivos de
+#        evaluaciones históricas EN CADA REQUEST — cada vez que alguien
+#        abría la página. Con 512MB, eso bastaba para tumbar el proceso
+#        principal de FastAPI (no es un paso del pipeline, así que no
+#        podía aislarse en un proceso hijo — tiene que responder rápido
+#        a una petición HTTP en vivo).
+#        Fix: evaluate_all() ahora, al terminar, actualiza un archivo
+#        pequeño (model_quality_history.json) con UN registro por día
+#        (hits/total agregados, no las evaluaciones individuales). El
+#        dashboard pasa a leer ese archivo chico en vez de escanear
+#        todo el histórico — se conserva la serie diaria completa
+#        (necesaria para ver si el sistema mejora con el tiempo) sin
+#        tener que reprocesarla nunca desde cero.
 # ======================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -557,6 +580,130 @@ def evaluate_prediction(
 
 
 # ======================================================
+# [E10] HISTORIAL DIARIO DE MODEL QUALITY
+# ======================================================
+
+def _update_daily_history(evaluated_pred_paths: List[str], eval_root: Path) -> None:
+    """
+    [E10] Agrega/actualiza el registro del día en model_quality_history.json
+    a partir de las evaluaciones que ACABAN de escribirse en esta corrida
+    (evaluated_pred_paths viene de results["evaluated"] en evaluate_all()).
+
+    No relee el histórico completo de evaluaciones — solo procesa lo que
+    esta corrida evaluó (típicamente unos cientos de archivos, uno por
+    ticker), y lo suma a lo que ya hubiera para el día de hoy en el
+    archivo de historial (por si evaluate_all corre más de una vez el
+    mismo día, ej. apertura + cierre).
+
+    Nunca debe romper evaluate_all() si falla — se llama envuelta en
+    try/except desde evaluate_all().
+    """
+    if not evaluated_pred_paths:
+        return
+
+    today_str = datetime.utcnow().date().isoformat()
+
+    hits_dir      = 0
+    total_dir     = 0
+    n_errors      = 0
+    sum_errors    = 0.0
+    rec_stats:     Dict[str, Dict[str, Any]] = {}
+    horizon_stats: Dict[str, Dict[str, Any]] = {}
+
+    for pred_path_str in evaluated_pred_paths:
+        pred_path = Path(pred_path_str)
+        eval_file = eval_root / pred_path.parent.name / pred_path.name
+        data = load_json(eval_file)
+        if not data:
+            continue
+
+        if data.get("hit_sign") is not None:
+            total_dir += 1
+            if data["hit_sign"]:
+                hits_dir += 1
+
+        err = data.get("error_return_pct")
+        if err is not None:
+            sum_errors += float(err)
+            n_errors   += 1
+
+        rec = (data.get("recommendation") or "HOLD").strip().upper()
+        rs  = rec_stats.setdefault(rec, {"total": 0, "hits": 0, "sum_error": 0.0, "n_error": 0})
+        rs["total"] += 1
+        if data.get("hit_sign"):
+            rs["hits"] += 1
+        if err is not None:
+            rs["sum_error"] += float(err)
+            rs["n_error"]   += 1
+
+        diag = data.get("models_diagnostics") or {}
+        for hkey, hdata in diag.items():
+            if not isinstance(hdata, dict):
+                continue
+            hs = horizon_stats.setdefault(hkey, {"total": 0, "hits": 0, "sum_error": 0.0, "n_error": 0})
+            hs["total"] += 1
+            if hdata.get("hit_sign"):
+                hs["hits"] += 1
+            herr = hdata.get("error_pct")
+            if herr is not None:
+                hs["sum_error"] += float(herr)
+                hs["n_error"]   += 1
+
+    if total_dir == 0 and n_errors == 0 and not rec_stats and not horizon_stats:
+        return  # nada útil que agregar
+
+    try:
+        history = json.loads(MODEL_QUALITY_HISTORY_FILE.read_text()) if MODEL_QUALITY_HISTORY_FILE.exists() else []
+    except Exception:
+        history = []
+
+    # Buscar si ya hay un registro de hoy — si evaluate_all corrió antes
+    # hoy mismo (apertura + cierre), se SUMA en vez de duplicar el día.
+    today_entry = next((e for e in history if e.get("date") == today_str), None)
+    if today_entry is None:
+        today_entry = {
+            "date": today_str, "hits_dir": 0, "total_dir": 0,
+            "sum_error": 0.0, "n_error": 0,
+            "by_recommendation": {}, "by_horizon": {},
+        }
+        history.append(today_entry)
+
+    today_entry["hits_dir"]  += hits_dir
+    today_entry["total_dir"] += total_dir
+    today_entry["sum_error"] += sum_errors
+    today_entry["n_error"]   += n_errors
+
+    for rec, s in rec_stats.items():
+        acc = today_entry["by_recommendation"].setdefault(
+            rec, {"total": 0, "hits": 0, "sum_error": 0.0, "n_error": 0}
+        )
+        acc["total"]     += s["total"]
+        acc["hits"]      += s["hits"]
+        acc["sum_error"] += s["sum_error"]
+        acc["n_error"]   += s["n_error"]
+
+    for hkey, s in horizon_stats.items():
+        acc = today_entry["by_horizon"].setdefault(
+            hkey, {"total": 0, "hits": 0, "sum_error": 0.0, "n_error": 0}
+        )
+        acc["total"]     += s["total"]
+        acc["hits"]      += s["hits"]
+        acc["sum_error"] += s["sum_error"]
+        acc["n_error"]   += s["n_error"]
+
+    # Mantener el archivo acotado — no crece indefinidamente
+    history.sort(key=lambda e: e["date"])
+    if len(history) > MODEL_QUALITY_HISTORY_MAX_DAYS:
+        history = history[-MODEL_QUALITY_HISTORY_MAX_DAYS:]
+
+    save_json(MODEL_QUALITY_HISTORY_FILE, history)
+    logger.info(
+        f"📈 [E10] model_quality_history actualizado | {today_str} | "
+        f"hits_dir={today_entry['hits_dir']}/{today_entry['total_dir']}"
+    )
+
+
+# ======================================================
 # EVALUACIÓN MASIVA
 # ======================================================
 
@@ -646,6 +793,14 @@ def evaluate_all(
         "errors":    len(results["errors"]),
     }
     logger.info(f"✅ Evaluator v2.4 COMPLETADO | {results['summary']}")
+
+    # [E10] Actualizar el historial diario liviano — nunca debe tumbar
+    # evaluate_all() si algo sale mal acá.
+    try:
+        _update_daily_history(results["evaluated"], eval_root)
+    except Exception as e:
+        logger.warning(f"⚠️ [E10] No se pudo actualizar model_quality_history: {e}")
+
     return results
 
 
