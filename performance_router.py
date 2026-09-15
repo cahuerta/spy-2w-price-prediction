@@ -63,6 +63,24 @@ def save_json(path: Path, data: Any) -> None:
     tmp.replace(path)
 
 
+def list_evaluation_files() -> List[Path]:
+    """
+    Restaurada tal cual estaba en V5 — [M2] ya no se usa dentro de
+    /model-quality (ver nota de arriba), pero execution_analyzer.py
+    la importa directo desde este módulo. Eliminarla rompió el deploy
+    (ImportError en main.py al cargar execution_analyzer). Se mantiene
+    aquí sin cambios para no romper ese otro consumidor.
+    """
+    root = DATA_PATH / "evaluations"
+    if not root.exists():
+        return []
+    files = []
+    for ticker_dir in root.iterdir():
+        if ticker_dir.is_dir():
+            files.extend(ticker_dir.glob("*.json"))
+    return sorted(files)
+
+
 # =========================================================
 # SNAPSHOT DIARIO
 # =========================================================
