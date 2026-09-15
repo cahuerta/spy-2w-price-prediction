@@ -37,7 +37,31 @@ EVAL_DIR  = "/data/evaluations"
 #        NO se modifica la forma del JSON de salida (compatibilidad
 #        con el resto del sistema) — solo cambia cómo se calcula
 #        internamente el valor de adjust_factor.
+# FIXES v7.8 [AUD-D2b] (auditoría 2026-09-13, Problema 2 — parte 2,
+# pendiente desde entonces):
+#   [D3] El veto de signo [O9] (abril 2026) sigue siendo correcto para
+#        lo que resolvía entonces: evitar que un ajuste ruidoso de
+#        H1-H9 invirtiera el signo de H10 y generara una operación en
+#        la dirección equivocada (diagnosticado como causa de ~30% de
+#        pérdidas en esa época). Pero es un veto todo-o-nada: bloquea
+#        el ajuste incluso cuando el consenso entre H1-H9 es fuerte y
+#        H10 (el peor predictor del ensemble, 48% hit rate global) es
+#        el que probablemente está equivocado. La auditoría del 13-sep
+#        señaló esto como una segunda causa raíz distinta a [D2] (el
+#        tamaño del ajuste) — nunca se implementó el refinamiento.
+#        Fix: el veto solo se aplica si el consenso de H1-H9 es débil
+#        (consensus_weight < CONSENSUS_OVERRIDE_THRESHOLD). Con
+#        consenso fuerte, se confía en la corrección y se deja pasar
+#        el ajuste aunque invierta el signo de H10 — exactamente el
+#        caso que la auditoría pedía cubrir. El caso que abril quería
+#        evitar (ajuste ruidoso con consenso débil) sigue protegido
+#        igual que siempre.
 # ======================================================
+
+# [D3] Umbral de consenso para permitir que el ajuste invierta el
+# signo de H10. Por encima de este valor, se confía en el acuerdo
+# entre H1-H9 más que en H10 solo.
+CONSENSUS_OVERRIDE_THRESHOLD = float(os.getenv("CONSENSUS_OVERRIDE_THRESHOLD", "0.6"))
 
 
 # ======================================================
@@ -451,13 +475,38 @@ class MasterOrchestrator:
         ret_adjusted = ((final_price - self.price_today) / self.price_today) * 100
         sign_adjusted = float(np.sign(ret_adjusted)) if ret_adjusted != 0 else 0.0
 
-        if sign_original != 0 and sign_adjusted != sign_original:
+        # [AUD-D2b][2026-09-13][D3] El veto de abril (evitar que un
+        # ajuste ruidoso invierta el signo de H10) sigue aplicándose,
+        # pero solo cuando el consenso entre H1-H9 es débil. Con
+        # consenso fuerte (>= CONSENSUS_OVERRIDE_THRESHOLD), se confía
+        # en la corrección de los 9 predictores con mejor historial
+        # que H10 (48% hit rate global, el peor del ensemble) y se
+        # deja pasar el ajuste aunque invierta el signo original.
+        if (
+            sign_original != 0
+            and sign_adjusted != sign_original
+            and consensus_weight < CONSENSUS_OVERRIDE_THRESHOLD
+        ):
             print(
                 f"⚠️ [{self.ticker}] curve_adjust invirtió signo "
-                f"({ret_original:.3f}% → {ret_adjusted:.3f}%) → forzando ret=0, MANTÉN"
+                f"({ret_original:.3f}% → {ret_adjusted:.3f}%) | "
+                f"consensus_weight={consensus_weight:.3f} < {CONSENSUS_OVERRIDE_THRESHOLD} "
+                f"→ forzando ret=0, MANTÉN"
             )
             ret_final   = 0.0
             final_price = self.price_today
+        elif (
+            sign_original != 0
+            and sign_adjusted != sign_original
+            and consensus_weight >= CONSENSUS_OVERRIDE_THRESHOLD
+        ):
+            print(
+                f"🔀 [{self.ticker}] curve_adjust invirtió signo "
+                f"({ret_original:.3f}% → {ret_adjusted:.3f}%) pero "
+                f"consensus_weight={consensus_weight:.3f} >= {CONSENSUS_OVERRIDE_THRESHOLD} "
+                f"→ se confía en el consenso de H1-H9, se deja pasar el ajuste"
+            )
+            ret_final = round(ret_adjusted, 4)
         else:
             ret_final = round(ret_adjusted, 4)
 
@@ -568,7 +617,7 @@ class MasterOrchestrator:
 
 if __name__ == "__main__":
     ticker = (sys.argv[1] if len(sys.argv) > 1 else "SPY").upper()
-    print(f"🎯 MasterOrchestrator v7.6 → {ticker}")
+    print(f"🎯 MasterOrchestrator v7.8 → {ticker}")
     print("=" * 60)
 
     orch   = MasterOrchestrator(ticker)
