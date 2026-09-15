@@ -46,6 +46,22 @@ FIXES:
         el evaluator en producción le genere evaluaciones reales
         (momento en que _read_hit_rates_from_evaluator() lo
         alimentará con datos genuinos en el próximo ciclo).
+
+  [AR4] (2026-09-15) run_predictor_evolution — bloque de ranking:
+        `r.get("bias_score", 0)` solo usa el default 0 cuando la
+        CLAVE "bias_score" no existe en el dict — pero para H10 la
+        clave sí existe, con valor None explícito (bias_score solo
+        se calcula para H1-H9, ver _run_h_cycle: "if horizon < 10").
+        Como la clave está presente, .get() devolvía None, no 0, y
+        `None >= BIAS_SCORE_THRESHOLD` lanzaba TypeError
+        ("'>=' not supported between instances of 'NoneType' and
+        'float'"), interrumpiendo TODO el ciclo evolutivo justo antes
+        de terminar de imprimir el ranking — afectaba cada corrida de
+        /internal/darwin/run, no solo cuando H10 estaba en juego.
+        Fix: leer bias_val = r.get("bias_score") (sin default) y
+        chequear `bias_val is not None` ANTES de comparar con >=,
+        mismo patrón ya usado correctamente en la recolección de
+        bias_alerts un poco más arriba en este mismo archivo.
 """
 
 import json
@@ -474,7 +490,18 @@ def run_predictor_evolution(dry_run: bool = False) -> Dict:
         r        = results.get(f"H{h}", {})
         champion = r.get("champion", "?")
         promoted = "🏆 PROMOVIDO" if r.get("was_promoted") else ""
-        bias_tag = f"⚠️ bias={r.get('bias_score', 0):.2f}" if r.get("bias_score", 0) >= BIAS_SCORE_THRESHOLD else ""
+        # [AR4][2026-09-15] r.get("bias_score", 0) solo usa el default 0
+        # cuando la CLAVE no existe — pero para H10 la clave sí existe
+        # con valor None explícito (bias_score solo se calcula para
+        # H1-H9). Eso hacía que bias_val fuera None, no 0, y
+        # None >= BIAS_SCORE_THRESHOLD explotaba con TypeError,
+        # interrumpiendo todo el ciclo evolutivo antes de terminar.
+        bias_val = r.get("bias_score")
+        bias_tag = (
+            f"⚠️ bias={bias_val:.2f}"
+            if bias_val is not None and bias_val >= BIAS_SCORE_THRESHOLD
+            else ""
+        )
         decay    = "⏱️ decay_ON" if r.get("decay_active") else ""
         logger.info(f"   H{h}: {hr:.2%} | {champion} {promoted} {bias_tag} {decay}")
 
