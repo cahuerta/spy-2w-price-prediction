@@ -1,5 +1,5 @@
 # =========================================================
-# pipeline_router.py — PIPELINE ROUTER v2.8
+# pipeline_router.py — PIPELINE ROUTER v2.9
 # =========================================================
 # v2.2: [F7] Intraday tracker como paso 10.5
 # v2.3: [F8] Intraday evaluator como paso 4.6
@@ -56,6 +56,24 @@
 #        esto NO es lo mismo que un Render Cron Job separado (que sí
 #        no comparte el disco persistente al ser otro servicio). No
 #        hay ningún problema de escritura a disco con este cambio.
+# v2.9: [F15] (2026-09-14) BATCHING de model_runner.
+#        Con [F12] ya aislado, el timeout de 20 min del paso 3 igual
+#        se cumplió una vez: model_runner se fue poniendo cada vez
+#        más lento por ticker (memory thrashing DENTRO de su propio
+#        proceso hijo) hasta no terminar el universo completo a
+#        tiempo. gc.collect() por ticker [MR5 en model_runner.py] no
+#        basta cuando el mismo proceso vive el tiempo suficiente para
+#        procesar ~700+ tickers seguidos.
+#        Fix: el paso 3 ya no lanza un solo proceso hijo con todo el
+#        universo — lo divide en lotes de MODEL_RUNNER_BATCH_SIZE
+#        tickers (default 50) y corre un proceso hijo por lote, uno
+#        detrás de otro. Cada proceso hijo vive poco tiempo y el
+#        sistema operativo le recupera el 100% de su memoria al
+#        terminar, antes de que arranque el siguiente lote — ningún
+#        proceso individual llega a acumular memoria suficiente para
+#        ponerse lento. El timeout de 20 min ahora aplica POR LOTE,
+#        no al total, así un lote lento no mata el progreso de los
+#        lotes que ya terminaron bien.
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -99,9 +117,15 @@ _pipeline_running = False
 # ocurre solo dentro del proceso hijo, nunca en el padre.
 # =========================================================
 
-def _mp_run_model_runner():
-    from model_runner import run_all_models
-    run_all_models()
+def _mp_run_model_runner_batch(tickers: list):
+    """[F15] Corre un LOTE de tickers, no el universo completo."""
+    from model_runner import run_models_for_tickers
+    run_models_for_tickers(tickers)
+
+
+def _batched(items: list, batch_size: int):
+    for i in range(0, len(items), batch_size):
+        yield items[i:i + batch_size]
 
 
 def _mp_run_evaluator():
@@ -119,6 +143,16 @@ def _mp_run_alpha_engine(tickers: list):
 # (FastAPI/Uvicorn). Con "fork" (default en Linux) el hijo hereda
 # todo el estado del padre y puede colgarse o corromper el loop.
 _mp_ctx = multiprocessing.get_context("spawn")
+
+# [F15] Tamaño de lote para model_runner — cada lote corre en su
+# propio proceso hijo, uno detrás de otro. Ajustable por env var sin
+# tocar código si 50 resulta muy alto o muy bajo para 512MB.
+MODEL_RUNNER_BATCH_SIZE = int(os.getenv("MODEL_RUNNER_BATCH_SIZE", "50"))
+
+# [F15] Timeout por LOTE (no por el total de tickers). 10 min por
+# defecto — un lote de 50 tickers nunca debería acercarse a esto si
+# el batching está funcionando como se espera.
+MODEL_RUNNER_BATCH_TIMEOUT_SEC = int(os.getenv("MODEL_RUNNER_BATCH_TIMEOUT_SEC", str(10 * 60)))
 
 
 async def _run_in_subprocess(target, args: tuple, step_name: str, timeout_sec: int = 20 * 60):
@@ -259,16 +293,39 @@ async def _run_pipeline_logic(request: Request):
         gc.collect()  # [F9] liberar después del decider
 
         # ── 3. MODEL RUNNER ───────────────────────────────
-        # [F12] Corre en proceso hijo separado — libera 100% de su
-        # memoria (pandas/sklearn de los 10 modelos H1-H10 por ticker)
-        # al sistema operativo cuando termina, sin depender de gc.collect().
+        # [F12][F15] Corre en lotes, cada uno en su propio proceso
+        # hijo separado — libera 100% de su memoria al sistema
+        # operativo cuando termina cada lote, antes de arrancar el
+        # siguiente. Evita que un solo proceso larguísimo (~700+
+        # tickers) acumule memoria hasta ponerse lento y exceder el
+        # timeout, como ocurrió con un solo proceso para todo el
+        # universo.
         if _models_done_today(DATA_PATH):
             pred_count = sum(1 for _ in (DATA_PATH / "predictions").glob(f"**/{today}.json"))
             logger.info(f"⚡ [3/10] Models SKIP | {pred_count} predicciones de hoy")
         else:
-            logger.info("📈 [3/10] Model runner (proceso hijo)...")
-            await _run_in_subprocess(_mp_run_model_runner, (), "model_runner")
-            logger.info("✅ Model runner OK")
+            logger.info("📈 [3/10] Model runner (por lotes, cada uno en proceso hijo)...")
+            all_tickers = json.loads((DATA_PATH / "tickers.json").read_text())
+            if isinstance(all_tickers, dict) and "tickers" in all_tickers:
+                all_tickers = all_tickers["tickers"]
+
+            lotes = list(_batched(all_tickers, MODEL_RUNNER_BATCH_SIZE))
+            logger.info(f"   {len(all_tickers)} tickers en {len(lotes)} lotes de hasta {MODEL_RUNNER_BATCH_SIZE}")
+
+            for i, lote in enumerate(lotes, start=1):
+                logger.info(f"   📦 Lote {i}/{len(lotes)} ({len(lote)} tickers)...")
+                try:
+                    await _run_in_subprocess(
+                        _mp_run_model_runner_batch, (lote,), f"model_runner_lote_{i}",
+                        timeout_sec=MODEL_RUNNER_BATCH_TIMEOUT_SEC,
+                    )
+                except Exception as e:
+                    # [F15] Un lote que falla o se cuelga no debe tumbar
+                    # los lotes siguientes — se loguea y se continúa.
+                    logger.error(f"❌ Lote {i}/{len(lotes)} falló: {e} — continuando con el siguiente lote")
+                gc.collect()  # limpieza del proceso padre entre lotes
+
+            logger.info("✅ Model runner OK (todos los lotes procesados)")
 
         gc.collect()  # [F9] limpieza del proceso padre (liviana, el hijo ya liberó lo pesado)
 
