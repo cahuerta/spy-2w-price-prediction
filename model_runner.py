@@ -15,6 +15,26 @@
 # FIXES vMR-3:
 #   [MR5] gc.collect() entre tickers — libera RAM acumulada
 #         Complementa el fix O7 de master_orchestrator V7.3
+#
+# FIXES vMR-4 — [F15] (2026-09-14):
+#   [MR6] run_models_for_tickers(tickers) — misma lógica de
+#         run_all_models() pero recibiendo la lista de tickers como
+#         argumento en vez de leerla siempre completa de tickers.json.
+#         Permite que pipeline_router.py [F15] divida el universo en
+#         lotes y corra cada lote en su propio proceso hijo, en vez de
+#         un solo proceso con los ~700+ tickers de una sola pasada.
+#         Motivo: con 512MB de RAM, gc.collect() por ticker [MR5] no
+#         bastó — la memoria se sigue acumulando ticker tras ticker
+#         DENTRO de un mismo proceso larguísimo (confirmado en logs:
+#         tiempos de carga por ticker crecientes hasta que el proceso
+#         entero se pone tan lento que excede el timeout del paso).
+#         Dividiendo en lotes, cada proceso hijo vive poco tiempo y el
+#         sistema operativo le recupera toda su memoria al terminar,
+#         antes de que arranque el siguiente lote.
+#         run_all_models() se mantiene intacta para el CLI/cron
+#         (corre TODOS los tickers en un solo proceso, como siempre) —
+#         ahora solo delega en run_models_for_tickers() con la lista
+#         completa, sin duplicar lógica.
 # =========================================================
 
 import os
@@ -91,11 +111,19 @@ def run_model_for_ticker(ticker: str) -> dict:
 
 
 # =========================================================
-# BATCH
+# BATCH — [MR6] recibe la lista de tickers como argumento
 # =========================================================
-def run_all_models():
-    tickers = load_tickers()
-    logger.info(f"🚀 Ejecutando modelo para {len(tickers)} tickers")
+def run_models_for_tickers(tickers: list[str]) -> dict:
+    """
+    [MR6] Misma lógica que run_all_models(), pero sobre la lista de
+    tickers que se le pase — no siempre el universo completo. Esto es
+    lo que permite a pipeline_router.py [F15] correr el universo en
+    lotes, cada uno en su propio proceso hijo.
+    Retorna el conteo ok/failed/skipped (útil para logging del lote,
+    aunque el proceso padre no lo lee — cada ticker ya quedó grabado
+    en disco por su cuenta, igual que siempre).
+    """
+    logger.info(f"🚀 Ejecutando modelo para {len(tickers)} tickers (lote)")
 
     # [MR4] Conteo separado para visibilidad real en logs
     ok, failed, skipped = 0, 0, 0
@@ -123,8 +151,20 @@ def run_all_models():
             gc.collect()
 
     logger.info(
-        f"🏁 MODEL RUN FINALIZADO | OK={ok} | FAIL={failed} | SKIP={skipped}"
+        f"🏁 LOTE FINALIZADO | OK={ok} | FAIL={failed} | SKIP={skipped}"
     )
+
+    return {"ok": ok, "failed": failed, "skipped": skipped}
+
+
+def run_all_models():
+    """
+    Entry point para CLI/cron — corre TODOS los tickers de
+    tickers.json en un solo proceso, como siempre. [MR6] Ahora
+    delega en run_models_for_tickers() para no duplicar lógica.
+    """
+    tickers = load_tickers()
+    run_models_for_tickers(tickers)
 
 
 # =========================================================
