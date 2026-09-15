@@ -58,9 +58,7 @@ FIX v1.4 (auditoría 2026-08-28, Problema 1 / Bug B):
        Fix: penalizacion_oport y premio_timing se siguen calculando y
        guardando en el resultado (visibles para auditar "¿dejó plata
        sobre la mesa?" cuando SÍ hay datos), pero salen de la fórmula
-       de fitness competitivo: fitness = sharpe - (max_dd * 2). Así
-       campeón y shadows se comparan con exactamente los mismos
-       ingredientes.
+       de fitness competitivo.
 
 FIX v1.5 [F8] (2026-09-01, Problema 1 — bug de signo en compute_combined_fitness):
   [F8] compute_combined_fitness() combinaba predictor (40%) + executor (60%)
@@ -76,6 +74,27 @@ FIX v1.5 [F8] (2026-09-01, Problema 1 — bug de signo en compute_combined_fitne
        fitness del predictor se sigue calculando y guardando (columna
        `predictor_fitness`, visible para diagnóstico/dashboard), pero deja
        de participar en la decisión de quién es campeón.
+
+FIX v1.6 [F9] (2026-09-15 — pendiente desde la decisión del 2026-09-01,
+nunca aplicada en compute_executor_fitness, solo en compute_combined_fitness):
+  [F9] fitness = sharpe - (max_dd * 2) seguía activo dentro de
+       compute_executor_fitness() pese a que el 1-sep se decidió
+       simplificar la competencia a PnL real puro. El bug de fondo:
+       _load_resolved_trades() ordena los trades por fecha DESCENDENTE
+       (reverse=True, el más reciente primero) y esa misma lista —
+       sin reordenar — se le pasa a _max_drawdown(), que arma la curva
+       de equity acumulada (cumprod) en ese orden. Eso construye la
+       curva yendo hacia atrás en el tiempo, produciendo drawdowns sin
+       sentido (0.99+ para genomas con 200 trades y avg_pnl moderado,
+       ej. executor_v6_4: max_drawdown=0.9946 con avg_pnl_pct=-1.42%).
+       En vez de arreglar el orden (quedaría un parche más sobre el
+       mismo punto que ya se rompió dos veces), se aplica ahora sí la
+       decisión ya tomada: fitness = avg_pnl_pct (PnL real promedio
+       por trade). Quien gana más plata en promedio por trade gana la
+       competencia — sin sharpe, sin max_drawdown, sin ningún término
+       sensible al orden de la lista. sharpe/max_drawdown se siguen
+       calculando y guardando en el resultado (diagnóstico), pero
+       dejan de decidir quién es campeón.
 """
 
 import json
@@ -126,7 +145,8 @@ def _is_valid_return(v) -> bool:
 
 
 def _sharpe(returns: List[float], annualize: int = 252) -> float:
-    """Sharpe ratio anualizado. Retorna 0 si no hay suficientes datos."""
+    """Sharpe ratio anualizado. Retorna 0 si no hay suficientes datos.
+    [F9] Ya no decide quién es campeón — solo diagnóstico."""
     if len(returns) < 5:
         return 0.0
     arr = np.array(returns, dtype=float)
@@ -141,6 +161,15 @@ def _max_drawdown(returns: List[float]) -> float:
     [F1] Max drawdown desde retornos porcentuales.
     Filtra nan/inf antes de calcular — antes un solo nan en el array
     propagaba nan a toda la cadena de fitness.
+
+    [F9] Ya no decide quién es campeón — solo diagnóstico. El bug de
+    fondo (la lista de entrada viene ordenada más-reciente-primero,
+    así que esta curva de equity se arma "hacia atrás" en el tiempo)
+    sigue sin corregirse aquí a propósito: como este valor ya no entra
+    a la fórmula de fitness, no bloquea la selección de campeón. Queda
+    anotado por si en el futuro se quiere usar este número en serio
+    para otra cosa — ahí sí habría que ordenar por fecha ascendente
+    antes de llamarlo.
     """
     if not returns:
         return 0.0
@@ -163,13 +192,14 @@ def _load_resolved_trades(genome_id: str, genome_type: str) -> List[Dict]:
     Carga trades resueltos atribuidos a un genome específico.
     genome_type: "executor" | "predictor"
 
-    [F6] Para "executor": si no hay trades REALES para este genome_id
-    (TRACKER_DIR solo lo alimenta el campeón — ningún mutante opera
-    dinero real), se cae a los trades simulados que el shadow
-    evaluator ya acumula en /data/darwin/shadow_trades/{genome_id}/.
-    Mismo dato que arena.py usa para decidir elegibilidad — ahora
-    también sirve para calcular el fitness en sí. El campeón siempre
-    tiene trades reales, así que nunca entra a esta rama.
+    [F6] Para "executor": el campeón es el único que opera con dinero
+    real (los mutantes/shadows nunca tocan Alpaca — son simulaciones).
+    Si TRACKER_DIR (trades reales) no tiene nada para este genome_id,
+    se cae a los trades simulados que el shadow evaluator ya acumula
+    en /data/darwin/shadow_trades/{genome_id}/. Mismo dato que arena.py
+    usa para decidir elegibilidad — ahora también sirve para calcular
+    el fitness en sí. El campeón siempre tiene trades reales, así que
+    nunca entra a esta rama.
     """
     field  = f"{genome_type}_genome_id"
     trades = []
@@ -266,6 +296,10 @@ def compute_executor_fitness(genome_id: str) -> Dict:
     Fitness del executor = qué tan bien decide cuándo entrar/salir.
 
     [F2] Filtra retornos inválidos (nan/inf/None) antes de calcular.
+    [F9] fitness = avg_pnl_pct (PnL real promedio por trade), directo.
+         sharpe y max_drawdown se siguen calculando y guardando para
+         diagnóstico, pero ya no entran a la fórmula competitiva —
+         ver nota [F9] en el encabezado del archivo.
     """
     trades = _load_resolved_trades(genome_id, "executor")
     trades = _enrich_with_alpaca_pnl(trades)
@@ -294,8 +328,8 @@ def compute_executor_fitness(genome_id: str) -> Dict:
     oportunidades = [float(t.get("oportunidad_pct") or 0) for t in valid_trades]
     cerro_antes   = [t.get("closed_before_horizon", False) for t in valid_trades]
 
-    sharpe   = _sharpe(returns)
-    max_dd   = _max_drawdown(returns)   # [F1] ya filtra nan internamente
+    sharpe   = _sharpe(returns)          # [F9] diagnóstico, no decide
+    max_dd   = _max_drawdown(returns)    # [F9] diagnóstico, no decide
     win_rate = float(np.mean([r > 0 for r in returns]))
     avg_pnl  = float(np.mean(returns))
 
@@ -313,19 +347,13 @@ def compute_executor_fitness(genome_id: str) -> Dict:
     ]
     premio = float(np.mean(oport_ganada)) if oport_ganada else 0.0
 
-    # FIX (auditoría 2026-08-28, Problema 1 / Bug B):
-    # penalizacion/premio dependen de oportunidad_pct + closed_before_horizon,
-    # que solo existen para trades REALES (los llena resolve_pending_trades()
-    # días después de cerrado el trade). Los trades de los shadows nunca
-    # pasan por ese proceso, así que para ellos este término siempre da 0 —
-    # el campeón se restaba puntos que ningún shadow paga jamás, sin que
-    # fuera una ventaja real, solo un hueco de datos.
-    #
-    # Se sigue calculando y guardando (penalizacion_oport / premio_timing
-    # abajo) para poder auditar "¿dejó plata sobre la mesa?" cuando SÍ hay
-    # datos — pero ya no forma parte del fitness competitivo, que debe
-    # poder compararse en igualdad de condiciones entre campeón y shadows.
-    fitness = sharpe - (max_dd * 2)
+    # [F9] (2026-09-15) fitness = PnL real promedio por trade, directo.
+    # Decisión tomada el 2026-09-01 y aplicada recién ahora: sharpe y
+    # max_drawdown quedan solo como diagnóstico (ver arriba), nunca
+    # entran a la fórmula que decide el campeón. Elimina de raíz el
+    # bug de _max_drawdown() calculando la curva de equity con la
+    # lista en orden invertido (más reciente primero).
+    fitness = avg_pnl
 
     result = {
         "genome_id":          genome_id,
@@ -348,7 +376,7 @@ def compute_executor_fitness(genome_id: str) -> Dict:
 
     logger.info(
         f"🏋️ Executor fitness | {genome_id} | "
-        f"fitness={fitness:.4f} sharpe={sharpe:.4f} "
+        f"fitness={fitness:.4f} (=avg_pnl_pct) sharpe={sharpe:.4f} "
         f"dd={max_dd:.4f} win={win_rate:.2%} n={len(valid_trades)} "
         f"(descartados={invalid_count})"
     )
@@ -451,6 +479,8 @@ def compute_combined_fitness(
     El fitness del predictor se sigue calculando y guardando (visible
     para diagnóstico/dashboard), pero ya no participa en la decisión.
 
+    [F9] e_fitness ahora es avg_pnl_pct directo (ver compute_executor_fitness).
+
     [F3] Usa math.isnan() para detectar nan en e_fitness/p_fitness.
     numpy evalúa nan < -0.5 como False, dejando pasar el nan al combined.
     """
@@ -492,7 +522,7 @@ def compute_combined_fitness(
     logger.info(
         f"⚡ Combined fitness | "
         f"pred={predictor_genome_id} exec={executor_genome_id} | "
-        f"combined={combined:.4f} (= fitness del executor) "
+        f"combined={combined:.4f} (= avg_pnl_pct del executor) "
         f"(pred_fitness={p_fitness:.4f}, informativo, no usado)"
     )
     return result
@@ -552,4 +582,3 @@ def get_fitness_summary() -> Dict:
         ],
         "status": "ok",
       }
-      
