@@ -1,5 +1,5 @@
 """
-market_orchestrator.py — V2.3 PRODUCCIÓN REAL NUMÉRICO ESTRICTO
+market_orchestrator.py — V2.4 PRODUCCIÓN REAL NUMÉRICO ESTRICTO
 
 ORQUESTADOR DE ENTORNO DE MERCADO
 
@@ -9,7 +9,7 @@ ORQUESTADOR DE ENTORNO DE MERCADO
 ✔ NO fallback
 ✔ NO defaults silenciosos
 ✔ Ajuste score estructural + impacto macro ponderado por confianza
-✔ Hysteresis limpio
+✔ Reacción simétrica e inmediata en ambas direcciones (v2.4)
 ✔ Contratos intactos
 
 FIX v2.2:
@@ -31,6 +31,24 @@ FIX v2.3:
        tan bien calibrado estuviera el régimen cuantitativo.
        Ahora el estado se carga desde disco al construir el objeto
        y se guarda después de cada evaluate().
+
+FIX v2.4 [AUD-P3] (auditoría 2026-09-16, Problema 3 — decisión del
+usuario: reacción simétrica, rápida en ambas direcciones):
+  [F3] Se elimina la histéresis. Antes, subir a "growth" exigía
+       HYSTERESIS_UP=2 evaluaciones consecutivas confirmando el
+       régimen, mientras que caer a "defensive" era inmediato, con
+       una sola evaluación — asimetría que el auditor señaló como
+       causa de que el sistema perdiera participación en
+       recuperaciones de mercado. Se descartó agregar histéresis
+       también a la baja (encarecería la protección ante una caída
+       real) y se optó por el otro extremo: sin histéresis en
+       ninguna dirección. next_mode = computed_mode directo, tanto
+       para growth como para defensive — el modo cambia en el mismo
+       ciclo en que el score cruza el umbral, sin esperar
+       confirmación en ningún sentido.
+       El campo `up_counter` se mantiene en el estado persistido y en
+       `source` por compatibilidad con quien lea ese archivo/campo,
+       pero ya no controla nada — queda fijo en 0.
 """
 
 from dataclasses import dataclass, asdict
@@ -56,7 +74,9 @@ logger = logging.getLogger(__name__)
 # CONFIGURACIÓN
 # =================================================================
 
-HYSTERESIS_UP = 2
+# [F3][2026-09-16] Histéresis eliminada — se mantiene la constante
+# comentada solo como referencia histórica, ya no se usa en evaluate().
+# HYSTERESIS_UP = 2
 
 # Score base por régimen estructural
 REGIME_BASE_SCORE = {
@@ -100,8 +120,7 @@ class MarketOrchestrator:
         # [F2] Cargar estado persistido en vez de arrancar siempre en neutral/0
         self._last_mode, self._up_counter = self._load_state()
         logger.info(
-            f"MarketOrchestrator inicializado (modo: {self._last_mode}, "
-            f"up_counter: {self._up_counter})"
+            f"MarketOrchestrator inicializado (modo: {self._last_mode})"
         )
 
     # -------------------------------------------------------------
@@ -179,8 +198,6 @@ class MarketOrchestrator:
         else:
             computed_mode = "neutral"
 
-        next_mode = computed_mode
-
         reason_parts = [
             f"Base regime={quant_regime} ({base_score:.2f})",
             f"Impact={impact_score:.3f} × Conf={qual_conf:.2f} → weighted={weighted_impact:.3f}",
@@ -188,23 +205,15 @@ class MarketOrchestrator:
         ]
 
         # =========================================================
-        # HYSTERESIS SOLO PARA SUBIDA A GROWTH
+        # [F3][2026-09-16] SIN HISTÉRESIS — reacción simétrica e
+        # inmediata en ambas direcciones. El modo calculado se aplica
+        # directo, sin esperar confirmación, tanto para subir a
+        # "growth" como para caer a "defensive". up_counter se
+        # mantiene en 0 solo por compatibilidad de formato del
+        # archivo de estado y del campo `source.up_counter`.
         # =========================================================
-        if computed_mode == "growth":
-            if self._last_mode in ["neutral", "growth"]:
-                self._up_counter += 1
-                if self._up_counter < HYSTERESIS_UP:
-                    next_mode = "neutral"
-                    reason_parts.append(
-                        f"Hysteresis growth warming ({self._up_counter}/{HYSTERESIS_UP})"
-                    )
-            else:
-                # desde defensive → neutral primero
-                next_mode = "neutral"
-                self._up_counter = 1
-                reason_parts.append("Recovery from defensive (hysteresis)")
-        else:
-            self._up_counter = 0
+        next_mode = computed_mode
+        self._up_counter = 0
 
         # =========================================================
         # CONFIDENCE REAL (NO INVENTADA)
@@ -246,7 +255,7 @@ class MarketOrchestrator:
                 "base_score": base_score,
                 "final_score": final_score,
                 "last_mode": self._last_mode,
-                "up_counter": self._up_counter,
+                "up_counter": self._up_counter,  # [F3] siempre 0, solo compatibilidad
                 "raw_quant": quant_ctx,
                 "raw_qual": qual_ctx,
             },
@@ -259,4 +268,5 @@ class MarketOrchestrator:
         return {
             "last_mode": self._last_mode,
             "up_counter": self._up_counter,
-      }
+        }
+      
