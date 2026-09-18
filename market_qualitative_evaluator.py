@@ -1,11 +1,11 @@
 """
-market_qualitative_evaluator.py — V3 PRODUCCIÓN REAL
+market_qualitative_evaluator.py — V4 PRODUCCIÓN REAL
 
 ✔ RSS feeds múltiples
 ✔ Filtrado por dominio confiable
 ✔ Evaluación INDIVIDUAL por noticia
 ✔ Agregación ponderada (impact × severity × confidence)
-✔ Impacto final acotado [-0.25, +0.15]
+✔ Impacto final acotado [-0.25, +0.25] — simétrico (v4)
 ✔ Logging robusto
 ✔ Listo para cron diario
 ✔ NO mezcla cuantitativo
@@ -24,6 +24,21 @@ FIX [ALPACA-NEWS] (2026-08-26):
   propia función fetch_market_news(). Para evitar la colisión al
   importar, la de news_ranker.py se importa con alias
   (_alpaca_fetch_market_news).
+
+FIX v4 [AUD-P3b] (auditoría 2026-09-16, Problema 3 — segunda parte,
+decisión del usuario: responder igual de fuerte a noticias buenas
+que a malas):
+  [F1] MAX_POS_IMPACT subía de 0.15 → 0.25, igualando el rango
+       negativo (MAX_NEG_IMPACT=-0.25). Antes, el evento más
+       positivo posible pesaba solo 60% de lo que pesaba el evento
+       más negativo posible — el sistema estaba estructuralmente
+       más dispuesto a reaccionar a malas noticias que a buenas.
+  [F2] SYSTEM_PROMPT: se agrega el escalón "+0.25 shock sistémico
+       positivo excepcional", como espejo exacto de "-0.25 shock
+       sistémico severo". Sin este cambio, el modelo de IA nunca
+       iba a devolver más de +0.15 de todas formas (nunca se le
+       pidió); ajustar solo la constante MAX_POS_IMPACT sin tocar
+       el prompt no habría tenido ningún efecto real.
 """
 
 from dataclasses import dataclass, asdict
@@ -43,8 +58,10 @@ IA_MODEL = "gpt-4o-mini"
 TEMPERATURE = 0.1
 MAX_TOKENS = 300
 
+# [F1][2026-09-16] Simétrico: antes MAX_POS_IMPACT=0.15 (60% del
+# rango negativo). Ahora igual magnitud en ambas direcciones.
 MAX_NEG_IMPACT = -0.25
-MAX_POS_IMPACT = 0.15
+MAX_POS_IMPACT = 0.25
 
 MAX_NEWS_PER_FEED = 5
 MAX_TOTAL_NEWS = 12
@@ -179,6 +196,7 @@ Escala impacto:
 +0.05 macro positivo
 +0.10 macro muy positivo
 +0.15 estímulo fuerte inesperado
++0.25 shock sistémico positivo excepcional
 
 Devuelve JSON estricto:
 {
@@ -315,3 +333,4 @@ def evaluate_qualitative_market() -> QualitativeMarketImpact:
 if __name__ == "__main__":
     result = evaluate_qualitative_market()
     print(json.dumps(result.to_dict(), indent=2))
+  
