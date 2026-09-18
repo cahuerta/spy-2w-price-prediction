@@ -1,5 +1,5 @@
 # =========================================================
-# pipeline_router.py — PIPELINE ROUTER v2.9
+# pipeline_router.py — PIPELINE ROUTER v2.10
 # =========================================================
 # v2.2: [F7] Intraday tracker como paso 10.5
 # v2.3: [F8] Intraday evaluator como paso 4.6
@@ -74,6 +74,28 @@
 #        ponerse lento. El timeout de 20 min ahora aplica POR LOTE,
 #        no al total, así un lote lento no mata el progreso de los
 #        lotes que ya terminaron bien.
+# v2.10: [F16] (2026-09-17) AISLAR SCREENER — crash OOM seguía
+#        ocurriendo en la apertura pese a [F12]/[F15], siempre en la
+#        misma ventana horaria (11:30-11:40 Chile), confirmado por
+#        Render Events varios días seguidos. El screener (paso 1,
+#        primero del pipeline) nunca había sido aislado: hace ~100
+#        llamadas secuenciales a yf.download() (yfinance) dentro del
+#        proceso principal de FastAPI, sin gc.collect() alguno.
+#        yfinance es conocido por retener objetos de sesión HTTP
+#        entre descargas sucesivas dentro del mismo proceso, sin que
+#        gc.collect() garantice que el sistema operativo recupere esa
+#        memoria — mismo motivo de fondo que llevó a aislar
+#        model_runner/evaluator/alpha_engine en [F12]. Se descartó
+#        agregar gc.collect() periódico como fix (ya se confirmó en
+#        [F12] que no resuelve el problema de fondo con
+#        pandas/numpy/glibc) y se aplicó el mismo patrón que ya
+#        funciona: el screener completo corre en su propio proceso
+#        hijo. A diferencia de model_runner, no se dividió en lotes
+#        por ahora — el screener trabaja con ~100 tickers (vs ~700+
+#        de model_runner, que sí necesitó lotes) — si la evidencia
+#        de próximas corridas muestra que un solo proceso sigue
+#        acercándose al límite, se divide en lotes con el mismo
+#        patrón de [F15].
 # =========================================================
 
 from fastapi import APIRouter, HTTPException, Request
@@ -87,7 +109,6 @@ import multiprocessing
 from pathlib import Path
 import json
 
-from screener import run_screener_async
 from decider import run_decider
 
 from market_state_evaluator import run_market_state
@@ -116,6 +137,24 @@ _pipeline_running = False
 # import (y toda la memoria que carga: pandas, sklearn, modelos)
 # ocurre solo dentro del proceso hijo, nunca en el padre.
 # =========================================================
+
+def _mp_run_screener(result_path: str):
+    """
+    [F16] Corre el screener completo (fetch de yfinance para ~100
+    tickers + engine de scoring) en un proceso hijo separado.
+    yfinance es conocido por retener objetos de sesión HTTP entre
+    llamadas sucesivas a yf.download() dentro del mismo proceso, sin
+    que gc.collect() garantice su liberación real al sistema
+    operativo — mismo motivo de fondo que llevó a aislar model_runner,
+    evaluator y alpha_engine [F12]. Escribe su resultado a un JSON
+    temporal, ya que run_screener_async() es async y retorna un
+    objeto (no escribe a disco por su cuenta como los otros pasos).
+    """
+    import asyncio
+    from screener import run_screener_async
+    result = asyncio.run(run_screener_async())
+    Path(result_path).write_text(json.dumps(result))
+
 
 def _mp_run_model_runner_batch(tickers: list):
     """[F15] Corre un LOTE de tickers, no el universo completo."""
@@ -263,13 +302,26 @@ async def _run_pipeline_logic(request: Request):
         today     = _today_utc()
 
         # ── 1. SCREENER ───────────────────────────────────
+        # [F16] Corre en proceso hijo separado — yfinance (100
+        # tickers, fetch secuencial) retiene memoria de sesión HTTP
+        # que gc.collect() no garantiza liberar dentro del mismo
+        # proceso. Aislado, el sistema operativo recupera el 100% de
+        # su memoria cuando el proceso hijo termina.
         if _screener_done_today(DATA_PATH):
             screener_file = DATA_PATH / "screener_candidates.json"
             screener_out  = json.loads(screener_file.read_text())
             logger.info(f"⚡ [1/10] Screener SKIP | candidates={screener_out.get('n_candidates')}")
         else:
-            logger.info("🔍 [1/10] Screener...")
-            screener_out = await run_screener_async()
+            logger.info("🔍 [1/10] Screener (proceso hijo)...")
+            screener_result_path = str(DATA_PATH / f"tmp_screener_result_{os.getpid()}.json")
+            await _run_in_subprocess(_mp_run_screener, (screener_result_path,), "screener")
+
+            screener_result_file = Path(screener_result_path)
+            if not screener_result_file.exists():
+                raise RuntimeError("screener: proceso hijo terminó pero no dejó resultado")
+            screener_out = json.loads(screener_result_file.read_text())
+            screener_result_file.unlink(missing_ok=True)
+
             screener_file = DATA_PATH / "screener_candidates.json"
             screener_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = screener_file.with_suffix(".tmp")
@@ -277,7 +329,7 @@ async def _run_pipeline_logic(request: Request):
             tmp.replace(screener_file)
             logger.info(f"✅ Screener OK | candidates={screener_out.get('n_candidates')}")
 
-        gc.collect()  # [F9] liberar después del screener
+        gc.collect()  # [F9] limpieza del proceso padre (liviana, el hijo ya liberó lo pesado)
 
         # ── 2. DECIDER ────────────────────────────────────
         if _decider_done_today(DATA_PATH):
@@ -534,4 +586,5 @@ async def run_pipeline(request: Request):
     return {
         "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
-    }
+        }
+    
