@@ -1,5 +1,5 @@
 # =========================================================
-# intraday_tracker.py — INTRADAY TRACKER v3.1
+# intraday_tracker.py — INTRADAY TRACKER v3.2
 # =========================================================
 # v3.0 — Refactor arquitectural:
 #   El tracker ya NO genera su propio universo.
@@ -39,6 +39,28 @@
 #       (potencial entrada táctica en caída)
 #
 #   ARQUITECTURA: El tracker SOLO informa. El PM decide.
+#
+# v3.2 [AUD-P1] (auditoría 2026-09-16, Problema 1) — CONFIRMACIÓN
+# POR LECTURAS CONSECUTIVAS antes de CERRAR por divergencia:
+#   La auditoría encontró que monitor_close (main.py) ejecuta el
+#   cierre de "diverging" directo contra el broker, sin pasar por
+#   ExecutorGenome ni por el Portfolio Manager — es el mecanismo de
+#   cierre dominante (85.3% de los trades resueltos) y reacciona a
+#   una sola lectura de precio spot de Yahoo Finance, que puede ser
+#   ruido intradía. Se descartó meter el genoma en este camino
+#   (podría bloquear un cierre de emergencia legítimo con sus propias
+#   reglas de "aguantar posición") — en su lugar, se exige que la
+#   divergencia se repita en 2 lecturas horarias CONSECUTIVAS antes
+#   de sugerir CERRAR. Una lectura aislada de "diverging" ahora baja
+#   a MANTENER, con una nota explicando que se espera confirmación.
+#   EXCEPCIÓN: si la pérdida ya es severa (>= SAME_DAY_STOP_LOSS_
+#   OVERRIDE_PCT), se cierra igual sin esperar una segunda lectura —
+#   ese caso ya es, por diseño, un stop de emergencia genuino, no
+#   una reacción a ruido.
+#   Nuevo helper: _contar_diverging_consecutivo(), que lee el
+#   snapshot horario ya guardado hoy (INTRADAY_DIR/{fecha}.json) —
+#   no requiere ningún estado nuevo, reutiliza el historial que el
+#   tracker ya persiste cada hora.
 # =========================================================
 
 import os
@@ -79,6 +101,13 @@ DIVERGING_STD_MULT = float(os.getenv("INTRADAY_DIVERGING_STD_MULT", "3.0"))
 # procede igual aunque sea el primer día (no proteger una caída fuerte).
 MIN_HOLD_DAYS_BEFORE_CURVE_EXIT = int(os.getenv("INTRADAY_MIN_HOLD_DAYS", "1"))
 SAME_DAY_STOP_LOSS_OVERRIDE_PCT = float(os.getenv("INTRADAY_SAME_DAY_STOP_LOSS", "4.0"))  # mismo % que STOP_LOSS_NEUTRAL_PCT en pm_neutral.py
+
+# [AUD-P1][2026-09-16] Lecturas horarias consecutivas de "diverging"
+# requeridas antes de sugerir CERRAR (con PnL negativo, no severo).
+# El monitor corre 4 veces al día (12:00-15:00 Chile) — con 2 lecturas
+# se filtra el caso de una sola lectura de ruido sin agotar casi toda
+# la ventana de reacción del día.
+REQUIRED_DIVERGING_READINGS = int(os.getenv("INTRADAY_DIVERGING_CONFIRMATIONS", "2"))
 
 # PnL mínimo para proteger con trailing en vez de cerrar directo
 TRAILING_PNL_THRESHOLD = float(os.getenv("INTRADAY_TRAILING_PNL", "0.02"))  # 2%
@@ -137,6 +166,40 @@ def _load_bearish_news_tickers() -> set:
         for item in data.get("bearish", [])
         if item.get("ticker")
     }
+
+
+# =========================================================
+# [AUD-P1] CONFIRMACIÓN POR LECTURAS CONSECUTIVAS
+# =========================================================
+
+def _contar_diverging_consecutivo(ticker: str, fecha_str: str) -> int:
+    """
+    [AUD-P1][2026-09-16] Cuenta cuántas lecturas horarias consecutivas
+    MÁS RECIENTES (ya guardadas hoy, antes de la lectura actual) tuvieron
+    curve_status="diverging" para este ticker, según el snapshot que
+    evaluar_posiciones_abiertas() ya persiste cada hora en
+    INTRADAY_DIR/{fecha}.json — no requiere ningún estado nuevo.
+
+    Se corta el conteo en la primera hora (yendo hacia atrás) que NO
+    sea "diverging", o que no tenga lectura para este ticker.
+    """
+    snapshot_path = INTRADAY_DIR / f"{fecha_str}.json"
+    snapshot      = _load_json(snapshot_path)
+    if not snapshot:
+        return 0
+
+    horas = sorted(snapshot.keys())
+    count = 0
+    for hora in reversed(horas):
+        posiciones = snapshot[hora].get("posiciones", {})
+        señal      = posiciones.get(ticker)
+        if not señal:
+            break
+        if señal.get("curve_status") == "diverging":
+            count += 1
+        else:
+            break
+    return count
 
 
 # =========================================================
@@ -363,7 +426,6 @@ def _get_open_positions_with_date(tickers_filter: Optional[List[str]] = None) ->
         logger.warning(f"⚠️ positions_meta no disponible: {e}")
         return []
 
-
 # =========================================================
 # EVALUAR TIMING DE ENTRADA
 # =========================================================
@@ -493,6 +555,13 @@ def _evaluate_open_position(
     news_ranking.json (llamada standalone). Si el ticker aparece ahí,
     se usa un umbral de "diverging" más ajustado (reacciona antes)
     solo para esta evaluación.
+
+    [AUD-P1] v3.2: cuando la divergencia lleva a CERRAR (PnL negativo,
+    no severo), se exige que las últimas REQUIRED_DIVERGING_READINGS
+    lecturas horarias hayan sido "diverging" de forma consecutiva —
+    una sola lectura aislada ahora baja a MANTENER en vez de CERRAR
+    directo. La pérdida severa (>= SAME_DAY_STOP_LOSS_OVERRIDE_PCT)
+    sigue actuando de inmediato, sin esperar confirmación.
     """
     if bearish_news_tickers is None:
         bearish_news_tickers = _load_bearish_news_tickers()
@@ -574,12 +643,17 @@ def _evaluate_open_position(
     #   lagging                           → MANTENER (esperar recuperación)
     #   on_track / ahead                  → MANTENER
     #
+    # [AUD-P1] v3.2: el CERRAR por PnL negativo no severo ahora exige
+    # REQUIRED_DIVERGING_READINGS lecturas consecutivas (ver más abajo).
+    # La pérdida severa (mismo día o no) sigue actuando de inmediato.
+    #
     # NOTA v3.1: la curva_futura (slope, peak, valle) se agrega al resultado
     # como contexto informativo para que el PM refine la decisión.
     # El tracker NO cambia su sugerencia basándose en curva_futura.
     # ──────────────────────────────────────────────────────
 
     pnl = ret_vs_entrada if ret_vs_entrada is not None else 0.0
+    diverging_confirmadas = None  # trazabilidad, solo se llena si aplica
 
     if curve_status == "diverging":
         if pnl >= TRAILING_PNL_THRESHOLD * 100:
@@ -602,11 +676,38 @@ def _evaluate_open_position(
                 f"<= {MIN_HOLD_DAYS_BEFORE_CURVE_EXIT} (piso mínimo) → "
                 f"esperar antes de cerrar por curva"
             )
-        else:
+
+        elif pnl <= -SAME_DAY_STOP_LOSS_OVERRIDE_PCT:
+            # [AUD-P1] Pérdida severa — no esperar confirmaciones,
+            # este es el stop de emergencia genuino, no una reacción
+            # a una sola lectura de ruido.
             sugerencia   = "CERRAR"
             razon_cierre = (
-                f"diverging + PnL={pnl:.1f}% negativo → cerrar para limitar pérdida"
+                f"diverging + pérdida severa PnL={pnl:.1f}% "
+                f"(>= {SAME_DAY_STOP_LOSS_OVERRIDE_PCT}%) → cerrar inmediato, sin esperar confirmación"
             )
+
+        else:
+            # [AUD-P1] PnL negativo pero no severo — exigir lecturas
+            # consecutivas antes de cerrar, para no reaccionar a una
+            # sola lectura de ruido intradía de Yahoo Finance.
+            fecha_hoy = datetime.now(timezone.utc).date().isoformat()
+            diverging_confirmadas = _contar_diverging_consecutivo(ticker, fecha_hoy) + 1
+
+            if diverging_confirmadas < REQUIRED_DIVERGING_READINGS:
+                sugerencia   = "MANTENER"
+                razon_cierre = (
+                    f"diverging + PnL={pnl:.1f}% negativo, pero solo "
+                    f"{diverging_confirmadas}/{REQUIRED_DIVERGING_READINGS} lecturas consecutivas "
+                    f"→ esperando confirmación antes de cerrar"
+                )
+            else:
+                sugerencia   = "CERRAR"
+                razon_cierre = (
+                    f"diverging + PnL={pnl:.1f}% negativo, confirmado en "
+                    f"{diverging_confirmadas} lecturas consecutivas → "
+                    f"cerrar para limitar pérdida"
+                )
     elif curve_status == "lagging":
         sugerencia   = "MANTENER"
         razon_cierre = f"lagging pero dentro del cono → esperar recuperación"
@@ -641,6 +742,9 @@ def _evaluate_open_position(
         "fuente_precio":          "yahoo",
         "news_bearish_alert":     has_bearish_news,   # [N2] trazabilidad
     }
+
+    if diverging_confirmadas is not None:
+        result["diverging_lecturas_consecutivas"] = diverging_confirmadas  # [AUD-P1] trazabilidad
 
     if usar_bandas:
         result["upper_band_hoy"]      = round(upper, 4)
@@ -687,7 +791,7 @@ def evaluar_timing_entrada(tickers: List[str]) -> Dict[str, Dict]:
     fecha_str = ahora.date().isoformat()
     hora_str  = ahora.strftime("%H:%M")
 
-    logger.info(f"📡 Tracker entrada v3.1 | {fecha_str} {hora_str} UTC | tickers={tickers}")
+    logger.info(f"📡 Tracker entrada v3.2 | {fecha_str} {hora_str} UTC | tickers={tickers}")
 
     resultado: Dict[str, Dict] = {}
 
@@ -723,7 +827,7 @@ def evaluar_posiciones_abiertas(tickers: List[str]) -> Dict[str, Dict]:
     fecha_str = ahora.date().isoformat()
     hora_str  = ahora.strftime("%H:%M")
 
-    logger.info(f"📊 Tracker posiciones v3.1 | {fecha_str} {hora_str} UTC | tickers={tickers}")
+    logger.info(f"📊 Tracker posiciones v3.2 | {fecha_str} {hora_str} UTC | tickers={tickers}")
 
     posiciones = _get_open_positions_with_date(tickers_filter=tickers)
     resultado: Dict[str, Dict] = {}
@@ -757,7 +861,6 @@ def evaluar_posiciones_abiertas(tickers: List[str]) -> Dict[str, Dict]:
     )
 
     return resultado
-
 
 # =========================================================
 # SNAPSHOT — persiste evaluaciones del día
@@ -818,3 +921,4 @@ def get_position_status_today() -> Dict[str, Dict]:
         for ticker, señal in posiciones.items():
             latest[ticker] = {**señal, "ultima_hora": hora}
     return latest
+    
