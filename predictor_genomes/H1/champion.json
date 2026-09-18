@@ -1,15 +1,15 @@
 {
-  "genome_id": "H1_v3_2",
+  "genome_id": "H1_v5_3",
   "horizon": 1,
-  "generation": 3,
+  "generation": 5,
   "parent_ids": [
-    "H1_v2_2"
+    "H1_v4_3"
   ],
   "fitness": null,
-  "hit_rate": 0.4994,
-  "bias_score": 0.5163,
-  "n_evaluations": 6187,
-  "created_at": "2026-07-31T22:00:24.289460+00:00",
+  "hit_rate": null,
+  "bias_score": 0.5582,
+  "n_evaluations": 0,
+  "created_at": "2026-09-17T21:06:19.522270+00:00",
   "features": [
     "range",
     "ret_lag_1",
@@ -24,13 +24,13 @@
   ],
   "model_params": {
     "alpha_ridge": 0.5,
-    "max_pca": 8,
-    "clip_ret": 0.05,
+    "max_pca": 6,
+    "clip_ret": 0.083,
     "period": "1y",
     "sample_weight_decay": 0.0
   },
-  "bias_score_updated_at": "2026-08-31T22:01:10.005467+00:00",
+  "bias_score_updated_at": "2026-09-17T21:06:19.504379+00:00",
   "mutations": [
-    "ADD:rv_short"
+    "PARAM:clip_ret:0.05→0.083"
   ]
 }
