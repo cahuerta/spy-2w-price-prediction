@@ -102,6 +102,15 @@ DIVERGING_STD_MULT = float(os.getenv("INTRADAY_DIVERGING_STD_MULT", "3.0"))
 MIN_HOLD_DAYS_BEFORE_CURVE_EXIT = int(os.getenv("INTRADAY_MIN_HOLD_DAYS", "1"))
 SAME_DAY_STOP_LOSS_OVERRIDE_PCT = float(os.getenv("INTRADAY_SAME_DAY_STOP_LOSS", "4.0"))  # mismo % que STOP_LOSS_NEUTRAL_PCT en pm_neutral.py
 
+# [AUD-P6][2026-09-20] Fracción del horizon_days propio del trade que
+# debe transcurrir antes de permitir un cierre por divergencia de
+# curva — reemplaza el piso fijo de 1 día para todos. 1/3 es un punto
+# de partida razonable (deja madurar la posición un tercio de su vida
+# esperada antes de dejar que la curva la saque); ajustable sin tocar
+# código si se prefiere otro balance velocidad-de-reacción vs.
+# paciencia con el horizonte del modelo.
+HORIZON_FLOOR_FRACTION = float(os.getenv("INTRADAY_HORIZON_FLOOR_FRACTION", "0.34"))
+
 # [AUD-P1][2026-09-16] Lecturas horarias consecutivas de "diverging"
 # requeridas antes de sugerir CERRAR (con PnL negativo, no severo).
 # El monitor corre 4 veces al día (12:00-15:00 Chile) — con 2 lecturas
@@ -415,9 +424,15 @@ def _get_open_positions_with_date(tickers_filter: Optional[List[str]] = None) ->
                 dia_actual = (today - entry_date).days + 1
                 dia_actual = max(1, min(dia_actual, 9))
                 result.append({
-                    "ticker":     ticker_up,
-                    "entry_date": entry_date_str,
-                    "dia_actual": dia_actual,
+                    "ticker":       ticker_up,
+                    "entry_date":   entry_date_str,
+                    "dia_actual":   dia_actual,
+                    # [AUD-P6][2026-09-20] horizon_days real del trade
+                    # (dominant_h), cuando trading_orchestrator.py lo pasó
+                    # a set_entry_date(). None para posiciones abiertas
+                    # antes de este fix — _evaluate_open_position() cae al
+                    # piso fijo MIN_HOLD_DAYS_BEFORE_CURVE_EXIT en ese caso.
+                    "horizon_days": data.get("horizon_days"),
                 })
             except Exception:
                 continue
@@ -425,6 +440,7 @@ def _get_open_positions_with_date(tickers_filter: Optional[List[str]] = None) ->
     except Exception as e:
         logger.warning(f"⚠️ positions_meta no disponible: {e}")
         return []
+
 
 # =========================================================
 # EVALUAR TIMING DE ENTRADA
@@ -538,6 +554,7 @@ def _evaluate_open_position(
     dia_actual: int,
     entry_date: str,
     bearish_news_tickers: Optional[set] = None,
+    horizon_days: Optional[int] = None,
 ) -> Optional[Dict]:
     """
     Evalúa si una posición abierta debe cerrarse ahora o mantenerse.
@@ -562,6 +579,21 @@ def _evaluate_open_position(
     una sola lectura aislada ahora baja a MANTENER en vez de CERRAR
     directo. La pérdida severa (>= SAME_DAY_STOP_LOSS_OVERRIDE_PCT)
     sigue actuando de inmediato, sin esperar confirmación.
+
+    [AUD-P6] v3.3 (2026-09-20): horizon_days — el horizonte real que
+    el modelo asignó a este trade (dominant_h). ANTES, toda posición
+    usaba el mismo piso fijo MIN_HOLD_DAYS_BEFORE_CURVE_EXIT (1 día)
+    antes de permitir un cierre por divergencia de curva — una
+    posición abierta con horizonte H9 podía cerrarse "por divergencia"
+    en el día 2, violando la premisa del propio modelo que la generó
+    (auditoría 2026-09-10: 93% de los trades cerraban antes de su
+    horizonte previsto, ~$21.400 estimados dejados de ganar). AHORA:
+    el piso escala con el horizonte propio del trade — un tercio de
+    horizon_days (mínimo 1 día), configurable vía
+    INTRADAY_HORIZON_FLOOR_FRACTION. Con horizon_days=None (posición
+    abierta antes de este fix, o horizonte no disponible), se usa el
+    piso fijo de siempre como fallback — comportamiento sin cambios
+    para esas posiciones.
     """
     if bearish_news_tickers is None:
         bearish_news_tickers = _load_bearish_news_tickers()
@@ -569,6 +601,16 @@ def _evaluate_open_position(
     has_bearish_news = ticker.upper() in bearish_news_tickers
     std_mult_used  = NEWS_TIGHT_STD_MULT  if has_bearish_news else DIVERGING_STD_MULT
     threshold_used = NEWS_TIGHT_THRESHOLD if has_bearish_news else DIVERGING_THRESHOLD
+
+    # [AUD-P6] Piso de días proporcional al horizonte real del trade.
+    # Sin horizon_days (legacy) → piso fijo de siempre, sin cambios.
+    if horizon_days:
+        hold_floor = max(
+            MIN_HOLD_DAYS_BEFORE_CURVE_EXIT,
+            round(horizon_days * HORIZON_FLOOR_FRACTION),
+        )
+    else:
+        hold_floor = MIN_HOLD_DAYS_BEFORE_CURVE_EXIT
 
     precio_actual   = _get_current_price(ticker)
     precio_esperado = _get_expected_price_for_day(ticker, dia_actual)
@@ -666,14 +708,16 @@ def _evaluate_open_position(
             sugerencia   = "TRAILING"
             razon_cierre = f"diverging + PnL={pnl:.1f}% positivo → trailing, no cerrar"
 
-        elif dia_actual <= MIN_HOLD_DAYS_BEFORE_CURVE_EXIT and pnl > -SAME_DAY_STOP_LOSS_OVERRIDE_PCT:
-            # [AUD-P9] Piso de días mínimos: no cerrar por curva el mismo
-            # día de apertura, salvo que la pérdida ya sea severa
-            # (>= SAME_DAY_STOP_LOSS_OVERRIDE_PCT).
+        elif dia_actual <= hold_floor and pnl > -SAME_DAY_STOP_LOSS_OVERRIDE_PCT:
+            # [AUD-P9][AUD-P6] Piso de días mínimos — ahora proporcional al
+            # horizon_days propio del trade cuando está disponible (ver
+            # cálculo de hold_floor arriba), no un fijo de 1 día para
+            # todos. No cerrar por curva antes de ese piso, salvo que la
+            # pérdida ya sea severa (>= SAME_DAY_STOP_LOSS_OVERRIDE_PCT).
             sugerencia   = "MANTENER"
             razon_cierre = (
                 f"diverging + PnL={pnl:.1f}% negativo, pero día {dia_actual} "
-                f"<= {MIN_HOLD_DAYS_BEFORE_CURVE_EXIT} (piso mínimo) → "
+                f"<= {hold_floor} (piso, horizon_days={horizon_days}) → "
                 f"esperar antes de cerrar por curva"
             )
 
@@ -843,6 +887,7 @@ def evaluar_posiciones_abiertas(tickers: List[str]) -> Dict[str, Dict]:
             señal = _evaluate_open_position(
                 pos["ticker"], pos["dia_actual"], pos["entry_date"],
                 bearish_news_tickers=bearish_news_tickers,
+                horizon_days=pos.get("horizon_days"),
             )
             if señal:
                 resultado[pos["ticker"]] = {**señal, "evaluado_hora": hora_str}
@@ -861,6 +906,7 @@ def evaluar_posiciones_abiertas(tickers: List[str]) -> Dict[str, Dict]:
     )
 
     return resultado
+
 
 # =========================================================
 # SNAPSHOT — persiste evaluaciones del día
@@ -921,4 +967,3 @@ def get_position_status_today() -> Dict[str, Dict]:
         for ticker, señal in posiciones.items():
             latest[ticker] = {**señal, "ultima_hora": hora}
     return latest
-    
