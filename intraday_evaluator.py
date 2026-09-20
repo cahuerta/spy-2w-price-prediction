@@ -374,12 +374,24 @@ def _update_shadow_genome_evals(h_hit_rates: Dict[str, float], fecha: date) -> N
         for h_key, hit_rate in h_hit_rates.items():
             h_num = int(h_key[1:])
 
-            # Actualizar hit rate del campeón
-            try:
-                from darwin_engine.predictor_genome import update_genome_hit_rate
-                update_genome_hit_rate(h_num, hit_rate, n_evals=0)
-            except Exception as e:
-                logger.warning(f"⚠️ update champion H{h_num}: {e}")
+            # [T9][2026-09-19, auditoría Problema 1] ANTES: esta función
+            # llamaba a update_genome_hit_rate(h_num, hit_rate, n_evals=0),
+            # sobrescribiendo A DIARIO el hit_rate/n_evaluations del
+            # campeón en champion.json con un valor calculado sobre solo
+            # 5 archivos de evaluación por ticker (ver
+            # _compute_h_hit_rates_from_evals arriba) — mucho más ruidoso
+            # que el agregado semanal de predictor_arena.py (60 archivos
+            # por ticker, mínimo 10 evaluaciones para publicar). Además,
+            # pasar n_evals=0 SIEMPRE reseteaba champion.data["n_evaluations"]
+            # a 0 cada día, deshaciendo el fix [AR5] de predictor_arena.py
+            # (que recién empezó a guardar el conteo real al promover) en
+            # cuanto corría el próximo pipeline diario.
+            # El propósito real de esta función (según su propio docstring)
+            # es solo alimentar shadow/evals/champion_baseline.json como
+            # referencia diaria — eso sigue intacto abajo. La actualización
+            # directa del campeón se elimina: el único lugar que debe
+            # decidir el hit_rate/n_evaluations "oficial" del campeón es
+            # predictor_arena.py, con su agregado semanal confiable.
 
             # Registrar en carpeta shadow/evals para el arena
             shadow_eval_dir = GENOME_BASE / f"H{h_num}" / "shadow" / "evals"
@@ -579,4 +591,3 @@ def _get_best_hours(by_hour: Dict) -> List[str]:
             ranked.append((hora, hr))
     ranked.sort(key=lambda x: x[1], reverse=True)
     return [h for h, _ in ranked[:3]]
-            
