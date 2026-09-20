@@ -103,6 +103,10 @@ ALPHA_FILE  = DATA_PATH / "alpha_last.json"
 MAX_PRED_AGE_HOURS       = 240
 MIN_STRUCTURAL_LIQUIDITY = 0.20
 DISAGREEMENT_HAIRCUT     = 0.75
+
+# [AUD-P3][2026-09-16, Problema 2] Umbral de ruido para el signo del
+# alpha — ver uso en el ensamble más abajo.
+PRED_RET_NOISE_FLOOR = float(os.getenv("ALPHA_PRED_RET_NOISE_FLOOR", "0.15"))  # %
 V6_3_THETA_BONUS         = 1.10
 
 # [F10] Umbral real de "candidato operable" — el mismo que
@@ -340,9 +344,26 @@ def compute_alpha_for_ticker(
         base_alpha *= DISAGREEMENT_HAIRCUT
         logger.info(f"⚠️ {ticker} haircut: pred vs trend mismatch")
 
+    # [AUD-P3][2026-09-16, Problema 2] ANTES: direction = np.sign(pred_ret)
+    # daba la MISMA magnitud de dirección a un pred_ret=-0.01% (ruido puro)
+    # que a uno de -8% (señal fuerte) — el signo del alpha (que decide si
+    # el ticker se lee como oportunidad de compra o de venta) no distinguía
+    # confianza direccional real de ruido estadístico. Resultado: señales
+    # de "alta confianza" (alpha 0.7-0.9) construidas sobre una predicción
+    # de retorno prácticamente nula.
+    # AHORA: por debajo de PRED_RET_NOISE_FLOOR (0.15% por defecto) la
+    # predicción se trata como sin señal direccional confiable
+    # (direction_strength=0 → alpha=0, ni compra ni venta). Por encima del
+    # umbral, se usa tanh(pred_ret/2) en vez de sign() puro — un -0.3%
+    # pesa menos que un -3%, que a su vez pesa menos que un -8% (tanh se
+    # satura suavemente en vez de dar 1.0 fijo para cualquier retorno
+    # apenas por encima del umbral).
     unsigned_alpha = clip01(base_alpha * v6_3_bonus * time_decay)
-    direction      = float(np.sign(pred_ret))
-    signed_alpha   = float(unsigned_alpha * direction)
+    if abs(pred_ret) < PRED_RET_NOISE_FLOOR:
+        direction_strength = 0.0
+    else:
+        direction_strength = float(np.tanh(pred_ret / 2.0))
+    signed_alpha = float(unsigned_alpha * direction_strength)
 
     # [N1] Ajuste por ranking de noticias — aditivo, puede invertir
     # el signo del modelo cuantitativo (decisión explícita del
