@@ -67,19 +67,37 @@ def _save_raw(data: Dict[str, Any]) -> None:
         tmp.replace(META_FILE)
 
 
-def set_entry_date(ticker: str, entry_date: Optional[str] = None) -> None:
+def set_entry_date(
+    ticker: str,
+    entry_date: Optional[str] = None,
+    horizon_days: Optional[int] = None,
+) -> None:
     """
     Registra la fecha de entrada de una posición.
     Llamar desde trading_orchestrator cuando el fill es exitoso.
+
+    [AUD-P6][2026-09-10/2026-09-20] horizon_days: el horizonte que el
+    propio modelo asignó a este trade (dominant_h, ya calculado por
+    trade_tracker.register_open() y disponible en el trade que retorna).
+    Antes no se guardaba acá, así que intraday_tracker.py no tenía
+    forma de saber si una posición tenía horizonte H1 o H9 — usaba un
+    piso fijo de 1 día para todas, cerrando por "divergencia de curva"
+    posiciones con horizonte largo mucho antes de que el propio
+    modelo esperara que maduraran (93% de los trades reales cerraban
+    antes de su horizonte previsto, según auditoría 2026-09-16).
     """
     ticker = ticker.upper()
     meta   = _load_raw()
     meta[ticker] = {
         "entry_date":      entry_date or datetime.utcnow().date().isoformat(),
         "registered_at":   datetime.utcnow().isoformat(),
+        "horizon_days":    horizon_days,
     }
     _save_raw(meta)
-    logger.info(f"📅 entry_date registrado | {ticker} → {meta[ticker]['entry_date']}")
+    logger.info(
+        f"📅 entry_date registrado | {ticker} → {meta[ticker]['entry_date']} "
+        f"| horizon_days={horizon_days}"
+    )
 
 
 def get_entry_date(ticker: str) -> Optional[str]:
@@ -124,4 +142,3 @@ def merge_into_positions(positions: list) -> list:
             pos["price_now"] = pos["current_price"]
 
     return positions
-    
