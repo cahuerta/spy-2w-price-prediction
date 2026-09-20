@@ -312,21 +312,41 @@ def _read_h_signals(ticker: str, entry_date) -> Dict[str, Any]:
 def _select_dominant_horizon(h_signals: Dict[str, Any]) -> str:
     """
     [T7] Selecciona el horizonte dominante ponderando por hit_rate real
-    del genoma campeón de cada horizonte, no solo por la magnitud del
-    retorno predicho.
+    de cada horizonte, no solo por la magnitud del retorno predicho.
 
     score(h) = |pred_return(h)| * max(0, hit_rate(h) - 0.5)
 
-    Horizontes sin hit_rate calculado (None — el genoma nunca fue
-    evaluado) quedan EXCLUIDOS de la competencia: sin evidencia de
-    que acierten, no deben competir por dominante solo por gritar
+    [T8][2026-09-19, auditoría Problema 1] ANTES: hit_rate venía de
+    PredictorGenome.load_champion(h).hit_rate — un valor que
+    intraday_evaluator.py sobrescribe A DIARIO usando solo los
+    últimos 5 archivos de evaluación por ticker (ventana corta y
+    ruidosa; ver fix [T9] en intraday_evaluator.py, que ya elimina
+    esa sobreescritura). Esa era una fuente DISTINTA y de calidad muy
+    inferior a la que trading_orchestrator.py usa para decidir cuándo
+    CERRAR una posición (darwin_engine/pnl_fitness.py::_get_h_hit_rates(),
+    que agrega TODO /data/evaluations con mínimo 20 evaluaciones por
+    horizonte) — dos partes del mismo pipeline decidiendo con datos
+    de calidad distinta. Resultado medido: 62% de los 325 trades
+    reales se concentraban en H10 (46.7% acierto, peor que el azar) y
+    H8 (49.1%), mientras H4 (el mejor horizonte real, 52.3%) solo
+    gatilló 13 trades — el sistema pescaba sistemáticamente las
+    peores señales para decidir CUÁNDO entrar, aunque usara la fuente
+    correcta para decidir cuándo salir.
+    AHORA: usa la misma fuente agregada y confiable
+    (pnl_fitness._get_h_hit_rates()) que ya usa el resto del pipeline
+    para cerrar posiciones — mismo criterio para entrar y para salir.
+
+    Horizontes sin hit_rate calculado (mínimo 20 evaluaciones, ver
+    pnl_fitness.py) quedan EXCLUIDOS de la competencia: sin evidencia
+    de que acierten, no deben competir por dominante solo por gritar
     un retorno grande. Si NINGÚN horizonte tiene hit_rate todavía,
     se usa "H6" como fallback (mismo default que antes del fix).
     """
     try:
-        from darwin_engine.predictor_genome import PredictorGenome
+        from darwin_engine.pnl_fitness import _get_h_hit_rates
+        real_hit_rates = _get_h_hit_rates()
     except Exception as e:
-        logger.warning(f"⚠️ _select_dominant_horizon: PredictorGenome no disponible ({e}) — usando H6")
+        logger.warning(f"⚠️ _select_dominant_horizon: _get_h_hit_rates no disponible ({e}) — usando H6")
         return "H6"
 
     dominant_h     = None
@@ -338,15 +358,10 @@ def _select_dominant_horizon(h_signals: Dict[str, Any]) -> str:
         if ret <= 0:
             continue
 
-        try:
-            genome   = PredictorGenome.load_champion(int(h[1:]))
-            hit_rate = genome.hit_rate
-        except Exception as e:
-            logger.warning(f"⚠️ _select_dominant_horizon: no se pudo cargar champion {h}: {e}")
-            hit_rate = None
+        hit_rate = real_hit_rates.get(h)
 
         if hit_rate is None:
-            # Sin evidencia de acierto → no compite por dominante
+            # Sin evidencia agregada suficiente → no compite por dominante
             continue
 
         score = ret * max(0.0, hit_rate - 0.5)
