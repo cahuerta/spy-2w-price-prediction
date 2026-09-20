@@ -1058,6 +1058,7 @@ class TradingOrchestrator:
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
 
+                trade_registered = None
                 if DARWIN_TRACKING:
                     try:
                         # [AUD-P5] entry_price real del fill cuando el broker
@@ -1069,7 +1070,7 @@ class TradingOrchestrator:
                             or order.get("entry_price")
                             or 0
                         )
-                        register_open(
+                        trade_registered = register_open(
                             ticker              = order["ticker"],
                             entry_price         = float(fill_price),
                             shares              = int(order.get("shares") or 0),
@@ -1093,8 +1094,22 @@ class TradingOrchestrator:
 
                 try:
                     from positions_meta import set_entry_date
-                    set_entry_date(order["ticker"])
-                    logger.info(f"📅 entry_date registrado: {order['ticker']}")
+                    # [AUD-P6][2026-09-10/2026-09-20] Propagar horizon_days
+                    # (dominant_h, ya calculado por register_open y
+                    # disponible en trade_registered) hasta positions_meta —
+                    # sin esto intraday_tracker.py no tenía forma de saber si
+                    # esta posición tenía horizonte H1 o H9, y usaba un piso
+                    # fijo de 1 día para todas (auditoría 2026-09-10: ~$21.400
+                    # estimados dejados de ganar por cierres prematuros).
+                    horizon_days = (
+                        trade_registered.get("horizon_days")
+                        if trade_registered else None
+                    )
+                    set_entry_date(order["ticker"], horizon_days=horizon_days)
+                    logger.info(
+                        f"📅 entry_date registrado: {order['ticker']} "
+                        f"(horizon_days={horizon_days})"
+                    )
                 except Exception as e:
                     logger.warning(f"⚠️ entry_date no registrado {order['ticker']}: {e}")
 
