@@ -790,7 +790,18 @@ class TradingOrchestrator:
             await self._cancel_pending_orders([c["ticker"] for c in closes_ejecutar])
             await asyncio.sleep(0.5)
 
-            for order in closes_ejecutar[:self.daily_limit]:
+            # [AUD-P4][2026-09-13, Problema 3] ANTES: closes_ejecutar[:self.
+            # daily_limit] — los CIERRES (incluidos los de emergencia por
+            # divergencia de curva) compartían el mismo tope de 15
+            # órdenes/día que las aperturas. Con un portfolio grande
+            # (se ha visto hasta 67 posiciones abiertas), un evento de
+            # mercado que dispare divergencia en más de 15 posiciones a
+            # la vez dejaría al resto SIN cerrar ese ciclo — el
+            # mecanismo de protección quedaría bloqueado justo cuando
+            # más se necesita. Los cierres nunca deben truncarse por un
+            # límite pensado para controlar cuántas posiciones NUEVAS se
+            # abren por día.
+            for order in closes_ejecutar:
                 try:
                     result = await asyncio.wait_for(
                         self.broker.execute_decision(order), timeout=30
@@ -1017,14 +1028,50 @@ class TradingOrchestrator:
                 result = await asyncio.wait_for(
                     self.broker.execute_decision(order), timeout=30
                 )
+
+                # [AUD-P5][2026-09-13, Problema 1] ANTES: se contaba como
+                # "success" y se registraba en Darwin ANTES de revisar
+                # result.get("status") — broker.execute_decision() nunca
+                # lanza excepción, siempre retorna un dict con status en
+                # {"executed","pending","error","rejected","skipped"}. Una
+                # orden "pending"/"rejected"/"error" se contaba igual como
+                # ejecutada y se registraba en Darwin con el precio de la
+                # DECISIÓN (no el fill real) — contaminando tanto el
+                # tracking de fitness como las métricas de éxito del
+                # sistema con trades que nunca se confirmaron.
+                # AHORA: solo status=="executed" cuenta como éxito, se
+                # registra en Darwin, y marca entry_date. Cualquier otro
+                # status se registra tal cual y se salta al siguiente.
+                if result.get("status") != "executed":
+                    logger.error(
+                        f"⚠️ Orden {order['ticker']} no confirmada "
+                        f"(status={result.get('status')}): {result}"
+                    )
+                    results.append({
+                        "ticker": order["ticker"],
+                        "status": result.get("status", "unknown"),
+                    })
+                    await asyncio.sleep(0.8)
+                    self.governor = await self._refresh_governor()
+                    continue
+
                 results.append({"ticker": order["ticker"], "status": "success"})
                 executed_opens += 1
 
                 if DARWIN_TRACKING:
                     try:
+                        # [AUD-P5] entry_price real del fill cuando el broker
+                        # lo entrega — antes siempre se usaba order["entry_price"]
+                        # (el precio al momento de la DECISIÓN), no el precio
+                        # real de ejecución.
+                        fill_price = (
+                            result.get("filled_avg_price")
+                            or order.get("entry_price")
+                            or 0
+                        )
                         register_open(
                             ticker              = order["ticker"],
-                            entry_price         = float(order.get("entry_price") or 0),
+                            entry_price         = float(fill_price),
                             shares              = int(order.get("shares") or 0),
                             reason              = order.get("reason", "UNKNOWN"),
                             alpha_score         = float(order.get("alpha") or 0),
@@ -1033,7 +1080,7 @@ class TradingOrchestrator:
                         )
                         logger.info(
                             f"📝 TRADE OPEN registrado | {order['ticker']} | "
-                            f"entrada=${order.get('entry_price', 0):.2f}"
+                            f"entrada=${float(fill_price):.2f}"
                         )
                     except Exception as _te:
                         # [AUD-P1] Antes: solo logger.warning, el fallo se perdía.
@@ -1044,13 +1091,12 @@ class TradingOrchestrator:
                         logger.error(f"❌ DARWIN OPEN FALLÓ {order['ticker']}: {_te}")
                         _record_tracking_failure("open", order["ticker"], str(_te))
 
-                if result.get("status") == "executed":
-                    try:
-                        from positions_meta import set_entry_date
-                        set_entry_date(order["ticker"])
-                        logger.info(f"📅 entry_date registrado: {order['ticker']}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ entry_date no registrado {order['ticker']}: {e}")
+                try:
+                    from positions_meta import set_entry_date
+                    set_entry_date(order["ticker"])
+                    logger.info(f"📅 entry_date registrado: {order['ticker']}")
+                except Exception as e:
+                    logger.warning(f"⚠️ entry_date no registrado {order['ticker']}: {e}")
 
                 await asyncio.sleep(0.8)
                 self.governor = await self._refresh_governor()
