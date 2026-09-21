@@ -1,477 +1,379 @@
 """
-darwin_engine/predictor_shadow_evaluator.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Evaluador nocturno de shadow genomes para H1-H10.
+darwin_engine/executor_shadow_evaluator.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARCHIVO NUEVO [AUD-D2] — resuelve el bug estructural #2 de la auditoría:
+"los executor shadows nunca pueden competir — no hay pipeline de trades
+reales para ellos".
 
-Pieza que faltaba en el ciclo evolutivo: hasta ahora, predictor_arena.py
-esperaba encontrar hit_rate real de cada shadow en
-GENOME_BASE/HX/shadow/evals/*.json, pero nada lo generaba — los shadows
-existían solo como parámetros guardados en disco, nunca se ejecutaban.
+PROBLEMA QUE RESUELVE:
+  Solo el executor campeón opera con dinero real en Alpaca. Los genomas
+  shadow (v2, v3, ...) nunca acumulan trades propios, por lo que
+  `cand_trades` en arena.py._select_champion() permanece en 0
+  indefinidamente y nunca alcanzan MIN_TRADES_TO_COMPETE — el campeón
+  nunca puede ser reemplazado, sin importar cuán bueno sea un candidato.
 
-Este archivo corre de noche (separado del trading real) y hace lo que
-faltaba, en dos fases:
+DISEÑO (confirmado con el usuario, punto por punto):
+  - Corre en el MISMO ciclo que trading_orchestrator.py — sin desfase
+    temporal entre shadows y campeón, para que ninguno tenga ventaja
+    por operar en un momento distinto del mercado.
+  - Cada shadow simula su PROPIO portfolio, independiente del campeón
+    y de los demás shadows — mide las consecuencias de las decisiones
+    de ESE genoma, no las del campeón.
+  - Capital ficticio: el mismo FIXED_CAPITAL que usa el sistema real.
+  - Universo de apertura: alpha_map completo del día (mismos tickers
+    con alpha_score que ve el campeón) — ningún shadow tiene un
+    universo más favorable que otro.
+  - Apertura: cada shadow decide con su PROPIO criterio, gobernado
+    por los genes entry_confirmation del genoma (min_agreeing_h,
+    min_horizon_for_entry) — genes que YA EXISTEN en ExecutorGenome
+    desde su creación pero que ningún código usaba hasta este fix.
+    Esto es intencional: la apertura debe derivarse de genes reales
+    que Darwin puede mutar, no de un umbral inventado aparte para
+    la simulación — de lo contrario la competencia no sería justa
+    ni auditable.
+  - Mantención/cierre: usa ExecutorGenome.evaluate(), la misma
+    función que ya usa el sistema real para el campeón — ningún
+    criterio distinto para shadows vs campeón en esta parte.
+  - Precios: se leen desde el mismo alpha_map / price_now del ciclo
+    (no requiere Alpaca ni ninguna cuenta adicional — es lectura de
+    datos ya disponibles en el ciclo, nunca ejecución de órdenes).
 
-  FASE 1 — generate_shadow_predictions():
-    Para cada horizonte H1-H10, para cada shadow genome, para un
-    subconjunto rotativo de tickers de /data/tickers.json:
-      1. Corre run_predictor_hX(ticker, override_genome=shadow) — el
-         predictor real, con el genoma del shadow pasado explícito
-      2. Guarda la predicción en shadow/predictions/{genome_id}/
+PERSISTENCIA:
+  /data/darwin/shadow_portfolios/{genome_id}/positions.json
+      Portfolio simulado actual del shadow (lista de posiciones).
+  /data/darwin/shadow_trades/{genome_id}/*.json
+      Un archivo por trade simulado cerrado — mismo esquema de
+      campos relevantes que darwin/trades/*.json para que
+      get_resolved_trades() (o un equivalente) pueda calcular
+      fitness de forma comparable.
 
-  FASE 2 — evaluate_matured_shadow_predictions():
-    Para cada predicción de shadow cuyo horizonte ya venció:
-      1. Obtiene el precio real (reutiliza evaluator.py, sin duplicar)
-      2. Calcula hit_sign con el mismo umbral que usa el evaluador real
-      3. Acumula hit_rate / n_evaluations en shadow/evals/{genome_id}.json
-         — el archivo exacto que predictor_arena.py ya espera leer
-
-DISEÑO:
-  [SE1] Rotación de universo: con ~158 tickers y TICKERS_PER_NIGHT=27,
-        el universo completo se cubre en ~6 noches. Estado persistido
-        en /data/darwin/shadow_eval_state.json (cursor simple).
-  [SE2] Lock file (GENOME_BASE/.shadow_eval_lock) evita que esta corrida
-        se solape con OTRA INSTANCIA DE SÍ MISMA (dos ejecuciones
-        concurrentes de este mismo archivo) — no relacionado con
-        champion.json, ver [SHADOW-FIX] más abajo. Se libera solo si
-        tiene más de 6h (asume crash previo).
-  [SE4] Ejecución serial (sin ThreadPoolExecutor) — el historial del
-        proyecto tiene OOM conocido con concurrencia en Render Standard;
-        se prioriza estabilidad sobre velocidad para este proceso nuevo.
-  [SE5] Reutiliza get_price_at_date, nth_business_day y _calc_hit_sign
-        de evaluator.py — no se duplica lógica de precios ni de umbral
-        de señal.
-
-FIX v1.1:
-  [SE6] El import `from master_orchestrator import extract_price_prediction,
-        extract_return_pct` fallaba en producción — ModuleNotFoundError,
-        confirmado en logs de la primera corrida nocturna real
-        ("❌ Shadow evaluator error: No module named 'master_orchestrator'").
-        Ese módulo no expone esas funciones (o no es importable así).
-        Reemplazado por _extract_price_pred()/_extract_return_pct()
-        locales, que leen directo del dict que devuelve cada
-        run_predictor_hX() — soportan ambos formatos: H1-H9 (campos
-        planos "price_pred"/"return_pct") y H10 (anidados bajo
-        "prediction": "price_pred"/"ret_ens_pct"). Cero dependencia
-        externa nueva.
-
-FIX v1.2 [SHADOW-FIX] (auditoría 2026-09-21, Problema 1b):
-  [SE3-eliminado] ANTES: para conseguir una predicción REAL de cada
-        shadow, esta función hacía un swap temporal de champion.json
-        (respaldar → sobreescribir con los parámetros del shadow →
-        correr run_predictor_hX(ticker), que no sabía leer otro genoma
-        que no fuera "el campeón" → restaurar el archivo original en
-        un finally). Coordinaba con predictor_arena.py (el único
-        proceso que promueve campeones de verdad) solo vía LOCK_FILE,
-        y esa coordinación falló al menos una vez de forma confirmada:
-        la promoción de H6 (18-sep-2026) coincidió con un swap en
-        curso, dejó un `champion.real_champion_backup` huérfano nunca
-        restaurado, y promovió un shadow objetivamente PEOR que el
-        campeón vigente (46.77% vs 49.03% de acierto).
-        Fix real: load_active_genome() (predictor_genome.py) ahora
-        acepta override_genome, y los 10 run_predictor_hX() lo
-        reciben y reenvían — _run_shadow_batch() les pasa el shadow
-        directo, sin tocar champion.json en ningún momento. No hay
-        nada que respaldar ni restaurar, y dos procesos que nunca
-        escriben el mismo archivo no pueden pisarse — la condición de
-        carrera se elimina de raíz, no se coordina con un candado.
-
-NOTA PENDIENTE (no resuelto en este archivo):
-  predictor_arena.py._evaluate_shadow_hit_rates() lee TODOS los .json
-  en shadow/evals/, incluyendo champion_baseline.json (escrito por
-  intraday_evaluator.py como placeholder temporal). Ese archivo no
-  corresponde a un shadow real y debería excluirse de la comparación
-  de "mejor shadow". Ya resuelto en predictor_arena.py [AR2] en sesión
-  previa — mencionado aquí solo como referencia histórica.
+AUDITABILIDAD:
+  Cada decisión (abrir, mantener, cerrar) queda registrada con la
+  razón exacta y los valores de los genes que la motivaron, para que
+  cualquier promoción futura de un shadow a campeón sea trazable
+  hasta las reglas específicas que la justificaron.
 """
 
-import os
-import sys
 import json
-import time
 import logging
-import importlib
-from datetime import datetime, timezone
+import os
+from copy import deepcopy
+from datetime import datetime, timezone, date
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Any, List, Optional
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+from darwin_engine.executor_genome import ExecutorGenome, GENOME_DIR
+from darwin_engine.trade_tracker import _read_h_signals
 
-from darwin_engine.predictor_genome import PredictorGenome, GENOME_BASE, DATA_PATH
-from evaluator import get_price_at_date, nth_business_day, _calc_hit_sign
+logger = logging.getLogger("executor_shadow_evaluator")
 
-logger = logging.getLogger("predictor_shadow_evaluator")
+DATA_PATH            = Path(os.getenv("DATA_PATH", "/data"))
+SHADOW_PORTFOLIO_DIR = DATA_PATH / "darwin" / "shadow_portfolios"
+SHADOW_TRADES_DIR    = DATA_PATH / "darwin" / "shadow_trades"
 
-# ══════════════════════════════════════════════════════
-# CONFIG
-# ══════════════════════════════════════════════════════
+FIXED_CAPITAL = float(os.getenv("FIXED_CAPITAL", "1000000"))
 
-TICKERS_FILE       = Path(DATA_PATH) / "tickers.json"
-STATE_FILE         = Path(DATA_PATH) / "darwin" / "shadow_eval_state.json"
-LOCK_FILE          = GENOME_BASE / ".shadow_eval_lock"
-LOCK_MAX_AGE_SEC    = 6 * 3600  # 6 horas — lock más viejo se asume crash
-
-TICKERS_PER_NIGHT  = int(os.getenv("SHADOW_EVAL_TICKERS_PER_NIGHT", "27"))
+# Tamaño de posición simulada — mismo default que usa el sistema real
+# para aperturas por alpha (ver trading_orchestrator.py ALPHA_INJECT)
+DEFAULT_TARGET_PCT = 0.05
 
 
 # ══════════════════════════════════════════════════════
-# HELPERS JSON
+# HELPERS DE DISCO
 # ══════════════════════════════════════════════════════
 
-def _load_json(path: Path) -> Dict:
-    if not path.exists():
-        return {}
+def _load_json(path: Path, default=None):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"⚠️ load_json {path}: {e}")
-        return {}
+    except Exception:
+        return default if default is not None else {}
 
 
-def _save_json(path: Path, data: Dict) -> None:
+def _save_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str))
     tmp.replace(path)
 
 
-# ══════════════════════════════════════════════════════
-# [SE6] EXTRACCIÓN DE CAMPOS DE PREDICCIÓN
-# Soporta ambos formatos que producen los predictores reales:
-#   H1-H9: campos planos {"price_pred": ..., "return_pct": ...}
-#   H10:   anidados bajo {"prediction": {"price_pred": ..., "ret_ens_pct": ...}}
-# ══════════════════════════════════════════════════════
-
-def _extract_price_pred(data: Dict) -> Optional[float]:
-    if data.get("price_pred") is not None:
-        return float(data["price_pred"])
-    pred = data.get("prediction")
-    if isinstance(pred, dict) and pred.get("price_pred") is not None:
-        return float(pred["price_pred"])
-    return None
+def _positions_path(genome_id: str) -> Path:
+    return SHADOW_PORTFOLIO_DIR / genome_id / "positions.json"
 
 
-def _extract_return_pct(data: Dict) -> float:
-    if data.get("return_pct") is not None:
-        return float(data["return_pct"])
-    pred = data.get("prediction")
-    if isinstance(pred, dict) and pred.get("ret_ens_pct") is not None:
-        return float(pred["ret_ens_pct"])
-    return 0.0
+def _load_shadow_positions(genome_id: str) -> List[Dict]:
+    data = _load_json(_positions_path(genome_id), default=[])
+    return data if isinstance(data, list) else []
+
+
+def _save_shadow_positions(genome_id: str, positions: List[Dict]) -> None:
+    _save_json(_positions_path(genome_id), positions)
+
+
+def _save_shadow_trade(genome_id: str, trade: Dict) -> None:
+    trade_dir = SHADOW_TRADES_DIR / genome_id
+    path = trade_dir / f"{trade['trade_id']}.json"
+    _save_json(path, trade)
 
 
 # ══════════════════════════════════════════════════════
-# [SE2] LOCK
+# [AUD-D2] CRITERIO DE APERTURA GOBERNADO POR GENES
 # ══════════════════════════════════════════════════════
 
-def _acquire_lock() -> bool:
-    if LOCK_FILE.exists():
+def should_open(
+    genome: ExecutorGenome,
+    ticker: str,
+    h_signals: Dict[str, Any],
+    alpha_score: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    [AUD-D2] Decide si el genoma abriría una posición en `ticker`,
+    usando ÚNICAMENTE los genes entry_confirmation que ya existen en
+    ExecutorGenome (min_agreeing_h, min_horizon_for_entry) — genes
+    presentes desde la creación del genoma pero que hasta este fix
+    ningún código consultaba.
+
+    No usa ningún umbral inventado para la simulación: la regla de
+    apertura del shadow es la misma que sus genes describen, por lo
+    tanto es tan auditable y mutable por Darwin como el resto del
+    comportamiento del genoma.
+
+    Retorna un dict con la decisión y el detalle de la evidencia que
+    la sustenta, o None si el genoma no abriría.
+    """
+    entry_cfg = genome.data.get("entry_confirmation", {})
+    min_agreeing_h        = int(entry_cfg.get("min_agreeing_h", 3))
+    min_horizon_for_entry = int(entry_cfg.get("min_horizon_for_entry", 4))
+
+    direction = "COMPRA" if alpha_score > 0 else "VENDE"
+
+    # FIX (auditoría 2026-08-28, Problema 1 / Bug A):
+    # El sistema real nunca abre posiciones cortas (trade_tracker.py lo
+    # documenta explícitamente) — solo compra. El shadow, en cambio,
+    # simulaba también las señales "VENDE" como si fueran compras,
+    # calculando el PnL siempre como posición larga (ver pnl_pct más
+    # abajo en evaluate_shadow_cycle). Resultado: una señal bajista que
+    # ACIERTA (el precio cae) se registraba como pérdida, y una que
+    # FALLA (el precio sube) se registraba como ganancia — invertido.
+    # El shadow debe simular exactamente lo que el sistema real puede
+    # hacer, ni más ni menos: si no compra en corto, tampoco lo simula.
+    if direction == "VENDE":
+        return None
+
+    agreeing = 0
+    evidence = []
+    for h_key, sig in h_signals.items():
+        if h_key == "main" or not h_key.startswith("H"):
+            continue
         try:
-            age_sec = time.time() - LOCK_FILE.stat().st_mtime
-            if age_sec > LOCK_MAX_AGE_SEC:
-                logger.warning(f"⚠️ Lock viejo ({age_sec/3600:.1f}h) → liberando forzado")
-                LOCK_FILE.unlink(missing_ok=True)
-            else:
-                return False
-        except Exception:
-            return False
-    try:
-        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-        LOCK_FILE.write_text(datetime.now(timezone.utc).isoformat())
-        return True
-    except Exception as e:
-        logger.error(f"❌ No se pudo crear lock: {e}")
-        return False
+            h_num = int(h_key[1:])
+        except ValueError:
+            continue
+        if h_num < min_horizon_for_entry:
+            continue
+        pred_ret = float(sig.get("pred_return", 0))
+        confirms = (pred_ret > 0 if direction == "COMPRA" else pred_ret < 0)
+        if confirms:
+            agreeing += 1
+            evidence.append({"h": h_key, "pred_return": pred_ret})
 
+    if agreeing < min_agreeing_h:
+        return None
 
-def _release_lock() -> None:
-    try:
-        LOCK_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+    return {
+        "ticker":      ticker,
+        "direction":   direction,
+        "agreeing_h":  agreeing,
+        "min_required": min_agreeing_h,
+        "evidence":    evidence,
+        "alpha_score": alpha_score,
+    }
 
 
 # ══════════════════════════════════════════════════════
-# [SE1] UNIVERSO Y ROTACIÓN
+# CICLO DE UN SHADOW — evalúa cierres y aperturas
 # ══════════════════════════════════════════════════════
 
-def _load_universe() -> List[str]:
-    if not TICKERS_FILE.exists():
-        return []
-    try:
-        data = json.loads(TICKERS_FILE.read_text())
-        if isinstance(data, list):
-            return sorted(t for t in data if isinstance(t, str))
-    except Exception as e:
-        logger.warning(f"⚠️ load_universe: {e}")
-    return []
+def evaluate_shadow_cycle(
+    genome: ExecutorGenome,
+    alpha_map: Dict[str, Dict],
+    price_map: Dict[str, float],
+    entry_date_str: str = None,
+) -> Dict[str, Any]:
+    """
+    Ejecuta un ciclo completo de evaluación para UN shadow:
+      1. Evalúa cada posición abierta del portfolio propio del shadow
+         con genome.evaluate() → HOLD o CLOSE.
+      2. Para cierres, registra el trade simulado en
+         darwin/shadow_trades/{genome_id}/ y lo quita del portfolio.
+      3. Para tickers sin posición, evalúa apertura con should_open()
+         usando el mismo alpha_map que ve el campeón ese día.
+      4. Persiste el portfolio actualizado.
 
+    No ejecuta ninguna orden real — todo el estado vive en
+    darwin/shadow_portfolios/ y darwin/shadow_trades/.
 
-def _get_tonight_chunk(universe: List[str], chunk_size: int) -> List[str]:
-    if not universe:
-        return []
+    price_map: {ticker: precio_actual} — mismos precios que ya calculó
+    el ciclo real (no se hace ninguna llamada adicional a Alpaca ni a
+    ningún proveedor de datos aquí).
+    """
+    genome_id = genome.genome_id
+    today = entry_date_str or datetime.now(timezone.utc).date().isoformat()
+    positions = _load_shadow_positions(genome_id)
 
-    n_chunks = max(1, -(-len(universe) // chunk_size))  # ceil division
-    state    = _load_json(STATE_FILE) or {"cursor": 0}
-    cursor   = state.get("cursor", 0) % n_chunks
+    closed_trades = []
+    still_open    = []
 
-    start = cursor * chunk_size
-    end   = start + chunk_size
-    chunk = universe[start:end]
+    # ── PASO 1: evaluar posiciones abiertas (HOLD/CLOSE) ──────────
+    for pos in positions:
+        ticker = pos["ticker"]
+        price_now = price_map.get(ticker.upper())
+        if price_now is None or price_now <= 0:
+            # Sin precio confiable este ciclo → mantener sin evaluar,
+            # igual criterio conservador que usa el sistema real
+            # ([F13] en trading_orchestrator.py): no inventar precio.
+            still_open.append(pos)
+            continue
 
-    state["cursor"]        = cursor + 1
-    state["last_run"]      = datetime.now(timezone.utc).isoformat()
-    state["universe_size"] = len(universe)
-    state["n_chunks"]      = n_chunks
-    _save_json(STATE_FILE, state)
+        entry_price = float(pos["entry_price"])
+        pnl_pct     = (price_now / entry_price - 1.0) * 100
+        days_held   = (
+            date.fromisoformat(today) - date.fromisoformat(pos["entry_date"])
+        ).days
+
+        h_signals   = _read_h_signals(ticker, date.fromisoformat(today))
+        alpha_entry = alpha_map.get(ticker.upper(), {})
+        alpha_score = float(alpha_entry.get("alpha_score", 0.0))
+        h_hit_rates = pos.get("h_hit_rates_at_entry", {})
+
+        decision = genome.evaluate(
+            trade            = pos,
+            current_pnl_pct  = pnl_pct,
+            alpha_score      = alpha_score,
+            h_signals        = h_signals,
+            h_hit_rates      = h_hit_rates,
+            days_held        = days_held,
+        )
+
+        if decision["action"] == "CLOSE":
+            trade = deepcopy(pos)
+            trade.update({
+                "status":         "closed",
+                "exit_price":     round(price_now, 4),
+                "exit_date":      today,
+                "reason_close":   decision["reason"],
+                "days_held":      days_held,
+                "pnl_real_pct":   round(pnl_pct, 4),
+                "pnl_real_usd":   round(pnl_pct / 100 * entry_price * pos["shares"], 2),
+                "decision_confidence": decision.get("confidence"),
+            })
+            _save_shadow_trade(genome_id, trade)
+            closed_trades.append(trade)
+        else:
+            pos["last_evaluated"] = today
+            pos["last_decision"]  = decision
+            still_open.append(pos)
+
+    # ── PASO 2: evaluar aperturas nuevas ──────────────────────────
+    open_tickers = {p["ticker"].upper() for p in still_open}
+    new_positions = []
+
+    for ticker, alpha_entry in alpha_map.items():
+        ticker_upper = ticker.upper()
+        if ticker_upper in open_tickers:
+            continue
+
+        alpha_score = float(alpha_entry.get("alpha_score", 0.0))
+        price_now   = price_map.get(ticker_upper)
+        if not price_now or price_now <= 0:
+            continue
+
+        h_signals = _read_h_signals(ticker_upper, date.fromisoformat(today))
+        if not h_signals:
+            continue
+
+        open_signal = should_open(genome, ticker_upper, h_signals, alpha_score)
+        if open_signal is None:
+            continue
+
+        shares = int((FIXED_CAPITAL * DEFAULT_TARGET_PCT) // price_now)
+        if shares <= 0:
+            continue
+
+        new_trade_id = f"{ticker_upper}_{today}_{genome_id}"
+        new_pos = {
+            "trade_id":              new_trade_id,
+            "ticker":                ticker_upper,
+            "entry_price":           round(price_now, 4),
+            "entry_date":            today,
+            "shares":                shares,
+            "h_signals_at_entry":    {"main": {"recommendation": open_signal["direction"]}},
+            "open_evidence":         open_signal,
+            "alpha_score_entry":     round(alpha_score, 4),
+        }
+        new_positions.append(new_pos)
+
+    still_open.extend(new_positions)
+    _save_shadow_positions(genome_id, still_open)
 
     logger.info(
-        f"🎯 Chunk {cursor + 1}/{n_chunks} | "
-        f"{len(chunk)} tickers | universo total={len(universe)}"
+        f"🌑 Shadow eval | {genome_id} | "
+        f"cerrados={len(closed_trades)} abiertos_nuevos={len(new_positions)} "
+        f"portfolio_actual={len(still_open)}"
     )
-    return chunk
+
+    return {
+        "genome_id":       genome_id,
+        "closed":          len(closed_trades),
+        "opened":          len(new_positions),
+        "portfolio_size":  len(still_open),
+    }
 
 
 # ══════════════════════════════════════════════════════
-# FASE 1 — GENERAR PREDICCIONES DE SHADOWS
+# API PÚBLICA: correr todos los shadows en el ciclo actual
 # ══════════════════════════════════════════════════════
 
-def _save_shadow_prediction(
-    horizon: int, genome_id: str, ticker: str, result: Dict
-) -> bool:
-    try:
-        pred_dir = GENOME_BASE / f"H{horizon}" / "shadow" / "predictions" / genome_id
-        pred_dir.mkdir(parents=True, exist_ok=True)
-        today_str = datetime.now(timezone.utc).date().isoformat()
-        pred_path = pred_dir / f"{ticker}_{today_str}.json"
-        tmp = pred_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(result, indent=2, default=str))
-        tmp.replace(pred_path)
-        return True
-    except Exception as e:
-        logger.error(f"❌ save_shadow_prediction {genome_id} {ticker}: {e}")
-        return False
-
-
-def _run_shadow_batch(horizon: int, shadow: PredictorGenome, tickers: List[str]) -> int:
+def run_all_shadows(
+    shadow_genomes: List[ExecutorGenome],
+    alpha_map: Dict[str, Dict],
+    price_map: Dict[str, float],
+) -> List[Dict[str, Any]]:
     """
-    [SHADOW-FIX][2026-09-21, auditoría 2026-09-21 Problema 1b] ANTES:
-    esta función hacía un swap temporal de champion.json (respaldo →
-    sobreescribir con los parámetros del shadow → correr el predictor
-    real → restaurar en un finally) porque run_predictor_hX() no tenía
-    forma de recibir un genoma explícito — siempre leía "el campeón".
-    Coordinaba con predictor_arena.py (el único que promueve
-    campeones de verdad) solo vía LOCK_FILE, y esa coordinación falló
-    al menos una vez confirmada: la promoción de H6 (18-sep-2026)
-    coincidió con un swap en curso, dejando un
-    `champion.real_champion_backup` huérfano nunca restaurado, y
-    promoviendo un shadow objetivamente peor que el campeón vigente.
-
-    AHORA: run_predictor_hX() acepta override_genome directamente
-    (ver load_active_genome() en predictor_genome.py) — el shadow se
-    pasa tal cual, sin tocar champion.json en ningún momento. No hay
-    nada que respaldar, nada que restaurar, y ninguna condición de
-    carrera posible con predictor_arena.py: dos procesos que nunca
-    escriben el mismo archivo no pueden pisarse.
+    Ejecuta evaluate_shadow_cycle() para cada shadow. Debe llamarse en
+    el MISMO ciclo que trading_orchestrator.py procesa al campeón real,
+    con el mismo alpha_map y price_map de ese ciclo — nunca en un cron
+    separado ni con datos de un momento distinto, para que ningún
+    shadow tenga ventaja o desventaja temporal frente a otro o frente
+    al campeón.
     """
-    ok_count = 0
-
-    mod  = importlib.import_module(f"predictors_engine.predictor_h{horizon}")
-    func = getattr(mod, f"run_predictor_h{horizon}")
-
-    for ticker in tickers:
+    results = []
+    for genome in shadow_genomes:
         try:
-            result = func(ticker, override_genome=shadow)
-            if result is None:
-                continue
-            if _save_shadow_prediction(horizon, shadow.genome_id, ticker, result):
-                ok_count += 1
+            result = evaluate_shadow_cycle(genome, alpha_map, price_map)
+            results.append(result)
         except Exception as e:
-            logger.error(f"❌ shadow pred H{horizon} {shadow.genome_id} {ticker}: {e}")
-
-    return ok_count
-
-
-def generate_shadow_predictions(chunk_size: int = TICKERS_PER_NIGHT) -> Dict:
-    if not _acquire_lock():
-        logger.warning("⚠️ Lock activo — otra corrida de shadow evaluator en progreso, abortando")
-        return {"status": "locked"}
-
-    results = {"status": "ok", "predictions_generated": 0, "errors": 0, "by_horizon": {}}
-    try:
-        universe = _load_universe()
-        tickers_tonight = _get_tonight_chunk(universe, chunk_size)
-        if not tickers_tonight:
-            logger.warning("⚠️ Sin tickers para evaluar esta noche")
-            return {"status": "no_tickers"}
-
-        logger.info(f"🌙 Shadow evaluator | {len(tickers_tonight)} tickers esta noche")
-
-        for h in range(1, 11):
-            shadow_genomes = PredictorGenome.load_shadow_genomes(h)
-            if not shadow_genomes:
-                results["by_horizon"][f"H{h}"] = 0
-                continue
-
-            h_count = 0
-            for shadow in shadow_genomes:
-                h_count += _run_shadow_batch(h, shadow, tickers_tonight)
-
-            results["by_horizon"][f"H{h}"] = h_count
-            results["predictions_generated"] += h_count
-            logger.info(f"   H{h}: {h_count} predicciones ({len(shadow_genomes)} shadows)")
-
-    finally:
-        _release_lock()
-
+            logger.error(f"❌ Error evaluando shadow {genome.genome_id}: {e}")
+            results.append({"genome_id": genome.genome_id, "error": str(e)})
     return results
 
 
 # ══════════════════════════════════════════════════════
-# FASE 2 — EVALUAR PREDICCIONES MADURAS
+# LECTURA DE TRADES SIMULADOS RESUELTOS DE UN SHADOW
+# (equivalente a get_resolved_trades() de trade_tracker.py,
+#  pero apuntando a shadow_trades/ en vez de darwin/trades/)
 # ══════════════════════════════════════════════════════
 
-def _append_shadow_eval(
-    horizon: int, genome_id: str, hit_sign: Optional[bool], weak_signal: bool
-) -> None:
-    eval_dir  = GENOME_BASE / f"H{horizon}" / "shadow" / "evals"
-    eval_dir.mkdir(parents=True, exist_ok=True)
-    eval_path = eval_dir / f"{genome_id}.json"
+def get_shadow_resolved_trades(genome_id: str, last_n: int = 200) -> List[Dict]:
+    trade_dir = SHADOW_TRADES_DIR / genome_id
+    if not trade_dir.exists():
+        return []
 
-    existing = _load_json(eval_path) or {
-        "genome_id":      genome_id,
-        "horizon":        horizon,
-        "hit_count":      0,
-        "n_evaluations":  0,
-        "n_weak_skipped": 0,
-        "hit_rate":       None,
-        "last_updated":   None,
-    }
+    trades = []
+    for path in trade_dir.glob("*.json"):
+        trade = _load_json(path, default=None)
+        if trade and trade.get("status") == "closed":
+            trades.append(trade)
 
-    if weak_signal or hit_sign is None:
-        existing["n_weak_skipped"] = existing.get("n_weak_skipped", 0) + 1
-    else:
-        existing["n_evaluations"] = existing.get("n_evaluations", 0) + 1
-        if hit_sign:
-            existing["hit_count"] = existing.get("hit_count", 0) + 1
-        if existing["n_evaluations"] > 0:
-            existing["hit_rate"] = round(
-                existing["hit_count"] / existing["n_evaluations"], 4
-            )
-
-    existing["last_updated"] = datetime.now(timezone.utc).isoformat()
-    _save_json(eval_path, existing)
-
-
-def evaluate_matured_shadow_predictions() -> Dict:
-    today   = datetime.now(timezone.utc).date()
-    summary = {"evaluated": 0, "pending": 0, "errors": 0, "by_horizon": {}}
-
-    for h in range(1, 11):
-        shadow_pred_root = GENOME_BASE / f"H{h}" / "shadow" / "predictions"
-        if not shadow_pred_root.exists():
-            continue
-
-        h_evaluated = 0
-        for genome_dir in shadow_pred_root.iterdir():
-            if not genome_dir.is_dir():
-                continue
-            genome_id = genome_dir.name
-
-            for pred_file in list(genome_dir.glob("*.json")):
-                try:
-                    data = _load_json(pred_file)
-                    if not data:
-                        pred_file.unlink(missing_ok=True)
-                        continue
-
-                    stem = pred_file.stem
-                    if "_" not in stem:
-                        pred_file.unlink(missing_ok=True)
-                        continue
-                    ticker, date_str = stem.rsplit("_", 1)
-
-                    try:
-                        pred_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    except ValueError:
-                        pred_file.unlink(missing_ok=True)
-                        continue
-
-                    target_date = nth_business_day(pred_date, h)
-                    if target_date > today:
-                        summary["pending"] += 1
-                        continue  # aún no madura — se reintenta otra noche
-
-                    price_now = (
-                        data.get("price_now")
-                        or data.get("price_today")
-                        or (data.get("prediction") or {}).get("price_now")
-                    )
-                    price_pred       = _extract_price_pred(data)
-                    predicted_return = _extract_return_pct(data)
-
-                    if price_now is None or price_pred is None:
-                        pred_file.unlink(missing_ok=True)
-                        continue
-
-                    price_now  = float(price_now)
-                    real_price = get_price_at_date(ticker, target_date)
-                    if not real_price:
-                        # Sin precio real disponible todavía → reintentar otra noche
-                        summary["pending"] += 1
-                        continue
-
-                    real_return = (real_price / price_now - 1) * 100.0
-                    hit_sign, weak_signal = _calc_hit_sign(predicted_return, real_return)
-
-                    _append_shadow_eval(h, genome_id, hit_sign, weak_signal)
-
-                    pred_file.unlink(missing_ok=True)
-                    h_evaluated += 1
-                    summary["evaluated"] += 1
-
-                except Exception as e:
-                    logger.error(f"❌ eval shadow pred {pred_file}: {e}")
-                    summary["errors"] += 1
-
-        summary["by_horizon"][f"H{h}"] = h_evaluated
-
-    return summary
-
-
-# ══════════════════════════════════════════════════════
-# CICLO COMPLETO
-# ══════════════════════════════════════════════════════
-
-def run_shadow_evolution_cycle() -> Dict:
-    logger.info("=" * 60)
-    logger.info("🌙 SHADOW EVALUATOR — CICLO NOCTURNO")
-    logger.info(f"   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    logger.info("=" * 60)
-
-    gen_result  = generate_shadow_predictions()
-    eval_result = evaluate_matured_shadow_predictions()
-
-    summary = {
-        "timestamp":  datetime.now(timezone.utc).isoformat(),
-        "generation": gen_result,
-        "evaluation": eval_result,
-    }
-
-    logger.info(
-        f"✅ Shadow evaluator completado | "
-        f"generadas={gen_result.get('predictions_generated', 0)} | "
-        f"evaluadas={eval_result.get('evaluated', 0)} | "
-        f"pendientes={eval_result.get('pending', 0)}"
-    )
-    return summary
-
-
-# ══════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    result = run_shadow_evolution_cycle()
-    print(json.dumps(result, indent=2, default=str))
+    trades.sort(key=lambda t: t.get("exit_date", ""), reverse=True)
+    return trades[:last_n]
+      
