@@ -14,12 +14,9 @@ faltaba, en dos fases:
   FASE 1 — generate_shadow_predictions():
     Para cada horizonte H1-H10, para cada shadow genome, para un
     subconjunto rotativo de tickers de /data/tickers.json:
-      1. Respalda el champion.json real
-      2. Escribe temporalmente los parámetros del shadow en champion.json
-      3. Corre run_predictor_hX(ticker) — el predictor real, sin
-         modificarlo, cree que está leyendo al campeón
-      4. Guarda la predicción en shadow/predictions/{genome_id}/
-      5. Restaura el champion.json real inmediatamente
+      1. Corre run_predictor_hX(ticker, override_genome=shadow) — el
+         predictor real, con el genoma del shadow pasado explícito
+      2. Guarda la predicción en shadow/predictions/{genome_id}/
 
   FASE 2 — evaluate_matured_shadow_predictions():
     Para cada predicción de shadow cuyo horizonte ya venció:
@@ -33,11 +30,10 @@ DISEÑO:
         el universo completo se cubre en ~6 noches. Estado persistido
         en /data/darwin/shadow_eval_state.json (cursor simple).
   [SE2] Lock file (GENOME_BASE/.shadow_eval_lock) evita que esta corrida
-        se solape con otra instancia de sí misma. Se libera solo si
+        se solape con OTRA INSTANCIA DE SÍ MISMA (dos ejecuciones
+        concurrentes de este mismo archivo) — no relacionado con
+        champion.json, ver [SHADOW-FIX] más abajo. Se libera solo si
         tiene más de 6h (asume crash previo).
-  [SE3] El swap de champion.json se hace UNA vez por shadow (no por
-        ticker) — todos los tickers de la noche corren bajo el mismo
-        swap, minimizando ventanas de riesgo y I/O.
   [SE4] Ejecución serial (sin ThreadPoolExecutor) — el historial del
         proyecto tiene OOM conocido con concurrencia en Render Standard;
         se prioriza estabilidad sobre velocidad para este proceso nuevo.
@@ -58,6 +54,27 @@ FIX v1.1:
         "prediction": "price_pred"/"ret_ens_pct"). Cero dependencia
         externa nueva.
 
+FIX v1.2 [SHADOW-FIX] (auditoría 2026-09-21, Problema 1b):
+  [SE3-eliminado] ANTES: para conseguir una predicción REAL de cada
+        shadow, esta función hacía un swap temporal de champion.json
+        (respaldar → sobreescribir con los parámetros del shadow →
+        correr run_predictor_hX(ticker), que no sabía leer otro genoma
+        que no fuera "el campeón" → restaurar el archivo original en
+        un finally). Coordinaba con predictor_arena.py (el único
+        proceso que promueve campeones de verdad) solo vía LOCK_FILE,
+        y esa coordinación falló al menos una vez de forma confirmada:
+        la promoción de H6 (18-sep-2026) coincidió con un swap en
+        curso, dejó un `champion.real_champion_backup` huérfano nunca
+        restaurado, y promovió un shadow objetivamente PEOR que el
+        campeón vigente (46.77% vs 49.03% de acierto).
+        Fix real: load_active_genome() (predictor_genome.py) ahora
+        acepta override_genome, y los 10 run_predictor_hX() lo
+        reciben y reenvían — _run_shadow_batch() les pasa el shadow
+        directo, sin tocar champion.json en ningún momento. No hay
+        nada que respaldar ni restaurar, y dos procesos que nunca
+        escriben el mismo archivo no pueden pisarse — la condición de
+        carrera se elimina de raíz, no se coordina con un candado.
+
 NOTA PENDIENTE (no resuelto en este archivo):
   predictor_arena.py._evaluate_shadow_hit_rates() lee TODOS los .json
   en shadow/evals/, incluyendo champion_baseline.json (escrito por
@@ -71,7 +88,6 @@ import os
 import sys
 import json
 import time
-import shutil
 import logging
 import importlib
 from datetime import datetime, timezone
@@ -240,47 +256,39 @@ def _save_shadow_prediction(
 
 def _run_shadow_batch(horizon: int, shadow: PredictorGenome, tickers: List[str]) -> int:
     """
-    [SE3] Swap de champion.json UNA vez por shadow — corre todos los
-    tickers de la noche bajo el mismo swap, y restaura al final.
+    [SHADOW-FIX][2026-09-21, auditoría 2026-09-21 Problema 1b] ANTES:
+    esta función hacía un swap temporal de champion.json (respaldo →
+    sobreescribir con los parámetros del shadow → correr el predictor
+    real → restaurar en un finally) porque run_predictor_hX() no tenía
+    forma de recibir un genoma explícito — siempre leía "el campeón".
+    Coordinaba con predictor_arena.py (el único que promueve
+    campeones de verdad) solo vía LOCK_FILE, y esa coordinación falló
+    al menos una vez confirmada: la promoción de H6 (18-sep-2026)
+    coincidió con un swap en curso, dejando un
+    `champion.real_champion_backup` huérfano nunca restaurado, y
+    promoviendo un shadow objetivamente peor que el campeón vigente.
+
+    AHORA: run_predictor_hX() acepta override_genome directamente
+    (ver load_active_genome() en predictor_genome.py) — el shadow se
+    pasa tal cual, sin tocar champion.json en ningún momento. No hay
+    nada que respaldar, nada que restaurar, y ninguna condición de
+    carrera posible con predictor_arena.py: dos procesos que nunca
+    escriben el mismo archivo no pueden pisarse.
     """
-    champion_path = GENOME_BASE / f"H{horizon}" / "champion.json"
-    backup_path   = champion_path.with_suffix(".real_champion_backup")
-
-    if not champion_path.exists():
-        logger.warning(f"⚠️ champion.json no existe para H{horizon} — saltando shadow")
-        return 0
-
     ok_count = 0
-    swapped  = False
-    try:
-        shutil.copy2(champion_path, backup_path)
-        tmp = champion_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(shadow.to_dict(), indent=2, default=str))
-        tmp.replace(champion_path)
-        swapped = True
 
-        mod  = importlib.import_module(f"predictors_engine.predictor_h{horizon}")
-        func = getattr(mod, f"run_predictor_h{horizon}")
+    mod  = importlib.import_module(f"predictors_engine.predictor_h{horizon}")
+    func = getattr(mod, f"run_predictor_h{horizon}")
 
-        for ticker in tickers:
-            try:
-                result = func(ticker)
-                if result is None:
-                    continue
-                if _save_shadow_prediction(horizon, shadow.genome_id, ticker, result):
-                    ok_count += 1
-            except Exception as e:
-                logger.error(f"❌ shadow pred H{horizon} {shadow.genome_id} {ticker}: {e}")
-
-    except Exception as e:
-        logger.error(f"❌ swap error H{horizon} {shadow.genome_id}: {e}")
-
-    finally:
-        # SIEMPRE restaurar el champion real, pase lo que pase
-        if swapped and backup_path.exists():
-            backup_path.replace(champion_path)
-        elif backup_path.exists():
-            backup_path.unlink(missing_ok=True)
+    for ticker in tickers:
+        try:
+            result = func(ticker, override_genome=shadow)
+            if result is None:
+                continue
+            if _save_shadow_prediction(horizon, shadow.genome_id, ticker, result):
+                ok_count += 1
+        except Exception as e:
+            logger.error(f"❌ shadow pred H{horizon} {shadow.genome_id} {ticker}: {e}")
 
     return ok_count
 
@@ -467,3 +475,4 @@ def run_shadow_evolution_cycle() -> Dict:
 if __name__ == "__main__":
     result = run_shadow_evolution_cycle()
     print(json.dumps(result, indent=2, default=str))
+          
