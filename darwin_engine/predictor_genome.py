@@ -379,7 +379,29 @@ class PredictorGenome:
 # API PÚBLICA
 # ══════════════════════════════════════════════════════
 
-def load_active_genome(horizon: int) -> PredictorGenome:
+def load_active_genome(horizon: int, override_genome: Optional["PredictorGenome"] = None) -> "PredictorGenome":
+    """
+    [SHADOW-FIX][2026-09-21, auditoría 2026-09-21 Problema 1b] ANTES:
+    predictor_shadow_evaluator.py necesitaba una predicción REAL de
+    cada shadow genome, pero esta función (y todo predictor_hX.py)
+    solo sabía cargar "el campeón" — sin forma de pedirle "corre con
+    ESTE genoma en particular". La única salida era un hack: respaldar
+    champion.json, sobreescribirlo temporalmente con los parámetros
+    del shadow, correr el predictor real (que cree estar leyendo al
+    campeón), y restaurar el archivo original — con un LOCK_FILE para
+    evitar que predictor_arena.py (el único que promueve campeones de
+    verdad) escribiera champion.json durante esa ventana.
+    Esa coordinación por candado no siempre alcanzó: evidencia real de
+    una condición de carrera confirmada (H6, 18-sep-2026): el swap
+    coincidió con una promoción y quedó un `champion.real_champion_
+    backup` huérfano, nunca restaurado.
+    AHORA: override_genome permite pasar un genoma explícito sin tocar
+    champion.json en absoluto — el swap completo deja de ser
+    necesario. Sin override_genome, el comportamiento es idéntico al
+    de siempre (carga el campeón real).
+    """
+    if override_genome is not None:
+        return override_genome
     return PredictorGenome.load_champion(horizon)
 
 
