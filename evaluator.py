@@ -26,6 +26,14 @@ PRICE_CACHE: Dict[str, float] = {}
 # Predicciones con |pred| < umbral → hit_sign=None (sin señal)
 HIT_SIGN_MIN_PCT = float(os.getenv("HIT_SIGN_MIN_PCT", "0.05"))
 
+# [E11][2026-09-21] Días recientes (contando desde hoy hacia atrás)
+# para los que Alpaca rechaza sistemáticamente por SIP restringido en
+# este plan — confirmado en logs reales: 100% de rechazo para
+# target_date=hoy, en cientos de tickers seguidos. Por defecto solo
+# "hoy" (0 días atrás), que es lo único confirmado — ajustable por env
+# var si se confirma que días adicionales también fallan siempre.
+RECENT_DATE_SKIP_ALPACA_DAYS = int(os.getenv("RECENT_DATE_SKIP_ALPACA_DAYS", "0"))
+
 # [E10] Historial diario de calidad del modelo — un registro pequeño
 # por día, en vez de que el dashboard reprocese los ~15,000 archivos
 # de evaluaciones históricas en cada request. Ver _update_daily_history().
@@ -119,6 +127,18 @@ def _is_alpaca_unsupported(ticker: str) -> bool:
     if t in ALPACA_UNSUPPORTED_EXACT:
         return True
     return any(t.endswith(s) for s in ALPACA_UNSUPPORTED_SUFFIXES)
+
+
+def _is_recent_date_alpaca_unsupported(target_date: date_type) -> bool:
+    """
+    [E11][2026-09-21] True si target_date es lo bastante reciente como
+    para que Alpaca la rechace sistemáticamente por SIP restringido en
+    este plan (confirmado en logs reales: 100% de rechazo para
+    target_date=hoy). Evita gastar una llamada de red real, condenada
+    a fallar, por cada ticker — ver get_price_at_date().
+    """
+    days_ago = (datetime.utcnow().date() - target_date).days
+    return 0 <= days_ago <= RECENT_DATE_SKIP_ALPACA_DAYS
 
 
 # ======================================================
@@ -385,12 +405,44 @@ def get_price_at_date(ticker: str, target_date: date_type) -> Optional[float]:
     no tiene permiso de datos (ej. SIP data restringido para el día
     en curso). Resultado cacheado en PRICE_CACHE en ambos casos, así
     que el fallback nunca se ejecuta más de una vez por (ticker, fecha).
+
+    [E11][2026-09-21] ANTES: para la fecha de HOY, Alpaca rechaza
+    sistemáticamente con "subscription does not permit querying
+    recent SIP data" — confirmado en logs reales: 100% de rechazo
+    para target_date=hoy, en cientos de tickers seguidos, sin ninguna
+    excepción. Pese a eso, el código intentaba Alpaca primero SIEMPRE,
+    gastando una llamada de red real (con su round-trip) que estaba
+    garantizada a fallar, antes de recién ahí caer al fallback.
+    Con cientos de tickers por corrida, esto se traduce en cientos de
+    llamadas de red inútiles por hora — evidencia real de esa misma
+    corrida: los tiempos entre tickers crecieron progresivamente
+    (segundos → minutos → 16 minutos de salto), y terminó en un error
+    de conexión SSL real contra Alpaca ("Max retries exceeded"),
+    consistente con agotamiento de recursos de red (sockets/conexiones)
+    del contenedor por el volumen de llamadas condenadas a fallar.
+    Fix: si target_date es HOY (o dentro de RECENT_DATE_SKIP_ALPACA_DAYS,
+    configurable — por defecto solo hoy, que es lo único confirmado en
+    los logs), se salta la llamada a Alpaca por completo y se va
+    directo al fallback — mismo resultado final, sin la llamada de red
+    condenada a fallar.
     """
     key = f"{ticker}_{target_date}"
     if key in PRICE_CACHE:
         return PRICE_CACHE[key]
 
     if _is_alpaca_unsupported(ticker):
+        return None
+
+    if _is_recent_date_alpaca_unsupported(target_date):
+        logger.info(
+            f"⏭️ get_price_at_date {ticker} {target_date} — fecha reciente "
+            f"(SIP no soportado en este plan de Alpaca), saltando directo a fallback"
+        )
+        price = _get_price_at_date_fallback(ticker, target_date)
+        if price is not None:
+            PRICE_CACHE[key] = price
+            return price
+        logger.warning(f"⚠️ get_price_at_date {ticker} — sin precio en fallback (fecha reciente)")
         return None
 
     price = _get_price_at_date_alpaca(ticker, target_date)
