@@ -138,7 +138,7 @@ def _select_alpha_ridge_cv(X: np.ndarray, y: np.ndarray, n_pca: int) -> float:
 # ======================================================
 # PREDICTOR H1
 # ======================================================
-def run_predictor_h1(ticker: str):
+def run_predictor_h1(ticker: str, override_genome=None):
     raw = get_price_history(ticker=ticker, period="2y", interval="1d")
 
     # ── DARWIN: cargar genoma activo ──────────────────
@@ -155,7 +155,7 @@ def run_predictor_h1(ticker: str):
 
     if DARWIN_PREDICTOR:
         try:
-            genome    = load_active_genome(HORIZON)
+            genome    = load_active_genome(HORIZON, override_genome=override_genome)
             _alpha_from_genome = genome.model_params.get("alpha_ridge")  # None si Darwin no lo definió
             _max_pca  = genome.model_params.get("max_pca",             MAX_PCA_COMPONENTS)
             _clip_ret = genome.model_params.get("clip_ret",            CLIP_RET)
