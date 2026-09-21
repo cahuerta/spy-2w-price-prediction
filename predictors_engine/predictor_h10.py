@@ -319,6 +319,7 @@ def run_predictor_h10(
     k_neighbors: int = K_NEIGHBORS_H10,
     alpha: float = ALPHA_H10,
     period: str = PERIOD_H10,
+    override_genome=None,
 ):
     _pca_target = pca_target
     _alpha = alpha
@@ -326,7 +327,7 @@ def run_predictor_h10(
 
     if DARWIN_PREDICTOR:
         try:
-            genome = load_active_genome(HORIZON_H10)
+            genome = load_active_genome(HORIZON_H10, override_genome=override_genome)
             _alpha = genome.model_params.get("alpha_ridge", alpha)
             _pca_target = genome.model_params.get("max_pca", pca_target)
             _clip_ret = genome.model_params.get("clip_ret", CLIP_RET_H10)
@@ -373,4 +374,3 @@ if __name__ == "__main__":
         json.dump(result, f, indent=2)
     print(format_report(result))
     print(f"\n💾 Guardado: {output_path}")
-                                                       
