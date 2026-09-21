@@ -116,7 +116,7 @@ def make_features_h8(df: pd.DataFrame):
 # ======================================================
 # PREDICTOR H8
 # ======================================================
-def run_predictor_h8(ticker: str):
+def run_predictor_h8(ticker: str, override_genome=None):
     raw = get_price_history(ticker=ticker, period="2y", interval="1d")
 
     # ── DARWIN: cargar genoma activo ──────────────────
@@ -128,7 +128,7 @@ def run_predictor_h8(ticker: str):
 
     if DARWIN_PREDICTOR:
         try:
-            genome    = load_active_genome(HORIZON)
+            genome    = load_active_genome(HORIZON, override_genome=override_genome)
             _alpha    = genome.model_params.get("alpha_ridge",         ALPHA_H8)
             _max_pca  = genome.model_params.get("max_pca",             MAX_PCA_COMPONENTS)
             _clip_ret = genome.model_params.get("clip_ret",            CLIP_RET)
@@ -256,4 +256,3 @@ if __name__ == "__main__":
         )
     else:
         print("⚠️ H8 sin resultado")
-    
