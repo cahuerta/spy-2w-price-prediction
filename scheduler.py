@@ -221,6 +221,32 @@ def _mp_monitor_worker(result_path: str):
     Path(result_path).write_text(json.dumps(result))
 
 
+def _mp_darwin_resolve_worker(result_path: str):
+    """
+    [F18][2026-09-21] Corre en proceso hijo: resolve_pending_trades()
+    puede hacer una llamada de precio (Alpaca + cascada de fallback)
+    por cada trade pendiente — con hasta 67 posiciones vistas en
+    auditorías pasadas, esto es el mismo patrón de llamadas de red
+    acumulativas, secuenciales, que ya confirmamos como causa de
+    degradación progresiva en evaluator.py [E11]. Antes corría directo
+    en el hilo del scheduler, sin aislar, único de los 4 triggers
+    darwin/monitor que faltaba (evolution/shadow/monitor ya estaban
+    aislados desde [F13]/[F14a]).
+    El resultado (lista de trades resueltos) se escribe a un JSON
+    temporal porque el proceso padre lo necesita para loguear el
+    detalle de los primeros 5 — mismo patrón que _mp_monitor_worker.
+    """
+    result = {"resolved": [], "error": None}
+    try:
+        from darwin_engine.trade_tracker import resolve_pending_trades
+        resolved = resolve_pending_trades()
+        result["resolved"] = resolved
+    except Exception as e:
+        result["error"] = str(e)
+
+    Path(result_path).write_text(json.dumps(result, default=str))
+
+
 def _run_in_subprocess_sync(target, step_name: str, args: tuple = (), timeout_sec: int = DARWIN_SUBPROCESS_TIMEOUT_SEC) -> bool:
     """
     [F13] Corre `target(*args)` en un proceso hijo separado y espera a
@@ -382,9 +408,37 @@ def _trigger_defensive_close(tickers: list):
 
 def _trigger_darwin_resolve(motivo: str):
     print(f"🧬 Darwin resolve_pending_trades [{motivo}]")
+
+    # [F18][2026-09-21] Corre en proceso hijo separado — puede hacer una
+    # llamada de precio por cada trade pendiente, mismo patrón de
+    # riesgo que ya confirmamos en evaluator.py [E11].
+    if _pipeline_esta_corriendo():
+        print("⏭️  [F14b] Darwin resolve SKIP — pipeline principal todavía corriendo")
+        return
+
+    result_path = str(DATA_PATH / f"tmp_darwin_resolve_{os.getpid()}.json")
+    ok = _run_in_subprocess_sync(
+        _mp_darwin_resolve_worker, "darwin_resolve", args=(result_path,)
+    )
+
+    if not ok:
+        print("❌ Darwin resolve falló o excedió tiempo — sin cambios")
+        return
+
     try:
-        from darwin_engine.trade_tracker import resolve_pending_trades
-        resolved = resolve_pending_trades()
+        result_file = Path(result_path)
+        if not result_file.exists():
+            print("❌ Darwin resolve: proceso hijo terminó pero no dejó resultado")
+            return
+
+        data = json.loads(result_file.read_text())
+        result_file.unlink(missing_ok=True)
+
+        if data.get("error"):
+            print(f"❌ Darwin resolve error: {data['error']}")
+            return
+
+        resolved = data.get("resolved", [])
         print(f"✅ Darwin trades resueltos: {len(resolved)}")
         for t in resolved[:5]:
             print(
@@ -394,7 +448,7 @@ def _trigger_darwin_resolve(motivo: str):
                 f"Oportunidad={t.get('oportunidad_pct', 0):+.2f}%"
             )
     except Exception as e:
-        print(f"❌ Darwin resolve error: {e}")
+        print(f"❌ Darwin resolve error post-proceso: {e}")
 
 
 def _trigger_darwin_evolution(motivo: str):
