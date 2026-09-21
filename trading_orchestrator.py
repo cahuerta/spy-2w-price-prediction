@@ -46,6 +46,7 @@ import logging
 import asyncio
 import os
 import json
+import multiprocessing
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, date
 from pathlib import Path
@@ -239,6 +240,106 @@ def _reconcile_broker_vs_darwin(broker_tickers: set) -> None:
             )
     except Exception as e:
         logger.warning(f"⚠️ Reconciliación broker↔Darwin falló: {e}")
+
+
+# =========================================================
+# [F17][2026-09-21] AISLAMIENTO DE CapitalGovernor EN PROCESO HIJO
+# =========================================================
+# capital_governor.py::evaluate() hace yf.download(period="1y") para
+# CADA posición abierta + el benchmark SPY, y calcula una matriz de
+# covarianza sobre todo eso — se llama desde adjust_sizing() y
+# adjust_sizing_after_closes(), que corrían directo en el proceso
+# principal del pipeline (paso 9, nunca aislado por los fixes previos
+# de memoria — esos solo cubrieron screener/model_runner/evaluator/
+# alpha_engine, pasos 1/3/4/8). Con hasta 67 posiciones abiertas
+# vistas en auditorías pasadas, esto es un año de historial de ~68
+# tickers vía yfinance, en el proceso de FastAPI que nunca se
+# reinicia — mismo patrón de riesgo que ya confirmamos con el
+# screener (yfinance retiene memoria de sesión entre llamadas
+# sucesivas, sin que gc.collect() garantice su liberación real).
+#
+# Fix: mismo patrón que [F16] — cada llamada corre en su propio
+# proceso hijo, que instancia su propio CapitalGovernor(fixed_capital)
+# y escribe el resultado (lista de candidatos con sizing aplicado) a
+# un JSON temporal. NO se toca LOOKBACK_DAYS/period="1y" — ese dato sí
+# lo necesita el cálculo real de riesgo (VaR/ES) para ser confiable;
+# acortarlo sin confirmarlo con el usuario podría debilitar el mismo
+# mecanismo que protege el capital de una apertura riesgosa.
+# =========================================================
+
+_mp_ctx_cg = multiprocessing.get_context("spawn")
+
+
+def _mp_run_adjust_sizing_after_closes(
+    positions: list, close_tickers_list: list, anchor_opens: list,
+    fixed_capital: float, result_path: str,
+) -> None:
+    from capital_governor import CapitalGovernor
+    gov    = CapitalGovernor(fixed_capital=fixed_capital)
+    result = gov.adjust_sizing_after_closes(positions, close_tickers_list, anchor_opens)
+    Path(result_path).write_text(json.dumps(result, default=str))
+
+
+def _mp_run_adjust_sizing(
+    positions: list, normal_opens: list,
+    fixed_capital: float, result_path: str,
+) -> None:
+    from capital_governor import CapitalGovernor
+    gov    = CapitalGovernor(fixed_capital=fixed_capital)
+    result = gov.adjust_sizing(positions, normal_opens)
+    Path(result_path).write_text(json.dumps(result, default=str))
+
+
+async def _run_capital_governor_subprocess(
+    target, args: tuple, step_name: str, timeout_sec: int = 10 * 60,
+) -> list:
+    """
+    [F17] Corre `target(*args)` (siempre terminando en result_path) en
+    un proceso hijo separado, espera sin bloquear el loop de asyncio,
+    y lee el resultado del JSON temporal. Retorna [] si el proceso
+    falla o se cuelga — mismo comportamiento seguro que tenía la
+    versión sin aislar cuando adjust_sizing/adjust_sizing_after_closes
+    no tenían candidatos que sizear (ver call sites: `if anchor_opens
+    else []` / `if normal_opens else []`).
+    """
+    result_path = str(Path(os.getenv("DATA_PATH", "/data")) / f"tmp_cg_{step_name}_{os.getpid()}.json")
+    proc = _mp_ctx_cg.Process(target=target, args=(*args, result_path), name=step_name)
+    proc.start()
+
+    loop = asyncio.get_event_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, proc.join, timeout_sec),
+            timeout=timeout_sec + 30,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ [F17] {step_name} excedió {timeout_sec}s — terminando proceso hijo")
+        proc.terminate()
+        proc.join(10)
+        return []
+
+    if proc.is_alive():
+        logger.error(f"⏱️ [F17] {step_name} no terminó a tiempo — terminando proceso hijo")
+        proc.terminate()
+        proc.join(10)
+        return []
+
+    if proc.exitcode != 0:
+        logger.error(f"❌ [F17] {step_name} falló en proceso hijo (exitcode={proc.exitcode})")
+        return []
+
+    result_file = Path(result_path)
+    if not result_file.exists():
+        logger.error(f"❌ [F17] {step_name} terminó pero no dejó resultado")
+        return []
+
+    try:
+        result = json.loads(result_file.read_text())
+    finally:
+        result_file.unlink(missing_ok=True)
+
+    logger.info(f"✅ [F17] {step_name} completado en proceso hijo (pid={proc.pid})")
+    return result
 
 
 class TradingOrchestrator:
@@ -983,11 +1084,15 @@ class TradingOrchestrator:
         normal_opens       = [o for o in unique_opens if o not in anchor_opens]
         close_tickers_list = [c["ticker"] for c in closes_ejecutar]
 
-        sized_anchors = self.governor.adjust_sizing_after_closes(
-            positions, close_tickers_list, anchor_opens
+        sized_anchors = await _run_capital_governor_subprocess(
+            _mp_run_adjust_sizing_after_closes,
+            (positions, close_tickers_list, anchor_opens, self.fixed_capital),
+            "adjust_sizing_after_closes",
         ) if anchor_opens else []
-        sized_normals = self.governor.adjust_sizing(
-            positions, normal_opens
+        sized_normals = await _run_capital_governor_subprocess(
+            _mp_run_adjust_sizing,
+            (positions, normal_opens, self.fixed_capital),
+            "adjust_sizing",
         ) if normal_opens else []
         sized_opens = sized_anchors + sized_normals
 
