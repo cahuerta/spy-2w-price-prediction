@@ -62,6 +62,40 @@ FIXES:
         chequear `bias_val is not None` ANTES de comparar con >=,
         mismo patrón ya usado correctamente en la recolección de
         bias_alerts un poco más arriba en este mismo archivo.
+
+  [AR5] (auditoría 2026-09-19, Problema 3) _run_h_cycle — promoción:
+        `inherited_n_evals` se leía de `new_champion_data.get(
+        "n_evaluations", 0)` — el archivo del GENOMA en sí
+        (shadow/{id}.json), que predictor_mutator.py SIEMPRE
+        inicializa en 0 al crear un hijo, sin importar cuánta
+        evidencia real haya acumulado después. El fix [AR3] (27-ago)
+        tenía la intención correcta (no mostrar hit_rate sin validar)
+        pero apuntaba a la fuente equivocada — por eso TODO campeón
+        promovido terminaba con hit_rate=None, incluso los que sí
+        tenían >= MIN_EVALS_TO_COMPETE evaluaciones reales.
+        El dato correcto ya estaba disponible en `best_shadow` (viene
+        de shadow/evals/{id}.json vía _evaluate_shadow_hit_rates), que
+        es justamente el mismo diccionario ya usado más arriba para
+        filtrar candidatos por `shadow_n >= MIN_EVALS_TO_COMPETE`.
+        Fix: usar `best_shadow.get("n_evaluations", 0)` en vez de
+        `new_champion_data.get(...)` — mismo dato, fuente correcta.
+
+  [AR6] (auditoría 2026-09-19, Problema 2) _prune_shadow():
+        Archivaba por antigüedad de archivo (`st_mtime`) apenas se
+        superaba MAX_SHADOW_PER_H=4, sin mirar cuánta evidencia
+        (n_evaluations) había acumulado cada shadow. Los horizontes
+        largos (H7-H10) tardan semanas en madurar las 30 evaluaciones
+        de MIN_EVALS_TO_COMPETE — el shadow era archivado antes de
+        alcanzar ese umbral, dejando a H3/H7/H8/H9/H10 sin evolucionar
+        desde 2026-07-07 (>2 meses). Mismo bug que ya se había
+        corregido en el archivo hermano de executors (arena.py::
+        _prune_shadow_genomes, fix AUD-D1, 2026-09-05) pero nunca se
+        portó aquí.
+        Fix: mismo patrón de elitismo — solo se archivan shadows que
+        AÚN NO llegan a MIN_EVALS_TO_COMPETE evaluaciones (leídas de
+        shadow/evals/{id}.json). Un shadow con evidencia suficiente
+        para competir ya no se archiva por antigüedad, aunque eso
+        signifique superar temporalmente el tope de MAX_SHADOW_PER_H.
 """
 
 import json
@@ -220,6 +254,28 @@ def _evaluate_shadow_hit_rates(horizon: int) -> List[Dict]:
 
 
 # ══════════════════════════════════════════════════════
+# [AR6] EVIDENCIA DE UN SHADOW — para elitismo en _prune_shadow
+# ══════════════════════════════════════════════════════
+
+def _load_shadow_n_evals(horizon: int, genome_filename: str) -> int:
+    """
+    [AR6] Lee n_evaluations desde shadow/evals/{mismo nombre de
+    archivo que el genoma}.json — misma fuente que usa
+    _evaluate_shadow_hit_rates()/_run_h_cycle() para decidir
+    elegibilidad de promoción. Retorna 0 si no existe el archivo de
+    evaluación (shadow recién creado, sin evidencia todavía).
+    """
+    eval_path = GENOME_BASE / f"H{horizon}" / "shadow" / "evals" / genome_filename
+    if not eval_path.exists():
+        return 0
+    try:
+        data = json.loads(eval_path.read_text())
+        return int(data.get("n_evaluations", 0) or 0)
+    except Exception:
+        return 0
+
+
+# ══════════════════════════════════════════════════════
 # ESCRIBIR CAMPEÓN AL REPO
 # ══════════════════════════════════════════════════════
 
@@ -346,25 +402,30 @@ def _run_h_cycle(
         if new_champion_data:
             new_champion = PredictorGenome.from_dict(new_champion_data)
 
-            # [AR3] El genoma recién promovido puede no tener
-            # evaluaciones REALES en producción todavía (n_evaluations
-            # heredado de la mutación, típicamente 0). Su hit_rate
-            # validado en shadow (best_shadow_hit) no debe presentarse
-            # como si fuera un resultado en vivo — se fuerza a None
-            # hasta que el evaluator real lo alimente con datos
-            # genuinos en un ciclo posterior.
-            inherited_n_evals = int(new_champion_data.get("n_evaluations", 0) or 0)
-            if inherited_n_evals == 0:
+            # [AR5][2026-09-19] El campo n_evaluations que SÍ importa es
+            # el de la evaluación real (best_shadow, viene de
+            # shadow/evals/{id}.json — mismo dato ya usado arriba para
+            # filtrar por MIN_EVALS_TO_COMPETE), NO el del archivo del
+            # genoma (new_champion_data), que predictor_mutator.py
+            # siempre inicializa en 0 al crear el hijo. Leer de la
+            # fuente equivocada hacía que TODO campeón promovido
+            # quedara con hit_rate=None, incluso los que sí tenían
+            # evidencia real suficiente (best_shadow_hit ya validado
+            # con shadow_n >= MIN_EVALS_TO_COMPETE más arriba).
+            real_n_evals = int(best_shadow.get("n_evaluations", 0) or 0)
+            if real_n_evals < MIN_EVALS_TO_COMPETE:
+                # No debería ocurrir (best_shadow ya pasó ese filtro
+                # arriba), pero se protege igual por si el archivo de
+                # evals cambió entre la selección y este punto.
                 logger.warning(
                     f"⚠️ H{horizon} nuevo campeón {new_champion.genome_id} promovido "
-                    f"con n_evaluations=0 (hit_rate shadow={best_shadow_hit:.2%} no "
-                    f"validado en producción) → hit_rate forzado a None hasta "
-                    f"evaluación real"
+                    f"con n_evaluations={real_n_evals} (< {MIN_EVALS_TO_COMPETE}) → "
+                    f"hit_rate forzado a None hasta evaluación real"
                 )
                 new_champion.hit_rate = None
             else:
                 new_champion.hit_rate = best_shadow_hit
-            new_champion.data["n_evaluations"] = inherited_n_evals
+            new_champion.data["n_evaluations"] = real_n_evals
 
             # [SW2] Preservar bias_score en el nuevo campeón
             if bias_score is not None:
@@ -376,7 +437,7 @@ def _run_h_cycle(
             logger.info(
                 f"🏆 H{horizon} NUEVO CAMPEÓN: {new_champion.genome_id} | "
                 f"hit_rate={new_champion.hit_rate if new_champion.hit_rate is not None else 'sin validar'} "
-                f"vs anterior={hit_rate:.2%}"
+                f"(n_evaluations={real_n_evals}) vs anterior={hit_rate:.2%}"
             )
     else:
         if not dry_run:
@@ -416,19 +477,54 @@ def _run_h_cycle(
 # ══════════════════════════════════════════════════════
 
 def _prune_shadow(horizon: int) -> None:
+    """
+    [AR6][2026-09-19] Elitismo: antes archivaba por antigüedad de
+    archivo apenas se superaba MAX_SHADOW_PER_H, sin mirar evidencia
+    acumulada — los horizontes largos (H7-H10) tardan semanas en
+    juntar las MIN_EVALS_TO_COMPETE evaluaciones necesarias para
+    competir, y el shadow era archivado antes de llegar a ese umbral.
+    Mismo bug ya corregido en arena.py::_prune_shadow_genomes
+    (executors, fix AUD-D1, 2026-09-05), portado aquí ahora.
+
+    Un shadow con evidencia suficiente (n_evaluations >=
+    MIN_EVALS_TO_COMPETE) YA NO se archiva por antigüedad — solo se
+    poda entre los que aún no llegan a ese umbral, empezando por el
+    más antiguo. Esto puede dejar temporalmente más de
+    MAX_SHADOW_PER_H genomas activos si varios ya tienen evidencia
+    suficiente — es intencional, protege candidatos con evidencia real
+    de ser destruidos antes de poder competir.
+    """
     shadow_dir = GENOME_BASE / f"H{horizon}" / "shadow"
     if not shadow_dir.exists():
         return
+
     files  = sorted(shadow_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
     excess = len(files) - MAX_SHADOW_PER_H
-    if excess > 0:
-        for f in files[:excess]:
-            try:
-                archive = shadow_dir / "archived" / f.name
-                archive.parent.mkdir(exist_ok=True)
-                f.rename(archive)
-            except Exception:
-                pass
+    if excess <= 0:
+        return
+
+    # [AR6] Solo los que AÚN NO tienen evidencia suficiente son
+    # candidatos a poda — ordenados por antigüedad (más viejo primero).
+    candidates = [
+        f for f in files
+        if _load_shadow_n_evals(horizon, f.name) < MIN_EVALS_TO_COMPETE
+    ]
+
+    to_archive = candidates[:excess]
+    for f in to_archive:
+        try:
+            archive = shadow_dir / "archived" / f.name
+            archive.parent.mkdir(exist_ok=True)
+            f.rename(archive)
+        except Exception:
+            pass
+
+    if len(to_archive) < excess:
+        logger.info(
+            f"🛡️ H{horizon} elitismo: {len(files) - len(to_archive)} genomas "
+            f"protegidos de poda (por encima del límite {MAX_SHADOW_PER_H}) — "
+            f"tienen evidencia suficiente para competir."
+        )
 
 
 # ══════════════════════════════════════════════════════
@@ -537,3 +633,4 @@ if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
     result  = run_predictor_evolution(dry_run=dry_run)
     print(json.dumps(result, indent=2, default=str))
+          
