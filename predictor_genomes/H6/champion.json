@@ -1,13 +1,15 @@
 {
-  "genome_id": "H6_v1",
+  "genome_id": "H6_v2_4",
   "horizon": 6,
-  "generation": 1,
-  "parent_ids": [],
+  "generation": 2,
+  "parent_ids": [
+    "H6_v1"
+  ],
   "fitness": null,
-  "hit_rate": 0.5005,
-  "bias_score": 0.5177,
-  "n_evaluations": 6609,
-  "created_at": "2026-07-07T16:52:27.546794+00:00",
+  "hit_rate": 0.4818,
+  "bias_score": 0.6291,
+  "n_evaluations": 8583,
+  "created_at": "2026-09-18T21:04:04.320076+00:00",
   "features": [
     "range",
     "rv_25",
@@ -27,5 +29,6 @@
     "period": "2y",
     "sample_weight_decay": 0.0
   },
-  "bias_score_updated_at": "2026-09-07T21:00:52.932878+00:00"
+  "bias_score_updated_at": "2026-09-22T21:06:27.967171+00:00",
+  "mutations": []
 }
