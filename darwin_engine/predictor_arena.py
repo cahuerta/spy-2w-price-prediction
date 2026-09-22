@@ -100,7 +100,9 @@ FIXES:
 
 import json
 import logging
+import math
 import os
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,6 +121,16 @@ from darwin_engine.predictor_genome import (
     BIAS_SCORE_THRESHOLD,
 )
 from darwin_engine.predictor_mutator import generate_children
+# [AR7][2026-09-21] NOTA: se evaluó agregar acá un candado compartido
+# con predictor_shadow_evaluator.py (LOCK_FILE) para coordinar el
+# acceso a champion.json durante el swap temporal que ese archivo
+# hacía. Se descartó: la solución de fondo fue eliminar el swap por
+# completo (ver load_active_genome(override_genome=...) en
+# predictor_genome.py y _run_shadow_batch() en
+# predictor_shadow_evaluator.py) — predictor_shadow_evaluator.py ya
+# no toca champion.json en ningún momento, así que no hay nada que
+# coordinar con un candado. Dos procesos que nunca escriben el mismo
+# archivo no pueden pisarse.
 
 logger = logging.getLogger("predictor_arena")
 
@@ -130,6 +142,10 @@ MIN_EVALS_TO_COMPETE = int(os.getenv("PRED_MIN_EVALS",    "30"))
 MIN_HIT_IMPROVEMENT  = float(os.getenv("PRED_MIN_IMPROVE", "0.015"))
 MAX_SHADOW_PER_H     = int(os.getenv("PRED_MAX_SHADOW",    "4"))
 GITHUB_ENABLED       = os.getenv("GITHUB_TOKEN") is not None
+
+# [AR8][2026-09-21] Umbral z para el test de significancia de dos
+# proporciones — z=1.645 equivale aprox. a p<0.05 a una cola.
+STAT_TEST_Z_THRESHOLD = float(os.getenv("PRED_STAT_TEST_Z", "1.645"))
 
 
 # ══════════════════════════════════════════════════════
@@ -254,6 +270,52 @@ def _evaluate_shadow_hit_rates(horizon: int) -> List[Dict]:
 
 
 # ══════════════════════════════════════════════════════
+# [AR8] TEST DE SIGNIFICANCIA — dos proporciones
+# ══════════════════════════════════════════════════════
+
+def _is_hit_rate_significantly_better(
+    champ_hit: float, champ_n: int,
+    shadow_hit: float, shadow_n: int,
+    z: float = STAT_TEST_Z_THRESHOLD,
+) -> bool:
+    """
+    [AR8][2026-09-21, auditoría Problema 1] ANTES: la promoción solo
+    exigía `shadow_hit - hit_rate >= MIN_HIT_IMPROVEMENT (0.015)` — un
+    delta absoluto sobre un hit_rate puntual, sin considerar el tamaño
+    de muestra de cada lado. Evidencia real de que esto ya causó daño:
+      - H1 (17-sep): promovido con hit_rate=0.6098 sobre apenas 41
+        evaluaciones — con n=41, el error estándar de una proporción
+        ~0.55 es de ~7.8 puntos porcentuales; un salto de ese tamaño
+        es indistinguible del ruido estadístico.
+      - H6 (18-sep): el campeón vigente (49.03% sobre 7.294 evals)
+        fue reemplazado por un shadow con 46.77% sobre 881 evals —
+        objetivamente PEOR (ver también [AR7] — probable condición de
+        carrera con el swap de predictor_shadow_evaluator.py).
+    A diferencia de arena.py (executors), acá NO existen los retornos
+    individuales de cada evaluación — solo el hit_rate agregado y el
+    conteo (n_evaluations). Con esos dos números el bootstrap de
+    arena.py no aplica; la herramienta correcta para "¿esta diferencia
+    de proporciones es real o es ruido?" es un test de dos
+    proporciones (aproximación normal), el mismo principio, adaptado
+    al tipo de dato disponible.
+
+    Retorna True solo si la mejora es estadísticamente significativa
+    (z >= STAT_TEST_Z_THRESHOLD, ~p<0.05 a una cola) Y ambos lados
+    tienen al menos MIN_EVALS_TO_COMPETE muestras.
+    """
+    if champ_n < MIN_EVALS_TO_COMPETE or shadow_n < MIN_EVALS_TO_COMPETE:
+        return False
+
+    p_pool = (champ_hit * champ_n + shadow_hit * shadow_n) / (champ_n + shadow_n)
+    se     = math.sqrt(p_pool * (1 - p_pool) * (1 / champ_n + 1 / shadow_n))
+
+    if se == 0:
+        return False
+
+    return (shadow_hit - champ_hit) / se >= z
+
+
+# ══════════════════════════════════════════════════════
 # [AR6] EVIDENCIA DE UN SHADOW — para elitismo en _prune_shadow
 # ══════════════════════════════════════════════════════
 
@@ -373,6 +435,7 @@ def _run_h_cycle(
     shadow_evals    = _evaluate_shadow_hit_rates(horizon)
     best_shadow     = None
     best_shadow_hit = 0.0
+    best_shadow_n   = 0
 
     for se in shadow_evals:
         shadow_hit = float(se.get("hit_rate", 0))
@@ -382,12 +445,30 @@ def _run_h_cycle(
         if shadow_hit > best_shadow_hit:
             best_shadow_hit = shadow_hit
             best_shadow     = se
+            best_shadow_n   = shadow_n
 
-    if (
+    # [AR8][2026-09-21] ANTES: solo `best_shadow_hit - hit_rate >=
+    # MIN_HIT_IMPROVEMENT` — un delta absoluto sin considerar tamaño
+    # de muestra, que ya promovió al menos un campeón peor (H6,
+    # 18-sep) y otro basado en ruido puro (H1, 17-sep, n=41). Ahora
+    # exige además significancia estadística real vía
+    # _is_hit_rate_significantly_better() (ver docstring de esa
+    # función para la evidencia completa).
+    is_promotable = (
         best_shadow is not None
         and best_shadow_hit - hit_rate >= MIN_HIT_IMPROVEMENT
-        and not dry_run
-    ):
+        and _is_hit_rate_significantly_better(hit_rate, n_evals, best_shadow_hit, best_shadow_n)
+    )
+
+    if not is_promotable and best_shadow is not None and best_shadow_hit - hit_rate >= MIN_HIT_IMPROVEMENT:
+        logger.info(
+            f"⏳ H{horizon}: {best_shadow.get('genome_id')} tiene mejor hit_rate "
+            f"({best_shadow_hit:.2%} vs {hit_rate:.2%}) pero no alcanzó significancia "
+            f"estadística (z>={STAT_TEST_Z_THRESHOLD}, n_champ={n_evals}, "
+            f"n_shadow={best_shadow_n}) → no se promueve"
+        )
+
+    if is_promotable and not dry_run:
         # Promover shadow a campeón
         new_champion_data = None
         for path in (GENOME_BASE / f"H{horizon}" / "shadow").glob("*.json"):
@@ -633,4 +714,4 @@ if __name__ == "__main__":
     dry_run = "--dry-run" in sys.argv
     result  = run_predictor_evolution(dry_run=dry_run)
     print(json.dumps(result, indent=2, default=str))
-          
+                                  
