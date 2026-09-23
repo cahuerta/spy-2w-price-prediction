@@ -128,7 +128,16 @@ def run_models_for_tickers(tickers: list[str]) -> dict:
     # [MR4] Conteo separado para visibilidad real en logs
     ok, failed, skipped = 0, 0, 0
 
-    for t in tickers:
+    # [MEMDIAG][2026-09-22] Muestreo real de RSS cada N tickers dentro
+    # del lote — antes solo medíamos el lote completo (inicio/fin desde
+    # pipeline_router.py); esto ubica en QUÉ ticker exacto empieza a
+    # subir, si es que sube dentro de un mismo lote (los lotes ya son
+    # chicos por [F15], pero esto confirma si hace falta achicarlos más).
+    from mem_diag import log_mem
+    MEM_SAMPLE_EVERY = int(os.getenv("MEM_SAMPLE_EVERY_N_TICKERS", "10"))
+    log_mem(f"model_runner ticker 0/{len(tickers)} — antes de empezar")
+
+    for i, t in enumerate(tickers):
         try:
             result = run_model_for_ticker(t)
 
@@ -149,6 +158,11 @@ def run_models_for_tickers(tickers: list[str]) -> dict:
             # Los módulos de predictores quedan cacheados en importlib (correcto)
             # pero los datos de entrenamiento (DataFrames, modelos sklearn) se liberan
             gc.collect()
+
+        if (i + 1) % MEM_SAMPLE_EVERY == 0:
+            log_mem(f"model_runner ticker {i + 1}/{len(tickers)} ({t})")
+
+    log_mem(f"model_runner ticker {len(tickers)}/{len(tickers)} — lote completo")
 
     logger.info(
         f"🏁 LOTE FINALIZADO | OK={ok} | FAIL={failed} | SKIP={skipped}"
