@@ -73,9 +73,15 @@ def is_structural_candidate(x: Dict[str, Any]) -> bool:
     """
     Filtro estructural más exigente.
     Reduce ruido y evita MODERATE / NOISE.
+
+    [AUD-SC1][2026-09-23] ANTES: `!= "✅ STRONG"` rechazaba TODO lo que
+    no fuera exactamente esa etiqueta — incluyendo "🚀 INSTITUTIONAL"
+    (screener_engine.py: score >= 0.85, categoría MEJOR que STRONG,
+    que empieza en 0.72). El sistema descartaba sus propios mejores
+    candidatos antes de que llegaran a evaluarse para trading.
     """
 
-    if x.get("quality") != "✅ STRONG":
+    if x.get("quality") not in ("✅ STRONG", "🚀 INSTITUTIONAL"):
         return False
 
     if x.get("score", 0) < 0.72:
@@ -200,3 +206,4 @@ def run_screener() -> Dict[str, Any]:
 if __name__ == "__main__":
     result = run_screener()
     print(json.dumps(result, indent=2))
+        
