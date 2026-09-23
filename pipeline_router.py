@@ -149,17 +149,29 @@ def _mp_run_screener(result_path: str):
     evaluator y alpha_engine [F12]. Escribe su resultado a un JSON
     temporal, ya que run_screener_async() es async y retorna un
     objeto (no escribe a disco por su cuenta como los otros pasos).
+
+    [MEMDIAG][2026-09-22] Mide RSS real antes/después — en vez de
+    seguir adivinando por lectura de código cuál paso sube memoria.
     """
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem("screener — inicio")
     import asyncio
     from screener import run_screener_async
     result = asyncio.run(run_screener_async())
     Path(result_path).write_text(json.dumps(result))
+    log_mem_delta("screener — fin", rss0)
 
 
 def _mp_run_model_runner_batch(tickers: list):
-    """[F15] Corre un LOTE de tickers, no el universo completo."""
+    """[F15] Corre un LOTE de tickers, no el universo completo.
+    [MEMDIAG] Mide RSS real antes/después de cada lote."""
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem(f"model_runner lote ({len(tickers)} tickers) — inicio")
     from model_runner import run_models_for_tickers
     run_models_for_tickers(tickers)
+    log_mem_delta(f"model_runner lote ({len(tickers)} tickers) — fin", rss0)
 
 
 def _batched(items: list, batch_size: int):
@@ -168,13 +180,23 @@ def _batched(items: list, batch_size: int):
 
 
 def _mp_run_evaluator():
+    """[MEMDIAG] Mide RSS real antes/después."""
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem("evaluator — inicio")
     from evaluator import evaluate_all
     evaluate_all()
+    log_mem_delta("evaluator — fin", rss0)
 
 
 def _mp_run_alpha_engine(tickers: list):
+    """[MEMDIAG] Mide RSS real antes/después."""
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem(f"alpha_engine ({len(tickers)} tickers) — inicio")
     from alpha_engine_v4 import compute_and_persist_alpha
     compute_and_persist_alpha(tickers)
+    log_mem_delta(f"alpha_engine ({len(tickers)} tickers) — fin", rss0)
 
 
 # Contexto "spawn": el proceso hijo arranca limpio, sin heredar
@@ -586,5 +608,4 @@ async def run_pipeline(request: Request):
     return {
         "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
-        }
-    
+    }
