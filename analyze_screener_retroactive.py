@@ -66,6 +66,22 @@ def _load_universe() -> list:
     return json.loads(path.read_text())
 
 
+def _normalize_tz(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    [FIX][2026-09-23] get_price_history() devuelve índice con zona
+    horaria (datetime64[ms, UTC]) — comparar eso contra un
+    pd.Timestamp sin zona horaria (como today/cutoff, calculados con
+    datetime.utcnow().date()) lanza:
+    'TypeError: Invalid comparison between dtype=datetime64[ms, UTC]
+    and Timestamp'. Se le quita la zona horaria una sola vez, apenas
+    se trae el DataFrame, para que todas las comparaciones de fecha
+    de este script sean consistentes.
+    """
+    if df is not None and len(df) > 0 and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
 def _closes_volumes_as_of(df: pd.DataFrame, cutoff: pd.Timestamp):
     """Recorta el DataFrame a solo datos <= cutoff — sin fuga de información."""
     past = df[df.index <= cutoff]
@@ -87,6 +103,7 @@ def analyze():
 
     # Benchmark: retorno de SPY en el mismo período, para tener con qué comparar
     spy_df = get_price_history("SPY", period="1y", interval="1d")
+    spy_df = _normalize_tz(spy_df)
     spy_return = None
     if spy_df is not None and len(spy_df) > 0:
         spy_past = spy_df[spy_df.index <= cutoff]
@@ -107,6 +124,7 @@ def analyze():
                 skipped_no_data += 1
                 continue
 
+            df = _normalize_tz(df)
             df = df.sort_index()
 
             closes_then, volumes_then = _closes_volumes_as_of(df, cutoff)
@@ -178,4 +196,4 @@ def analyze():
 
 if __name__ == "__main__":
     analyze()
-          
+    
