@@ -274,20 +274,32 @@ def _mp_run_adjust_sizing_after_closes(
     positions: list, close_tickers_list: list, anchor_opens: list,
     fixed_capital: float, result_path: str,
 ) -> None:
+    """[MEMDIAG][2026-09-22] Mide RSS real antes/después — este es el
+    candidato de mayor volumen (yf.download período=1y por posición
+    + benchmark, matriz de covarianza)."""
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem(f"capital_governor adjust_sizing_after_closes ({len(positions)} posiciones) — inicio")
     from capital_governor import CapitalGovernor
     gov    = CapitalGovernor(fixed_capital=fixed_capital)
     result = gov.adjust_sizing_after_closes(positions, close_tickers_list, anchor_opens)
     Path(result_path).write_text(json.dumps(result, default=str))
+    log_mem_delta("capital_governor adjust_sizing_after_closes — fin", rss0)
 
 
 def _mp_run_adjust_sizing(
     positions: list, normal_opens: list,
     fixed_capital: float, result_path: str,
 ) -> None:
+    """[MEMDIAG][2026-09-22] Mide RSS real antes/después."""
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem(f"capital_governor adjust_sizing ({len(positions)} posiciones) — inicio")
     from capital_governor import CapitalGovernor
     gov    = CapitalGovernor(fixed_capital=fixed_capital)
     result = gov.adjust_sizing(positions, normal_opens)
     Path(result_path).write_text(json.dumps(result, default=str))
+    log_mem_delta("capital_governor adjust_sizing — fin", rss0)
 
 
 async def _run_capital_governor_subprocess(
