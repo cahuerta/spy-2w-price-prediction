@@ -76,7 +76,15 @@ logging.basicConfig(level=logging.INFO)
 
 DATA_PATH     = Path(os.getenv("DATA_PATH", "/data"))
 ALPHA_FILE    = DATA_PATH / "alpha_last.json"
-ANCHOR_FILE   = Path(os.getenv("ANCHOR_FILE", "/opt/render/project/src/anchor_universe.json"))
+# [AUD-P12][2026-09-23] ANTES: ruta fija "/opt/render/project/src/..."
+# — la ruta característica del entorno NATIVO de Render (sin Docker).
+# Este servicio corre en Docker (WORKDIR /app, confirmado en Settings
+# → Environment), donde esa ruta nunca existió — por eso
+# anchor_universe.json (que sí está en el repo) nunca se cargaba acá,
+# aunque main.py y pm_defensive.py sí lo encontraban bien (ambos usan
+# Path(__file__).resolve().parent, relativo al propio archivo, no una
+# ruta pegada a mano). Mismo patrón seguro que esos dos.
+ANCHOR_FILE   = Path(os.getenv("ANCHOR_FILE", str(Path(__file__).resolve().parent / "anchor_universe.json")))
 CHAMPION_FILE = DATA_PATH / "darwin" / "champion.json"
 
 # [CB1] Archivo SOD (Start-Of-Day equity)
