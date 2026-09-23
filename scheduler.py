@@ -165,18 +165,28 @@ _mp_ctx = multiprocessing.get_context("spawn")
 # ══════════════════════════════════════════════════════
 
 def _mp_darwin_evolution():
+    """[MEMDIAG] Mide RSS real antes/después."""
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem("darwin_evolution — inicio")
     from darwin_engine.arena import run_evolution_cycle
     from darwin_engine.predictor_arena import run_predictor_evolution
     run_evolution_cycle()
     run_predictor_evolution()
+    log_mem_delta("darwin_evolution — fin", rss0)
 
 
 def _mp_shadow_evaluator():
+    """[MEMDIAG] Mide RSS real antes/después."""
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0 = log_mem("shadow_evaluator — inicio")
     from darwin_engine.predictor_shadow_evaluator import run_shadow_evolution_cycle
     from darwin_engine.arena import _load_all_active_genomes, _run_shadow_evaluation
     run_shadow_evolution_cycle()
     _, shadow = _load_all_active_genomes()
     _run_shadow_evaluation(shadow)
+    log_mem_delta("shadow_evaluator — fin", rss0)
 
 
 def _mp_monitor_worker(result_path: str):
@@ -186,7 +196,12 @@ def _mp_monitor_worker(result_path: str):
     tickers cerrar (para disparar el cierre defensivo por HTTP), el
     resultado se escribe a un JSON temporal en vez de perderse al
     terminar el proceso hijo.
+
+    [MEMDIAG][2026-09-22] Mide RSS real antes/después.
     """
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0   = log_mem("monitor — inicio")
     result = {"cerrar": [], "trailing": [], "mantener": [], "n_posiciones": 0}
 
     try:
@@ -219,6 +234,7 @@ def _mp_monitor_worker(result_path: str):
         result["error"] = str(e)
 
     Path(result_path).write_text(json.dumps(result))
+    log_mem_delta("monitor — fin", rss0)
 
 
 def _mp_darwin_resolve_worker(result_path: str):
@@ -235,7 +251,12 @@ def _mp_darwin_resolve_worker(result_path: str):
     El resultado (lista de trades resueltos) se escribe a un JSON
     temporal porque el proceso padre lo necesita para loguear el
     detalle de los primeros 5 — mismo patrón que _mp_monitor_worker.
+
+    [MEMDIAG][2026-09-22] Mide RSS real antes/después.
     """
+    from mem_diag import log_mem, log_mem_delta, quiet_logs
+    quiet_logs()
+    rss0   = log_mem("darwin_resolve — inicio")
     result = {"resolved": [], "error": None}
     try:
         from darwin_engine.trade_tracker import resolve_pending_trades
@@ -245,6 +266,7 @@ def _mp_darwin_resolve_worker(result_path: str):
         result["error"] = str(e)
 
     Path(result_path).write_text(json.dumps(result, default=str))
+    log_mem_delta("darwin_resolve — fin", rss0)
 
 
 def _run_in_subprocess_sync(target, step_name: str, args: tuple = (), timeout_sec: int = DARWIN_SUBPROCESS_TIMEOUT_SEC) -> bool:
