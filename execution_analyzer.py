@@ -67,7 +67,13 @@ async def get_effective_hit_rate(days: int = 14):
         if eval_date < cut_date:
             continue
 
-        ticker = data.get("ticker", "").upper()
+        # [AUD-SC2][2026-09-23] ANTES: data.get("ticker", "") — los
+        # archivos de evaluación reales no tienen "ticker" en el nivel
+        # superior, vive anidado en data["meta"]["ticker"]. Esto
+        # siempre leía "" → was_executed nunca podía dar True → el
+        # endpoint reportaba un hit rate efectivo roto desde su
+        # creación (0% de coincidencias posibles).
+        ticker = str((data.get("meta") or {}).get("ticker", "")).upper()
         pred_ret = float(data.get("predicted_return_pct", 0))
         real_ret = float(data.get("real_return_pct", 0))
 
