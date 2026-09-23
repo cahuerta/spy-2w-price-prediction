@@ -53,4 +53,12 @@ COPY . .
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+# [DOCKER-FIX][2026-09-22] ANTES: sin --log-level, uvicorn usaba su
+# nivel por defecto (info) — cada request HTTP (dashboard, polling)
+# generaba una línea "GET ... 200 OK" en el log. main.py define
+# log_level="error" en su bloque `if __name__ == "__main__":`, pero
+# ese bloque NUNCA se ejecuta acá: este CMD llama a uvicorn
+# directo por línea de comandos, sin pasar por ese código — el
+# log_level="error" de main.py era código muerto en producción.
+# Fix: pasar --log-level warning directo al comando real de arranque.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --log-level warning"]
