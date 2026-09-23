@@ -13,6 +13,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
 from sklearn.decomposition import PCA
 
+from predictors_engine.calibration_utils import select_alpha_ridge_cv
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -113,7 +115,7 @@ def run_predictor_h9(ticker: str, override_genome=None):
     raw = get_price_history(ticker=ticker, period="2y", interval="1d")
 
     # ── DARWIN: cargar genoma activo ──────────────────
-    _alpha    = ALPHA_H9
+    _alpha_from_genome = None  # [AUD-P11] antes: _alpha = ALPHA_H9 (fijo, nunca recalibrado)
     _max_pca  = MAX_PCA_COMPONENTS
     _clip_ret = CLIP_RET
     _decay    = 0.0               # [SW1] default neutro — sin cambio de comportamiento
@@ -122,7 +124,7 @@ def run_predictor_h9(ticker: str, override_genome=None):
     if DARWIN_PREDICTOR:
         try:
             genome    = load_active_genome(HORIZON, override_genome=override_genome)
-            _alpha    = genome.model_params.get("alpha_ridge",         ALPHA_H9)
+            _alpha_from_genome = genome.model_params.get("alpha_ridge")  # None si Darwin no lo definió
             _max_pca  = genome.model_params.get("max_pca",             MAX_PCA_COMPONENTS)
             _clip_ret = genome.model_params.get("clip_ret",            CLIP_RET)
             _decay    = genome.model_params.get("sample_weight_decay", 0.0)  # [SW1]
@@ -169,6 +171,15 @@ def run_predictor_h9(ticker: str, override_genome=None):
 
     n_samples, n_features = X.shape
     dynamic_pca = max(1, min(_max_pca, n_features, n_samples - 1))
+
+    # [AUD-P11][2026-09-23] Si Darwin ya evolucionó un alpha propio
+    # para este horizonte, se respeta. Si no, se calibra por ticker
+    # vía RidgeCV (walk-forward) en vez de usar ALPHA_H9 fijo —
+    # mismo patrón ya usado en H1/H2, extraído a calibration_utils.py.
+    if _alpha_from_genome is not None:
+        _alpha = float(_alpha_from_genome)
+    else:
+        _alpha = select_alpha_ridge_cv(X, y, dynamic_pca, fallback_alpha=ALPHA_H9)
 
     model = Pipeline([
         ("scaler", StandardScaler()),
