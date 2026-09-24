@@ -371,8 +371,25 @@ def _is_significantly_better(
       None  → muestra insuficiente de un lado — el llamador debe usar
               el criterio de respaldo (delta absoluto).
     """
-    champ_returns = _extract_returns(get_resolved_trades(executor_genome_id=champion_genome_id))
-    cand_returns  = _extract_returns(get_shadow_resolved_trades(candidate_genome_id))
+    # [AUD-P4][2026-09-24] ANTES: get_resolved_trades()/get_shadow_
+    # resolved_trades() se llamaban SIN especificar last_n → usaban
+    # el default de 200 (trade_tracker.py/executor_shadow_evaluator.py),
+    # sin importar que un shadow ya tuviera 528 u 856 trades reales
+    # acumulados. Con esa muestra truncada y el ruido real observado
+    # (std ~4-6% por trade), la diferencia de fitness nunca alcanzaba
+    # significancia aunque fuera consistentemente mayor — 0
+    # promociones en 41 evaluaciones desde abril, pese a candidatos
+    # con fitness 50-66% superior sostenido en el tiempo.
+    # Fix: usar TODO el historial acumulado. A diferencia del período
+    # de entrenamiento de un predictor (donde mezclar décadas mezcla
+    # regímenes de mercado distintos), acá el genoma NO cambia una vez
+    # creado — más trades del mismo genoma_id son solo más evidencia
+    # válida del mismo comportamiento, nunca datos contaminados de un
+    # "modelo distinto". Se mantiene p<0.10 sin relajar el rigor
+    # estadístico — el problema nunca fue el umbral, era la muestra.
+    HIST_COMPLETO = 100_000  # en la práctica, "todo lo que exista"
+    champ_returns = _extract_returns(get_resolved_trades(executor_genome_id=champion_genome_id, last_n=HIST_COMPLETO))
+    cand_returns  = _extract_returns(get_shadow_resolved_trades(candidate_genome_id, last_n=HIST_COMPLETO))
 
     if len(champ_returns) < STAT_TEST_MIN_SAMPLES or len(cand_returns) < STAT_TEST_MIN_SAMPLES:
         return None
