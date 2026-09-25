@@ -6,9 +6,9 @@
     "H2_v3_4"
   ],
   "fitness": null,
-  "hit_rate": 0.5058,
-  "bias_score": 0.6226,
-  "n_evaluations": 8915,
+  "hit_rate": 0.511,
+  "bias_score": 0.6234,
+  "n_evaluations": 9260,
   "created_at": "2026-07-31T22:00:24.956652+00:00",
   "features": [
     "range",
@@ -31,7 +31,7 @@
     "period": "1y",
     "sample_weight_decay": 0.0
   },
-  "bias_score_updated_at": "2026-09-24T21:04:29.145169+00:00",
+  "bias_score_updated_at": "2026-09-25T21:04:42.266851+00:00",
   "mutations": [
     "REM:rsi_9",
     "REP:ret_lag_1→rsi_9"
