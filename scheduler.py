@@ -14,14 +14,12 @@
 #   - Darwin Engine: ciclo evolutivo DIARIO post-market (18:00 Chile) [v2.3]
 #   - Darwin Engine: shadow evaluator nocturno diario (23:00 Chile) —
 #     ahora incluye executor shadows, no solo predictor shadows [v2.3]
-#   - Code Auditor Agent: auditoría de código diaria (01:00 Chile)
 #
 # Horario mercado US en hora Chile (verano UTC-3):
 #   Apertura  09:30 ET = 10:30 Chile
 #   Cierre    16:00 ET = 17:00 Chile
 #
 # EJECUCIONES DIARIAS:
-#   01:00 → Code Auditor Agent — auditoría completa del repo
 #   11:00 → Macro Factors — oro/petróleo/DXY/VIX/etc, antes de la
 #           apertura, para que el régimen del día ya tenga los datos [v2.5]
 #   11:30 → APERTURA  — predicción + alpha + trading (abre Y cierra)
@@ -37,10 +35,10 @@
 #   23:00 → Darwin shadow evaluator — predictor Y executor desde v2.3
 #           (antes: solo predictor)
 #
-# v2.2 — Agregado Code Auditor Agent:
-#   - Corre a las 01:00 Chile, todos los días
-#   - Lee repo completo de GitHub y detecta incoherencias
-#   - Guarda reporte en /data/audits/
+# v2.2 — Agregado Code Auditor Agent (retirado en v2.8, ver abajo):
+#   - Corría a las 01:00 Chile, todos los días
+#   - Leía repo completo de GitHub y detectaba incoherencias
+#   - Guardaba reporte en /data/audits/
 #
 # v2.3 — FIX [AUD-D2-cableado] (auditoría 2026-08-25, Problema 3):
 #   El sistema de shadow-trading del executor (executor_shadow_evaluator.py,
@@ -97,6 +95,11 @@
 #          pipeline_router.py corren en el mismo proceso de Python,
 #          esto es una simple lectura de atributo de módulo, sin
 #          necesidad de archivos ni IPC adicional.
+#
+# v2.8 — (2026-09-26) Retirado Code Auditor Agent.
+#   Ya no es necesario: eliminados _trigger_code_auditor, sus
+#   constantes HORA_AUDITOR/MIN_AUDITOR y el disparo diario 01:00
+#   del loop principal. agents/code_auditor_agent.py fue borrado.
 # =========================================================
 
 import os
@@ -136,10 +139,6 @@ MONITOR_HORA_FIN    = int(os.getenv("MONITOR_HORA_FIN",    "15"))
 # v2.1 — Shadow evaluator nocturno
 HORA_SHADOW_EVAL = int(os.getenv("SHADOW_EVAL_HOUR", "23"))
 MIN_SHADOW_EVAL  = int(os.getenv("SHADOW_EVAL_MIN",  "0"))
-
-# v2.2 — Code Auditor Agent
-HORA_AUDITOR = int(os.getenv("AUDITOR_HOUR", "1"))
-MIN_AUDITOR  = int(os.getenv("AUDITOR_MIN",  "0"))
 
 # [v2.5] Macro Factors — datos macro (oro, petróleo, DXY, VIX, etc.)
 # No cambian intradía de forma relevante, así que corre una vez al
@@ -506,7 +505,7 @@ def _trigger_shadow_evaluator(motivo: str):
 
 
 # ══════════════════════════════════════════════════════
-# CODE AUDITOR AGENT (v2.2)
+# MACRO FACTORS
 # ══════════════════════════════════════════════════════
 
 def _trigger_macro_factors(motivo: str):
@@ -529,31 +528,6 @@ def _trigger_macro_factors(motivo: str):
         print(f"⚠️ Macro Factors falló (continuando igual): {e}")
 
 
-def _trigger_code_auditor(motivo: str):
-    """
-    v2.2 — Ejecuta el agente auditor de código.
-    Lee el repo completo de GitHub y detecta incoherencias.
-    Guarda reporte en /data/audits/.
-    """
-    print(f"🔍 Code Auditor Agent [{motivo}]")
-    try:
-        result = subprocess.run(
-            ["python", "agents/code_auditor_agent.py"],
-            timeout=3600,  # 1 hora máximo
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            print(f"✅ Code Auditor completado")
-            print(result.stdout[-500:])  # últimas 500 chars del output
-        else:
-            print(f"❌ Code Auditor error: {result.stderr[:300]}")
-    except subprocess.TimeoutExpired:
-        print("❌ Code Auditor timeout (1 hora)")
-    except Exception as e:
-        print(f"❌ Code Auditor excepción: {e}")
-
-
 # ══════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════
@@ -573,7 +547,6 @@ def _en_horario_monitor(ahora: datetime) -> bool:
 def _loop():
     print(
         f"🕐 Quant Scheduler iniciado\n"
-        f"   🔍 AUDITOR:  {HORA_AUDITOR:02d}:{MIN_AUDITOR:02d} Chile (diario)\n"
         f"   🌍 MACRO:    {HORA_MACRO_FACTORS:02d}:{MIN_MACRO_FACTORS:02d} Chile (diario)\n"
         f"   🟢 APERTURA: {HORA_APERTURA:02d}:{MIN_APERTURA:02d} Chile\n"
         f"   🔴 CIERRE:   {HORA_CIERRE:02d}:{MIN_CIERRE:02d} Chile\n"
@@ -589,21 +562,11 @@ def _loop():
     darwin_resolve_hoy:   str | None = None
     darwin_evolution_hoy: str | None = None
     shadow_eval_hoy:      str | None = None
-    auditor_hoy:          str | None = None
     macro_factors_hoy:    str | None = None
 
     while True:
         ahora     = datetime.now(CHILE_TZ)
         fecha_hoy = ahora.strftime("%Y-%m-%d")
-
-        # ── 🔍 Code Auditor: 01:00 diario ─────────────────
-        if (
-            ahora.hour      == HORA_AUDITOR
-            and MIN_AUDITOR <= ahora.minute < MIN_AUDITOR + 10
-            and auditor_hoy != fecha_hoy
-        ):
-            _trigger_code_auditor("diario_01:00")
-            auditor_hoy = fecha_hoy
 
         # ── 🌍 MACRO FACTORS: 11:00 — antes de la apertura ────
         if (
