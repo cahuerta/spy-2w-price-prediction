@@ -316,15 +316,16 @@ def _weighted_price_curve(
     horizons = np.array([r["horizon"] for r in filtered])
     prices   = np.array([r["price_pred"] for r in filtered])
 
-    if weights:
-        w_array = np.array([
-            weights.get(f"H{r['horizon']}", 1.0 / len(filtered))
-            for r in filtered
-        ])
-        w_array         = w_array / w_array.sum()
-        weighted_prices = prices * w_array * len(filtered)
-    else:
-        weighted_prices = prices
+    # [FIX CURVE-W][2026-09-26] ANTES: weighted_prices = prices * w * n.
+    # Eso NO pondera nada: multiplica el PRECIO de cada horizonte por su
+    # peso relativo (0.95-1.04 con los hit rates reales) → sesgos de
+    # -5%..+4% sobre predicciones que son del orden de ±0.5%. La curva
+    # (y el pred_return H1-H9 que mide el evaluator y Darwin) quedaba
+    # dominada por el peso, no por el modelo. Cada punto de la curva es
+    # la predicción de UN horizonte: no hay nada que promediar, así que
+    # se usan los precios tal cual. `weights` se mantiene en la firma y
+    # se sigue guardando en el JSON (horizon_weights) como diagnóstico.
+    weighted_prices = prices
 
     full_h       = np.arange(1, 10)
     interpolated = np.interp(full_h, horizons, weighted_prices)

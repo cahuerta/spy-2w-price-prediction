@@ -126,7 +126,7 @@ def _select_alpha_ridge_cv(X: np.ndarray, y: np.ndarray, n_pca: int) -> float:
         X_pca      = pca_tmp.fit_transform(X_scaled)
 
         n_splits = min(5, max(2, n_samples // 30))
-        tscv     = TimeSeriesSplit(n_splits=n_splits)
+        tscv     = TimeSeriesSplit(n_splits=n_splits, gap=HORIZON)  # [CAL-GAP] sin solape target/test
 
         ridge_cv = RidgeCV(alphas=ALPHA_GRID_H2, cv=tscv)
         ridge_cv.fit(X_pca, y)

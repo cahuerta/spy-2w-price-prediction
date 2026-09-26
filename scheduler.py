@@ -558,8 +558,48 @@ def _trigger_code_auditor(motivo: str):
 # HELPERS
 # ══════════════════════════════════════════════════════
 
+NY_TZ = pytz.timezone("America/New_York")
+
+# [S3] Cache {fecha: bool} del calendario de Alpaca (feriados NYSE).
+_calendario_cache: dict = {}
+
+
 def _es_dia_habil(ahora: datetime) -> bool:
-    return ahora.weekday() < 5
+    """
+    [S3][2026-09-26] ANTES: solo weekday() < 5 → el pipeline abría y
+    cerraba posiciones en feriados de EE.UU. (Thanksgiving, 4 de julio,
+    Navidad, etc.) con el mercado cerrado. Ahora se consulta el
+    calendario de Alpaca una vez por día; si la consulta falla se usa
+    el criterio anterior (lunes a viernes).
+    """
+    if ahora.weekday() >= 5:
+        return False
+    fecha = ahora.astimezone(NY_TZ).date()
+    if fecha in _calendario_cache:
+        return _calendario_cache[fecha]
+    try:
+        from alpaca.trading.requests import GetCalendarRequest
+        from broker import get_engine
+        dias = get_engine().client.get_calendar(GetCalendarRequest(start=fecha, end=fecha))
+        abierto = any(getattr(d, "date", None) == fecha for d in (dias or []))
+        _calendario_cache[fecha] = abierto
+        if not abierto:
+            print(f"📅 {fecha} feriado NYSE — scheduler no opera hoy")
+        return abierto
+    except Exception as e:
+        print(f"⚠️ Calendario Alpaca no disponible ({e}) — se asume día hábil")
+        return True
+
+
+def _mercado_us_cerrado_hoy(ahora: datetime) -> bool:
+    """
+    [S4] True si en Nueva York ya pasaron las 16:05 (cierre NYSE + margen).
+    Chile y EE.UU. cambian de horario en fechas distintas: entre
+    noviembre y marzo las 17:05 de Chile son las 15:05 en NY, con el
+    mercado todavía abierto.
+    """
+    ny = ahora.astimezone(NY_TZ)
+    return (ny.hour, ny.minute) >= (16, 5)
 
 
 def _en_horario_monitor(ahora: datetime) -> bool:
@@ -654,10 +694,13 @@ def _loop():
             monitor_ultima_hora = ahora.hour
 
         # ── 🧬 Darwin: resolver trades 17:05 ──────────────
+        # [S4] Ancla: 17:05 Chile, pero nunca antes del cierre real de NY.
+        # La ventana ya no es de 10 min: corre en la primera vuelta del
+        # loop que cumpla ambas condiciones (antes de las 18:00 evolución).
         if (
             _es_dia_habil(ahora)
-            and ahora.hour == 17
-            and 5 <= ahora.minute < 15
+            and (ahora.hour, ahora.minute) >= (17, 5)
+            and _mercado_us_cerrado_hoy(ahora)
             and darwin_resolve_hoy != fecha_hoy
         ):
             _trigger_darwin_resolve("post_market_17:05")
@@ -668,10 +711,13 @@ def _loop():
         # semanal demoró demasiado en reemplazar al campeón (fitness
         # real negativo desde el 24-abr) — se prueba con cadencia
         # diaria en todos los días hábiles.
+        # [S4] Además exige que la resolución de hoy ya haya corrido: entre
+        # noviembre y marzo la resolución se corre a ~18:05 Chile (16:05
+        # NY) y la evolución no debe adelantarse con datos del día previo.
         if (
             _es_dia_habil(ahora)
-            and ahora.hour   == 18
-            and ahora.minute < 10
+            and (ahora.hour, ahora.minute) >= (18, 0)
+            and darwin_resolve_hoy == fecha_hoy
             and darwin_evolution_hoy != fecha_hoy
         ):
             _trigger_darwin_evolution(f"diario_18:00")

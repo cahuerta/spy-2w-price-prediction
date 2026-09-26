@@ -193,55 +193,95 @@ def _record_tracking_failure(kind: str, ticker: str, error: str) -> None:
         logger.error(f"❌ No se pudo persistir tracking failure ({kind}/{ticker}): {e}")
 
 
-def _reconcile_broker_vs_darwin(broker_tickers: set) -> None:
+def _reconcile_broker_vs_darwin(broker_tickers: set, broker=None) -> None:
     """
-    [AUD-P1] Reconciliación diaria: compara los tickers con posición real
-    en el broker (hoy) contra los tickers que aparecen en los trades
-    abiertos registrados por Darwin hoy (darwin/trades/*.json).
+    [AUD-P1] Reconciliación broker ↔ Darwin (darwin/trades/*.json).
 
-    Chequeo informativo — no bloquea el ciclo ni actúa como circuit
-    breaker. Su único objetivo es hacer visible, vía logger.error, la
-    divergencia entre "lo que el broker realmente sostiene" y "lo que
-    Darwin cree que sostiene", que es la causa raíz sospechada del
-    Problema 1 de la auditoría (P&L de Darwin positivo mientras la
-    cuenta real cae).
+    [AUD-P1b][2026-09-26] ANTES: leía los campos "opened_at"/"closed_at",
+    que register_open() nunca escribe (usa entry_timestamp/status) →
+    darwin_open_tickers quedaba siempre vacío y el chequeo reportaba
+    divergencia total en cada corrida, sin ninguna utilidad. Además solo
+    miraba trades abiertos HOY.
+
+    Ahora:
+      - Darwin abierto = todo trade con status == "open".
+      - en_darwin_no_en_broker: la posición ya no existe en Alpaca pero
+        Darwin la cree abierta → típicamente la cerró una pata TP/SL del
+        bracket [B6] (o un cierre manual). Si hay broker, se busca el
+        último fill de venta y se registra el cierre con ese precio real
+        (reason="broker_exit"), para que el fitness no ignore esos trades.
+      - en_broker_no_en_darwin: solo se loguea (posiciones sin tracking).
+
+    Si broker_tickers está vacío NO se cierra nada: puede ser una caída
+    de la API, no una cuenta sin posiciones.
     """
     try:
         if not DARWIN_TRADES_DIR.exists():
             logger.warning(f"⚠️ Reconciliación omitida: {DARWIN_TRADES_DIR} no existe")
             return
 
-        today_str = date.today().isoformat()
         darwin_open_tickers = set()
-
+        entry_dates: Dict[str, str] = {}
         for trade_file in DARWIN_TRADES_DIR.glob("*.json"):
             try:
                 trade = json.loads(trade_file.read_text())
             except Exception:
                 continue
-
-            opened_at = str(trade.get("opened_at", ""))
-            closed_at = trade.get("closed_at")
-
-            # Trade abierto hoy y aún sin cerrar → debería reflejarse en el broker
-            if opened_at.startswith(today_str) and not closed_at:
+            if trade.get("status") == "open":
                 ticker = str(trade.get("ticker", "")).upper()
                 if ticker:
                     darwin_open_tickers.add(ticker)
+                    ed = str(trade.get("entry_date") or "")
+                    entry_dates[ticker] = max(entry_dates.get(ticker, ""), ed)
 
         broker_tickers_upper = {t.upper() for t in broker_tickers}
 
         missing_in_darwin = broker_tickers_upper - darwin_open_tickers
         missing_in_broker = darwin_open_tickers - broker_tickers_upper
 
-        if missing_in_darwin or missing_in_broker:
-            logger.error(
-                f"🚨 RECONCILIACIÓN BROKER↔DARWIN DIVERGE | "
-                f"en_broker_no_en_darwin={sorted(missing_in_darwin)} | "
-                f"en_darwin_no_en_broker={sorted(missing_in_broker)} | "
-                f"posible fuga de capital no capturada por darwin/trades/*.json"
+        if missing_in_darwin:
+            logger.warning(
+                f"⚠️ Posiciones en broker sin trade abierto en Darwin: {sorted(missing_in_darwin)}"
             )
-        else:
+
+        if missing_in_broker:
+            logger.warning(
+                f"⚠️ Trades abiertos en Darwin sin posición en broker: {sorted(missing_in_broker)}"
+            )
+            if broker is not None and broker_tickers_upper and DARWIN_TRACKING \
+                    and hasattr(broker, "get_last_sell_fill"):
+                for ticker in sorted(missing_in_broker):
+                    fill = broker.get_last_sell_fill(ticker)
+                    if not fill:
+                        logger.warning(f"⚠️ {ticker}: sin fill de venta en Alpaca — no se registra cierre")
+                        continue
+                    if fill["filled_at"][:10] < entry_dates.get(ticker, ""):
+                        logger.warning(
+                            f"⚠️ {ticker}: último fill de venta ({fill['filled_at'][:10]}) es anterior "
+                            f"a la entrada ({entry_dates[ticker]}) — no se registra cierre"
+                        )
+                        continue
+                    try:
+                        register_close(
+                            ticker      = ticker,
+                            exit_price  = fill["price"],
+                            reason      = "broker_exit",
+                            alpha_score = 0.0,
+                        )
+                        logger.info(
+                            f"📝 Darwin close (broker_exit) {ticker} @ ${fill['price']:.2f} "
+                            f"| {fill['order_type']} {fill['filled_at']}"
+                        )
+                        try:
+                            from positions_meta import remove_entry
+                            remove_entry(ticker)
+                        except Exception:
+                            pass
+                    except Exception as _te:
+                        logger.error(f"❌ DARWIN CLOSE (broker_exit) FALLÓ {ticker}: {_te}")
+                        _record_tracking_failure("close", ticker, str(_te))
+
+        if not missing_in_darwin and not missing_in_broker:
             logger.info(
                 f"✅ Reconciliación broker↔Darwin OK | "
                 f"{len(broker_tickers_upper)} posiciones coinciden"
@@ -712,7 +752,9 @@ class TradingOrchestrator:
                 try:
                     raw = self.broker.get_positions()
                     if isinstance(raw, dict):
-                        positions = list(raw.values())
+                        # broker.get_positions() → {symbol: {...}} sin "ticker"
+                        # adentro; list(raw.values()) perdía el símbolo.
+                        positions = [{"ticker": t, **v} for t, v in raw.items()]
                     elif isinstance(raw, list):
                         positions = raw
                     else:
@@ -770,7 +812,7 @@ class TradingOrchestrator:
 
         # [AUD-P1] Reconciliación diaria broker↔Darwin — informativa, no bloquea.
         if DARWIN_TRACKING:
-            _reconcile_broker_vs_darwin(broker_real_tickers)
+            _reconcile_broker_vs_darwin(broker_real_tickers, self.broker)
 
         logger.info(
             f"📊 Portfolio | broker={len(broker_real_tickers)} "
@@ -927,6 +969,18 @@ class TradingOrchestrator:
                     result = await asyncio.wait_for(
                         self.broker.execute_decision(order), timeout=30
                     )
+                    # [AUD-P5b][2026-09-26] Mismo bug que AUD-P5 en las
+                    # aperturas: execute_decision() no lanza, devuelve
+                    # {"status": "error"/"skipped"/...}. Antes todo cierre
+                    # se daba por hecho → se registraba en Darwin y se
+                    # borraba de positions_meta aunque la posición siguiera
+                    # abierta en el broker.
+                    if not isinstance(result, dict) or result.get("status") != "executed":
+                        logger.error(
+                            f"❌ CLOSE no confirmado {order['ticker']} "
+                            f"(status={result.get('status') if isinstance(result, dict) else result}): {result}"
+                        )
+                        continue
                     close_successes.append(order["ticker"])
                     logger.info(f"⚰️ CLOSED {order['ticker']}")
 

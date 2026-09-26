@@ -197,6 +197,43 @@ class TradingEngine:
             return 0
 
     # =========================================================
+    # [B11] ÚLTIMO FILL DE VENTA — para cierres hechos por Alpaca
+    # =========================================================
+    def get_last_sell_fill(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """
+        Devuelve el fill de venta más reciente del ticker (p.ej. una pata
+        TP/SL de bracket que cerró la posición sin pasar por el sistema).
+        None si no hay ninguno o si falla la consulta.
+        """
+        ticker = ticker.upper()
+        try:
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=[ticker],
+                side=OrderSide.SELL,
+                limit=20,
+                nested=False,
+            )
+            orders = self.client.get_orders(filter=request) or []
+        except Exception as e:
+            logger.warning(f"⚠️ get_last_sell_fill({ticker}) falló: {e}")
+            return None
+
+        filled = [
+            o for o in orders
+            if o.filled_at is not None and o.filled_avg_price and float(o.filled_qty or 0) > 0
+        ]
+        if not filled:
+            return None
+        last = max(filled, key=lambda o: o.filled_at)
+        return {
+            "price":      float(last.filled_avg_price),
+            "filled_at":  last.filled_at.isoformat(),
+            "order_type": str(getattr(last, "order_type", "") or getattr(last, "type", "")),
+            "order_id":   str(last.id),
+        }
+
+    # =========================================================
     # EXECUTE DECISION
     # =========================================================
     async def execute_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -229,6 +266,8 @@ class TradingEngine:
                     return await self._place_market_order(ticker, shares, OrderSide.BUY)
                 return {"status": "partially_executed", "reason": "close_done_open_failed_shares"}
 
+            return {"status": "rejected", "reason": f"unknown_action:{action}"}
+
         except Exception as e:
             logger.error(f"❌ EXECUTION ERROR for {ticker}: {str(e)}")
             return {"status": "error", "message": str(e)}
@@ -259,6 +298,14 @@ class TradingEngine:
                     break
         except Exception as e:
             logger.warning(f"⚠️ {ticker} no se pudo capturar precio pre-cierre: {e}")
+
+        # [B10] Las patas TP/SL de un bracket reservan las acciones
+        # (held_for_orders) y Alpaca rechaza close_position con
+        # "insufficient qty available". El orquestador ya cancelaba antes
+        # de cerrar, pero monitor-close y ROTATE no — se hace acá para
+        # que todos los caminos de cierre queden cubiertos.
+        if await self.cancel_orders_for_ticker(ticker):
+            await asyncio.sleep(0.5)
 
         # Ejecutar cierre
         res = self.client.close_position(ticker)
@@ -372,11 +419,17 @@ class TradingEngine:
                     f"orden enviada SIN bracket (queda a cargo del monitoreo horario)"
                 )
 
+        # [B8] Con bracket, las patas TP/SL heredan el time_in_force de la
+        # orden madre: con DAY expiraban al cierre del primer día y la
+        # posición quedaba sin stop el resto del holding (días/semanas).
+        # GTC mantiene TP/SL vivos hasta que se ejecuten o se cancelen.
+        tif = TimeInForce.GTC if order_class == OrderClass.BRACKET else TimeInForce.DAY
+
         req = MarketOrderRequest(
             symbol=ticker,
             qty=qty,
             side=side,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=tif,
             client_order_id=client_id,   # [B4] marca de origen sistema
             order_class=order_class,
             take_profit=take_profit,
@@ -388,7 +441,14 @@ class TradingEngine:
 
         for _ in range(5):
             await asyncio.sleep(1)
-            order = self.client.get_order_by_id(order.id)
+            try:
+                order = self.client.get_order_by_id(order.id)
+            except Exception as e:
+                # La orden YA fue enviada: un error de polling no puede
+                # convertirse en "error" (el orquestador la daría por no
+                # ejecutada y quedaría una posición sin registrar).
+                logger.warning(f"⚠️ {ticker} polling orden {order.id}: {e}")
+                continue
             if order.status == OrderStatus.FILLED:
                 logger.info(f"✅ {side} {qty} {ticker} FILLED at ${order.filled_avg_price}")
                 return {
@@ -399,6 +459,31 @@ class TradingEngine:
                     "price":            float(order.filled_avg_price) if order.filled_avg_price else None,
                     "bracket":          order_class == OrderClass.BRACKET,
                 }
+
+        # [B9] No llenó en 5s. Antes se devolvía "pending" y la orden
+        # quedaba viva: se llenaba después, pero el orquestador ya la
+        # había descartado (sin Darwin, sin entry_date). Ahora se cancela;
+        # si justo se llenó mientras tanto, se reporta como ejecutada.
+        try:
+            self.client.cancel_order_by_id(order.id)
+            logger.warning(f"🗑 {ticker} orden {order.id} sin fill en 5s → cancelada")
+        except Exception as e:
+            logger.warning(f"⚠️ {ticker} no se pudo cancelar orden {order.id}: {e}")
+        try:
+            order = self.client.get_order_by_id(order.id)
+            if order.status == OrderStatus.FILLED or (order.filled_qty and float(order.filled_qty) > 0):
+                logger.info(f"✅ {side} {ticker} llenó durante la cancelación ({order.filled_qty} @ ${order.filled_avg_price})")
+                return {
+                    "status":           "executed",
+                    "order_id":         str(order.id),
+                    "client_order_id":  client_id,
+                    "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
+                    "price":            float(order.filled_avg_price) if order.filled_avg_price else None,
+                    "bracket":          order_class == OrderClass.BRACKET,
+                    "partial_fill":     order.status != OrderStatus.FILLED,
+                }
+        except Exception as e:
+            logger.warning(f"⚠️ {ticker} re-check orden {order.id}: {e}")
 
         return {
             "status":          "pending",

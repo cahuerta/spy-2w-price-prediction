@@ -32,6 +32,9 @@ from sklearn.model_selection import TimeSeriesSplit
 # 15 puntos en escala logarítmica.
 DEFAULT_ALPHA_GRID = np.logspace(-1, 1.2, 15)
 
+# Separación entre train y test en el CV (días) = horizonte máximo H10.
+CV_GAP_DAYS = 10
+
 
 def select_alpha_ridge_cv(
     X: np.ndarray,
@@ -70,7 +73,11 @@ def select_alpha_ridge_cv(
         X_pca      = pca_tmp.fit_transform(X_scaled)
 
         n_splits = min(5, max(2, n_samples // 30))
-        tscv     = TimeSeriesSplit(n_splits=n_splits)
+        # [CAL-GAP][2026-09-26] gap = horizonte máximo (10 días): el target
+        # de las últimas filas de cada fold de entrenamiento es el retorno
+        # a h días hacia adelante, que se solapa con el fold de test. Sin
+        # gap, esa fuga premia alphas bajos (sobreajuste) en el CV.
+        tscv     = TimeSeriesSplit(n_splits=n_splits, gap=CV_GAP_DAYS)
 
         ridge_cv = RidgeCV(alphas=grid, cv=tscv)
         ridge_cv.fit(X_pca, y)

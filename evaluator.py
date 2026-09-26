@@ -492,13 +492,26 @@ def evaluate_models(
     old_p     = pred_data.get("prediction", {})
     curve     = pred_data.get("price_curve", {}).get("price_path", [])
     price_now = float(old_p.get("price_now", 0))
+    # [E12][2026-09-26] Salida CRUDA de cada predictor (master_orchestrator
+    # la guarda en models_diagnostics). Antes H1-H9 se evaluaban con el
+    # punto de price_curve, que está suavizado (rolling 3 → mezcla H{h-1},
+    # H{h}, H{h+1}) y estaba distorsionado por los pesos de horizonte —
+    # Darwin terminaba seleccionando genomas por un número que no era
+    # la predicción del genoma. La curva queda solo como fallback para
+    # predicciones antiguas sin models_diagnostics.
+    raw_diag  = pred_data.get("models_diagnostics") or {}
 
-    if price_now <= 0 or not curve:
+    if price_now <= 0 or (not curve and not raw_diag):
         return {}
 
     for h in range(1, 11):
-        if h == 10:
+        raw_h = raw_diag.get(f"H{h}") or {}
+        if raw_h.get("pred_price") is not None:
+            price_pred = float(raw_h["pred_price"])
+            pred_ret   = (price_pred / price_now - 1) * 100
+        elif h == 10:
             # [E8] H10 no viene de la curva — se lee de su propia predicción
+            # (fallback: la predicción final ya ajustada por la curva)
             raw_price_pred = old_p.get("price_pred")
             raw_pred_ret   = old_p.get("ret_ens_pct")
             if raw_price_pred is None or raw_pred_ret is None:

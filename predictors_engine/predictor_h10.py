@@ -134,7 +134,8 @@ def knn_caotico_predict(X_train, y_train, X_query, k=20) -> float:
     return float(np.mean(y_train[idx[0]]))
 
 def walk_forward_train_test(data, feature_cols, target_col, alpha_ridge,
-                             train_years=5, test_months=6, pca_target=50) -> pd.DataFrame:
+                             train_years=5, test_months=6, pca_target=50,
+                             horizon=HORIZON_H10) -> pd.DataFrame:
     clean_data = data.dropna(subset=feature_cols + [target_col]).sort_index()
     if len(clean_data) < 400:
         return pd.DataFrame()
@@ -156,6 +157,12 @@ def walk_forward_train_test(data, feature_cols, target_col, alpha_ridge,
         cur_test_end = cur_train_end + DateOffset(months=test_months)
 
         train = clean_data[(clean_data.index >= cur_train_start) & (clean_data.index < cur_train_end)]
+        # [WF-PURGE][2026-09-26] y_fwd de las últimas `horizon` filas de
+        # train usa precios que caen dentro del período de test → fuga
+        # que inflaba hit_rate_mean (usado como peso del ensemble y en
+        # theta_dynamic). Se purgan esas filas.
+        if horizon > 0 and len(train) > horizon:
+            train = train.iloc[:-horizon]
         test = clean_data[(clean_data.index >= cur_train_end) & (clean_data.index < cur_test_end)]
 
         if len(test) < 30:
@@ -213,7 +220,8 @@ def _run_full_math_engine(ticker, horizon, pca_target, theta,
     # (y_fwd_excess), no sobre el retorno crudo — el hit_rate resultante
     # refleja skill genuino, no acierto por drift.
     res_df = walk_forward_train_test(
-        feat, feature_cols, "y_fwd_excess", alpha_ridge=alpha, pca_target=pca_target
+        feat, feature_cols, "y_fwd_excess", alpha_ridge=alpha, pca_target=pca_target,
+        horizon=horizon,
     )
 
     if res_df is None or len(res_df) == 0:

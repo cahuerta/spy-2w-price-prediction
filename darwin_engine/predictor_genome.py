@@ -479,15 +479,23 @@ def calc_bias_score_from_evals(ticker: str, horizon: int, min_evals: int = 10) -
 
         if d.get("legacy_bad_horizon") is True:
             continue
-        if d.get("price_real") is None:
+
+        # [SW3][2026-09-26] ANTES: leía predicted_return_pct / hit_sign
+        # del nivel raíz — la predicción FINAL a 10 días — sin importar
+        # `horizon`. Resultado: H1-H9 recibían exactamente el mismo
+        # bias_score (0.6234 en todos los champion.json) y Darwin mutaba
+        # sample_weight_decay de cada horizonte según el sesgo de otro
+        # modelo. Ahora se lee el diagnóstico del propio horizonte.
+        h_diag = (d.get("models_diagnostics") or {}).get(f"H{horizon}") or {}
+        if h_diag.get("real_return") is None:
             continue
-        if d.get("weak_signal") is True:
+        if h_diag.get("weak_signal") is True:
             continue
-        if d.get("hit_sign") is None:
+        if h_diag.get("hit_sign") is None:
             continue
 
-        pred_ret = d.get("predicted_return_pct", 0) or 0
-        hit      = d.get("hit_sign", False)
+        pred_ret = h_diag.get("pred_return", 0) or 0
+        hit      = h_diag.get("hit_sign", False)
 
         if pred_ret > 0.05:  # predicción positiva con señal
             pred_pos_total += 1

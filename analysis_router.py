@@ -5,6 +5,7 @@
 # POST /dashboard/order-analysis/run      → corre análisis y guarda
 # GET  /dashboard/real-performance        → lee reporte cacheado
 # POST /dashboard/real-performance/run    → corre backtest real+teórico
+# GET  /dashboard/signal-analysis         → ¿hay señal? (analyze_signal.py)
 #
 # FIX v1.1:
 #   [A1] _fetch_orders(): is_system comparaba client_order_id contra
@@ -49,6 +50,7 @@ from broker import get_engine
 # sin duplicar lógica de Sharpe/drawdown/CAGR/Newey-West aquí.
 from backtest_evaluations import run_backtest_from_evaluations
 from backtest_real_trades import run_backtest_from_real_trades
+from analyze_signal import run_signal_analysis
 
 logger = logging.getLogger("order_analysis")
 router = APIRouter(prefix="/dashboard", tags=["analysis"])
@@ -359,3 +361,17 @@ async def run_real_performance(background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_real_performance)
     return {"status": "started", "message": "Análisis iniciado. Consulta GET /real-performance en ~15-30s"}
+
+
+# =========================================================
+# [A3] ¿HAY SEÑAL? — skill por predictor + trades reales
+# =========================================================
+
+@router.get("/signal-analysis")
+def get_signal_analysis():
+    """
+    Corre analyze_signal.run_signal_analysis() sobre /data (sin red).
+    def (no async) → FastAPI lo ejecuta en threadpool, no bloquea el loop.
+    """
+    return run_signal_analysis()
+

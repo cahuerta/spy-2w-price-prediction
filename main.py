@@ -315,6 +315,12 @@ async def monitor_close(payload: Dict[str, Any], request: Request):
                 }),
                 timeout=30,
             )
+            # execute_decision() no lanza: devuelve status. Sin este chequeo
+            # un cierre fallido se registraba en Darwin y borraba el meta.
+            if not isinstance(result, dict) or result.get("status") != "executed":
+                errors.append({"ticker": ticker, "error": f"close no confirmado: {result}"})
+                logger.error(f"❌ Monitor close no confirmado {ticker}: {result}")
+                continue
             closed.append(ticker)
             logger.info(f"⚰️ Monitor closed {ticker}")
 
