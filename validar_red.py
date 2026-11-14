@@ -6,8 +6,13 @@ Horizonte: 1 a 5 días (24 horas a 1 semana). Barras diarias de Alpaca (feed IEX
 
 Qué hace, todo en este archivo:
   1. Descarga ~5 años de barras diarias de ~100 acciones líquidas + SPY (o usa datos de prueba).
-  2. Una sola red GRU pequeña mira las últimas 60 barras de cada acción y predice, para
-     1, 3 y 5 días, el retorno de la acción MENOS el de SPY.
+  2. Una red neuronal pequeña predice, para 1, 3 y 5 días, el retorno de cada acción MENOS
+     el de SPY. Hay dos formas de tratar los números (opción --modelo):
+       - fila:   una GRU lee las últimas 60 barras de cada acción por separado (SPY solo
+                 como contexto).
+       - bloque: la red recibe el bloque completo (60 días x ~100 acciones x características).
+                 Una GRU lee cada acción y luego una capa de atención deja que cada acción
+                 mire a todas las demás antes de dar su puntaje.
   3. Valida con walk-forward: entrena en el pasado, prueba en meses que la red nunca vio,
      con un hueco (embargo) entre ambos para que no se filtre información del futuro.
   4. Simula operar esas predicciones DESCONTANDO costos (spread/slippage y costo de pedir
@@ -24,9 +29,11 @@ Cómo operar la señal (simulación):
 Uso:
     pip install torch alpaca-py pandas numpy
     export ALPACA_API_KEY=...  ALPACA_SECRET_KEY=...
-    python validar_red.py                  # datos reales de Alpaca (feed IEX gratis)
+    python validar_red.py                  # datos reales de Alpaca (IEX gratis), prueba fila y bloque
+    python validar_red.py --modelo bloque  # solo la red en bloque (o: fila, ambos)
     python validar_red.py --demo ruido     # prueba: datos SIN señal (no debe ganar)
-    python validar_red.py --demo senal     # prueba: datos con señal débil (debe detectarla)
+    python validar_red.py --demo senal     # prueba: señal débil dentro de cada acción
+    python validar_red.py --demo cruzada   # prueba: señal que solo se ve mirando varias acciones
 """
 
 import argparse
@@ -114,7 +121,9 @@ def a_paneles(df):
 
 
 def datos_demo(modo, seed=0):
-    """Datos inventados. 'ruido': sin ninguna señal. 'senal': persistencia débil (corr ~0.06)."""
+    """Datos inventados. 'ruido': sin ninguna señal. 'senal': persistencia débil dentro de cada
+    acción (corr ~0.06). 'cruzada': las 90 acciones "seguidoras" repiten con un día de retraso
+    el movimiento promedio de 10 "líderes"; solo se ve mirando varias acciones a la vez."""
     rng = np.random.default_rng(seed)
     T, N = 1260, 100
     mkt = rng.normal(0.0004, 0.010, T)
@@ -123,6 +132,10 @@ def datos_demo(modo, seed=0):
     if modo == "senal":
         for t in range(1, T):
             idio[t] += 0.06 * idio[t - 1]
+    if modo == "cruzada":
+        lider = idio[:, :10].mean(axis=1)
+        for t in range(1, T):
+            idio[t, 10:] += 0.25 * lider[t - 1]
     ret = beta[None, :] * mkt[:, None] + idio
     close = 100 * np.exp(np.cumsum(ret, axis=0))
     spy_c = 100 * np.exp(np.cumsum(mkt))
@@ -282,6 +295,89 @@ def predecir(net, Fn, ts, ns):
 
 
 # ----------------------------------------------------------------------------
+# RED EN BLOQUE: ve todas las acciones a la vez
+# ----------------------------------------------------------------------------
+def crear_red_bloque(nf, nout, hid=32, heads=4):
+    import torch.nn as nn
+
+    class RedBloque(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gru = nn.GRU(nf, hid, batch_first=True)
+            self.att = nn.MultiheadAttention(hid, heads, dropout=0.1, batch_first=True)
+            self.n1 = nn.LayerNorm(hid)
+            self.ff = nn.Sequential(nn.Linear(hid, 2 * hid), nn.GELU(), nn.Linear(2 * hid, hid))
+            self.n2 = nn.LayerNorm(hid)
+            self.drop = nn.Dropout(0.2)
+            self.out = nn.Linear(hid, nout)
+
+        def forward(self, x):  # x: [días, acciones, barras, características]
+            b, n, l, f = x.shape
+            _, hn = self.gru(x.reshape(b * n, l, f))
+            e = hn[-1].reshape(b, n, -1)              # una "huella" por acción
+            a, _ = self.att(e, e, e, need_weights=False)  # cada acción mira a todas las demás
+            e = self.n1(e + self.drop(a))
+            e = self.n2(e + self.drop(self.ff(e)))
+            return self.out(e)                         # [días, acciones, horizontes]
+
+    return RedBloque()
+
+
+def lote_bloque(Fn, dias):
+    import torch
+    x = Fn[dias[:, None] + OFFS[None, :]]              # [días, barras, acciones, caract.]
+    return torch.from_numpy(np.ascontiguousarray(x.transpose(0, 2, 1, 3)))
+
+
+def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, paciencia=8):
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    net = crear_red_bloque(Fn.shape[2], Ys.shape[2])
+    opt = torch.optim.AdamW(net.parameters(), lr=LR, weight_decay=1e-3)
+    lossf = nn.HuberLoss(delta=1.0)
+    mejor, estado, malas, ep_mejor = np.inf, None, 0, 0
+
+    for ep in range(epochs):
+        net.train()
+        perm = rng.permutation(len(dias_tr))
+        for i in range(0, len(perm), batch_dias):
+            d = dias_tr[perm[i:i + batch_dias]]
+            opt.zero_grad()
+            lossf(net(lote_bloque(Fn, d)), torch.from_numpy(Ys[d])).backward()
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
+        net.eval()
+        tot = 0.0
+        with torch.no_grad():
+            for i in range(0, len(dias_va), 16):
+                d = dias_va[i:i + 16]
+                tot += lossf(net(lote_bloque(Fn, d)), torch.from_numpy(Ys[d])).item() * len(d)
+        vl = tot / len(dias_va)
+        if vl < mejor - 1e-5:
+            mejor, malas, ep_mejor = vl, 0, ep + 1
+            estado = {k: v.clone() for k, v in net.state_dict().items()}
+        else:
+            malas += 1
+            if malas >= paciencia:
+                break
+    net.load_state_dict(estado)
+    net.eval()
+    return net, ep_mejor, mejor
+
+
+def predecir_bloque(net, Fn, dias):
+    import torch
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(dias), 16):
+            out.append(net(lote_bloque(Fn, dias[i:i + 16])).numpy())
+    return np.concatenate(out, axis=0)                 # [días, acciones, horizontes]
+
+
+# ----------------------------------------------------------------------------
 # WALK-FORWARD
 # ----------------------------------------------------------------------------
 def tramos(T, hmax):
@@ -296,7 +392,7 @@ def tramos(T, hmax):
     return out, gap
 
 
-def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs):
+def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila"):
     T, N, H = Y.shape
     pred = np.full((T, N, H), np.nan)
     val_len = int(TRAIN_DAYS * VAL_FRAC)
@@ -314,6 +410,22 @@ def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs):
         va = muestras(Y, v_ini, t_fin)
         sdh = np.array([np.nanstd(Y[t_ini:fit_fin + 1, :, h]) for h in range(H)])
         Ys = np.clip(Y / sdh[None, None, :], -5, 5).astype(np.float32)
+
+        if modelo == "bloque":
+            dias_tr = np.arange(t_ini, fit_fin + 1)
+            dias_tr = dias_tr[np.isfinite(Ys[dias_tr]).all(axis=(1, 2))]
+            dias_va = np.arange(v_ini, t_fin + 1)
+            dias_va = dias_va[np.isfinite(Ys[dias_va]).all(axis=(1, 2))]
+            dias_te = np.arange(a, b + 1)
+            acum_b = np.zeros((len(dias_te), N, H))
+            for s in range(seeds):
+                t0 = time.time()
+                net, ep, vl = entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed=s, epochs=epochs)
+                acum_b += predecir_bloque(net, Fn, dias_te)
+                print(f"  tramo {k}/{len(tr_list)} semilla {s}: {len(dias_tr)} días de entrenamiento, "
+                      f"mejor época {ep}, pérdida val {vl:.4f}, {time.time() - t0:.0f}s", flush=True)
+            pred[a:b + 1] = acum_b / seeds
+            continue
 
         ts_te = np.repeat(np.arange(a, b + 1), N).astype(np.int64)
         ns_te = np.tile(np.arange(N), b - a + 1).astype(np.int64)
@@ -392,13 +504,17 @@ def veredicto(por_tramo, st_neto, st_spy):
 # ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--demo", choices=["ruido", "senal"], help="usar datos inventados para probar el sistema")
+    ap.add_argument("--demo", choices=["ruido", "senal", "cruzada"],
+                    help="usar datos inventados para probar el sistema")
+    ap.add_argument("--modelo", choices=["fila", "bloque", "ambos"], default="ambos",
+                    help="fila: una GRU por acción; bloque: la red ve todas las acciones a la vez")
     ap.add_argument("--years", type=float, default=5.0, help="años de historial a descargar")
     ap.add_argument("--k", type=int, default=10, help="acciones por lado en el portafolio")
     ap.add_argument("--cost-bps", type=float, default=5.0, help="costo por lado en puntos base (spread + slippage)")
     ap.add_argument("--borrow", type=float, default=0.01, help="costo anual de pedir prestadas acciones (0.01 = 1%%)")
     ap.add_argument("--seeds", type=int, default=3, help="redes por tramo (se promedian)")
-    ap.add_argument("--epochs", type=int, default=20, help="máximo de épocas por red")
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="máximo de épocas por red (por defecto 20 en fila, 60 en bloque)")
     ap.add_argument("--cache", default="barras_diarias.csv")
     ap.add_argument("--refresh", action="store_true", help="volver a descargar aunque exista el archivo guardado")
     args = ap.parse_args()
@@ -423,11 +539,20 @@ def main():
     for i, (a, b) in enumerate(tr_list, 1):
         print(f"  tramo {i}: {fechas[a].date()} a {fechas[b].date()}")
 
-    print("Entrenando...", flush=True)
-    pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, args.epochs)
+    modelos = ["fila", "bloque"] if args.modelo == "ambos" else [args.modelo]
+    pasan_total = []
+    for m in modelos:
+        pasan_total += [(m, h, n) for h, n in ejecutar(m, args, F, Y, R, spyR, tr_list, gap)]
+    resumen(pasan_total, len(modelos))
+
+
+def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
+    epocas = args.epochs or (60 if modelo == "bloque" else 20)
+    print(f"\nEntrenando modelo {modelo}...", flush=True)
+    pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, epocas, modelo)
 
     print("\n" + "=" * 78)
-    print(f"RESULTADOS (solo períodos de prueba; costo {args.cost_bps:g} pb por lado, "
+    print(f"RESULTADOS modelo {modelo.upper()} (solo períodos de prueba; costo {args.cost_bps:g} pb por lado, "
           f"préstamo {args.borrow * 100:g}%/año, K={args.k} por lado)")
     print("=" * 78)
     pasan = []
@@ -453,12 +578,16 @@ def main():
                   f"{sn['dd'] * 100:>7.1f}%{pos:>5}/{len(por_tramo):<3}{ss['ann'] * 100:>8.1f}%{ss['sharpe']:>8.2f}"
                   f"  {'PASA' if ok else 'no pasa'}")
 
+    return pasan
+
+
+def resumen(pasan, n_modelos):
     print("\n" + "-" * 78)
     print("Vara: ganancia neta positiva en la mayoría de los tramos, retorno anual neto > 0 y")
     print("Sharpe mayor que el de comprar SPY en los mismos días.")
     if pasan:
-        print("Configuraciones que pasan: " + ", ".join(f"{n} a {h}d" for h, n in pasan))
-        print("OJO: se probaron 6 combinaciones sobre los mismos datos; elegir la mejor infla el")
+        print("Configuraciones que pasan: " + ", ".join(f"modelo {m}, {n} a {h}d" for m, h, n in pasan))
+        print(f"OJO: se probaron {6 * n_modelos} combinaciones sobre los mismos datos; elegir la mejor infla el")
         print("resultado. Además la lista de acciones son nombres grandes de hoy (sesgo de")
         print("supervivencia). Si pasa, confirmar en paper trading antes de usar dinero real.")
     else:
