@@ -1,0 +1,43 @@
+name: Validar red (S&P 500)
+
+# Se lanza a mano desde el teléfono: pestaña Actions > "Validar red (S&P 500)" > Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      universo:
+        description: "sp500 (todo el índice) o top100 (más rápido)"
+        default: "sp500"
+      semillas:
+        description: "Redes por tramo (más = más lento y más estable)"
+        default: "2"
+
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install alpaca-py pandas numpy requests lxml
+      - name: Correr validación
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: |
+          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" 2>&1 | tee resultados.txt
+      - name: Mostrar resultado en el resumen
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 60 resultados.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resultados
+          path: resultados.txt

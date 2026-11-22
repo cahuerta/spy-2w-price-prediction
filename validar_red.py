@@ -5,7 +5,9 @@ validar_red.py - ¿Una red neuronal gana dinero de verdad con acciones de EE.UU.
 Horizonte: 1 a 5 días (24 horas a 1 semana). Barras diarias de Alpaca (feed IEX, gratis).
 
 Qué hace, todo en este archivo:
-  1. Descarga ~5 años de barras diarias de ~100 acciones líquidas + SPY (o usa datos de prueba).
+  1. Descarga ~5 años de barras diarias de todo el S&P 500 (lista actual de Wikipedia; si falla,
+     ~100 acciones líquidas) + SPY + variables de contexto (volatilidad VIXY, tasas TLT/IEF/SHY,
+     dólar UUP, oro, petróleo y los 11 ETF de sectores), todo del mismo feed gratis de Alpaca.
   2. Una red neuronal pequeña predice, para 1, 3 y 5 días, el retorno de cada acción MENOS
      el de SPY. Hay dos formas de tratar los números (opción --modelo):
        - fila:   una GRU lee las últimas 60 barras de cada acción por separado (SPY solo
@@ -29,8 +31,9 @@ Cómo operar la señal (simulación):
 Uso:
     pip install torch alpaca-py pandas numpy
     export ALPACA_API_KEY=...  ALPACA_SECRET_KEY=...
-    python validar_red.py                  # datos reales de Alpaca (IEX gratis), prueba fila y bloque
-    python validar_red.py --modelo bloque  # solo la red en bloque (o: fila, ambos)
+    python validar_red.py                  # S&P 500 con Alpaca (IEX gratis), red en bloque
+    python validar_red.py --universo top100  # solo las ~100 acciones líquidas (más rápido)
+    python validar_red.py --modelo ambos   # también la red "fila" (o: fila, bloque)
     python validar_red.py --demo ruido     # prueba: datos SIN señal (no debe ganar)
     python validar_red.py --demo senal     # prueba: señal débil dentro de cada acción
     python validar_red.py --demo cruzada   # prueba: señal que solo se ve mirando varias acciones
@@ -72,13 +75,44 @@ UNIVERSO = list(dict.fromkeys([
     "TMUS", "APH", "WM", "CVS", "MDLZ",
 ]))
 BENCH = "SPY"
+# Variables de contexto (mismo feed de Alpaca, sin otra llave). VIXY = volatilidad esperada (VIX).
+CONTEXTO = ["VIXY", "TLT", "IEF", "SHY", "UUP", "GLD", "USO",
+            "XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLB", "XLU", "XLRE", "XLC"]
+SECTOR_ETF = {
+    "Information Technology": "XLK", "Financials": "XLF", "Energy": "XLE", "Health Care": "XLV",
+    "Consumer Discretionary": "XLY", "Consumer Staples": "XLP", "Industrials": "XLI",
+    "Materials": "XLB", "Utilities": "XLU", "Real Estate": "XLRE", "Communication Services": "XLC",
+}
+SECTOR_DE = {}              # símbolo -> ETF de su sector (se llena al cargar el S&P 500)
 OFFS = np.arange(-LOOKBACK + 1, 1)
 
 
 # ----------------------------------------------------------------------------
 # DATOS
 # ----------------------------------------------------------------------------
-def descargar_alpaca(years, cache, refrescar):
+def obtener_universo(modo):
+    """S&P 500 actual desde Wikipedia (con su sector). Si falla, usa la lista corta."""
+    if modo == "top100":
+        return list(UNIVERSO)
+    try:
+        import io
+        import requests
+        r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                         headers={"User-Agent": "validar_red/1.0"}, timeout=30)
+        r.raise_for_status()
+        t = pd.read_html(io.StringIO(r.text))[0]
+        syms = [str(x).strip().replace("-", ".") for x in t["Symbol"]]
+        for sym, sec in zip(syms, t["GICS Sector"]):
+            if sec in SECTOR_ETF:
+                SECTOR_DE[sym] = SECTOR_ETF[sec]
+        print(f"S&P 500 cargado de Wikipedia: {len(syms)} símbolos.")
+        return list(dict.fromkeys(syms))
+    except Exception as e:  # noqa: BLE001
+        print(f"No pude leer la lista del S&P 500 ({e}); uso la lista corta de ~100 acciones.")
+        return list(UNIVERSO)
+
+
+def descargar_alpaca(years, cache, refrescar, tickers):
     if os.path.exists(cache) and not refrescar:
         print(f"Usando datos guardados en {cache} (usa --refresh para volver a descargar)")
         return pd.read_csv(cache)
@@ -96,16 +130,26 @@ def descargar_alpaca(years, cache, refrescar):
     cli = StockHistoricalDataClient(key, secret)
     fin = datetime.now(timezone.utc) - timedelta(days=1)
     ini = fin - timedelta(days=int(365.25 * years) + 10)
-    print(f"Descargando {len(UNIVERSO) + 1} símbolos desde Alpaca (feed IEX)...")
-    req = StockBarsRequest(
-        symbol_or_symbols=UNIVERSO + [BENCH],
-        timeframe=TimeFrame.Day,
-        start=ini,
-        end=fin,
-        adjustment=Adjustment.ALL,
-        feed=DataFeed.IEX,
-    )
-    df = cli.get_stock_bars(req).df.reset_index()
+    todos = list(dict.fromkeys(tickers + [BENCH] + CONTEXTO))
+    print(f"Descargando {len(todos)} símbolos desde Alpaca (feed IEX)...", flush=True)
+    partes = []
+    for i in range(0, len(todos), 100):
+        lote_s = todos[i:i + 100]
+        for intento in range(3):
+            try:
+                req = StockBarsRequest(symbol_or_symbols=lote_s, timeframe=TimeFrame.Day,
+                                       start=ini, end=fin, adjustment=Adjustment.ALL,
+                                       feed=DataFeed.IEX)
+                d = cli.get_stock_bars(req).df.reset_index()
+                partes.append(d)
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"  lote {i // 100 + 1}: error ({e}); reintento {intento + 1}/3", flush=True)
+                time.sleep(5 * (intento + 1))
+        print(f"  {min(i + 100, len(todos))}/{len(todos)}", flush=True)
+    if not partes:
+        sys.exit("No se pudo descargar ningún dato de Alpaca.")
+    df = pd.concat(partes, ignore_index=True)
     df.to_csv(cache, index=False)
     return df
 
@@ -139,15 +183,20 @@ def datos_demo(modo, seed=0):
     ret = beta[None, :] * mkt[:, None] + idio
     close = 100 * np.exp(np.cumsum(ret, axis=0))
     spy_c = 100 * np.exp(np.cumsum(mkt))
-    close = np.column_stack([close, spy_c])
+    ctx_n = ["VIXY", "TLT", "XLK"]
+    ctx_c = np.column_stack([100 * np.exp(np.cumsum(rng.normal(0, 0.01, T) + k * mkt)) for k in (-3, 0.2, 1.0)])
+    close = np.column_stack([close, spy_c, ctx_c])
     prev = np.vstack([close[:1], close[:-1]])
     open_ = prev * np.exp(rng.normal(0, 0.003, close.shape))
     high = np.maximum(open_, close) * np.exp(np.abs(rng.normal(0, 0.004, close.shape)))
     low = np.minimum(open_, close) * np.exp(-np.abs(rng.normal(0, 0.004, close.shape)))
     vol = np.exp(rng.normal(15, 0.4, close.shape))
-    cols = [f"T{i:03d}" for i in range(N)] + [BENCH]
+    cols = [f"T{i:03d}" for i in range(N)] + [BENCH] + ctx_n
     idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=T)
     mk = lambda a: pd.DataFrame(a, index=idx, columns=cols)
+    SECTOR_DE.clear()
+    for i in range(0, N, 3):
+        SECTOR_DE[f"T{i:03d}"] = "XLK"
     return {"open": mk(open_), "high": mk(high), "low": mk(low), "close": mk(close), "volume": mk(vol)}
 
 
@@ -158,7 +207,7 @@ def limpiar(p):
     for k in ("open", "high", "low", "close"):
         p[k] = p[k].ffill(limit=3)
     p["volume"] = p["volume"].fillna(0.0)
-    cols = [c for c in p["close"].columns if c != BENCH]
+    cols = [c for c in p["close"].columns if c != BENCH and c not in CONTEXTO]
     malos = [c for c in cols if any(p[k][c].isna().any() for k in ("open", "high", "low", "close"))]
     buenos = [c for c in cols if c not in malos]
     if malos:
@@ -169,7 +218,8 @@ def limpiar(p):
 
 
 def construir(p, tickers):
-    o, h, l, c, v = (p[k][tickers + [BENCH]] for k in ("open", "high", "low", "close", "volume"))
+    ctx = [x for x in CONTEXTO if x in p["close"].columns]
+    o, h, l, c, v = (p[k][tickers + [BENCH] + ctx] for k in ("open", "high", "low", "close", "volume"))
     ret1 = np.log(c / c.shift(1))
     spy_ret = ret1[BENCH]
     vol_rel = np.log((v + 1) / (v.rolling(20, min_periods=5).mean().shift(1) + 1))
@@ -179,6 +229,13 @@ def construir(p, tickers):
         return x[tickers].values
 
     spy_b = np.repeat(spy_ret.values[:, None], N, axis=1)
+    rt = ret1[tickers]
+    rel_sec = np.zeros((T, N))
+    for j, tk in enumerate(tickers):
+        se = SECTOR_DE.get(tk)
+        if se in ctx:
+            rel_sec[:, j] = (rt[tk] - ret1[se]).values
+    ctx_b = [np.repeat(ret1[x].values[:, None], N, axis=1) for x in ctx]
     F = np.stack(
         [
             cols(ret1),                                   # retorno del día
@@ -187,7 +244,11 @@ def construir(p, tickers):
             cols(np.log(o / c.shift(1))),                 # gap de apertura
             cols(vol_rel),                                # volumen relativo
             spy_b,                                        # contexto de mercado
-        ],
+            cols(np.log(c / c.shift(5))),                 # momentum 5 días
+            cols(np.log(c / c.shift(20))),                # momentum 20 días
+            cols(ret1.rolling(20, min_periods=10).std()), # volatilidad 20 días
+            rel_sec,                                      # retorno vs su sector
+        ] + ctx_b,                                        # volatilidad, tasas, dólar, oro, petróleo, sectores
         axis=2,
     )
     F = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -329,7 +390,7 @@ def lote_bloque(Fn, dias):
     return torch.from_numpy(np.ascontiguousarray(x.transpose(0, 2, 1, 3)))
 
 
-def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, paciencia=8):
+def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, paciencia=8, frac=1.0):
     import torch
     import torch.nn as nn
 
@@ -342,7 +403,7 @@ def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, pacien
 
     for ep in range(epochs):
         net.train()
-        perm = rng.permutation(len(dias_tr))
+        perm = rng.permutation(len(dias_tr))[:max(batch_dias, int(len(dias_tr) * frac))]
         for i in range(0, len(perm), batch_dias):
             d = dias_tr[perm[i:i + batch_dias]]
             opt.zero_grad()
@@ -392,7 +453,7 @@ def tramos(T, hmax):
     return out, gap
 
 
-def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila"):
+def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1.0):
     T, N, H = Y.shape
     pred = np.full((T, N, H), np.nan)
     val_len = int(TRAIN_DAYS * VAL_FRAC)
@@ -420,7 +481,7 @@ def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila"):
             acum_b = np.zeros((len(dias_te), N, H))
             for s in range(seeds):
                 t0 = time.time()
-                net, ep, vl = entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed=s, epochs=epochs)
+                net, ep, vl = entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed=s, epochs=epochs, frac=frac)
                 acum_b += predecir_bloque(net, Fn, dias_te)
                 print(f"  tramo {k}/{len(tr_list)} semilla {s}: {len(dias_tr)} días de entrenamiento, "
                       f"mejor época {ep}, pérdida val {vl:.4f}, {time.time() - t0:.0f}s", flush=True)
@@ -506,13 +567,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--demo", choices=["ruido", "senal", "cruzada"],
                     help="usar datos inventados para probar el sistema")
-    ap.add_argument("--modelo", choices=["fila", "bloque", "ambos"], default="ambos",
+    ap.add_argument("--modelo", choices=["fila", "bloque", "ambos"], default="bloque",
                     help="fila: una GRU por acción; bloque: la red ve todas las acciones a la vez")
+    ap.add_argument("--universo", choices=["sp500", "top100"], default="sp500",
+                    help="sp500: todo el índice (Wikipedia); top100: lista corta")
+    ap.add_argument("--frac", type=float, default=0.5,
+                    help="fracción de días de entrenamiento usada por época en la red en bloque (acelera)")
     ap.add_argument("--years", type=float, default=5.0, help="años de historial a descargar")
     ap.add_argument("--k", type=int, default=10, help="acciones por lado en el portafolio")
     ap.add_argument("--cost-bps", type=float, default=5.0, help="costo por lado en puntos base (spread + slippage)")
     ap.add_argument("--borrow", type=float, default=0.01, help="costo anual de pedir prestadas acciones (0.01 = 1%%)")
-    ap.add_argument("--seeds", type=int, default=3, help="redes por tramo (se promedian)")
+    ap.add_argument("--seeds", type=int, default=2, help="redes por tramo (se promedian)")
     ap.add_argument("--epochs", type=int, default=None,
                     help="máximo de épocas por red (por defecto 20 en fila, 60 en bloque)")
     ap.add_argument("--cache", default="barras_diarias.csv")
@@ -526,7 +591,7 @@ def main():
         print(f"MODO PRUEBA con datos inventados ({args.demo}).")
         p = datos_demo(args.demo)
     else:
-        p = a_paneles(descargar_alpaca(args.years, args.cache, args.refresh))
+        p = a_paneles(descargar_alpaca(args.years, args.cache, args.refresh, obtener_universo(args.universo)))
     p, tickers = limpiar(p)
     F, Y, R, spyR, fechas = construir(p, tickers)
     T, N, H = Y.shape
@@ -549,7 +614,7 @@ def main():
 def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
     epocas = args.epochs or (60 if modelo == "bloque" else 20)
     print(f"\nEntrenando modelo {modelo}...", flush=True)
-    pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, epocas, modelo)
+    pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, epocas, modelo, args.frac)
 
     print("\n" + "=" * 78)
     print(f"RESULTADOS modelo {modelo.upper()} (solo períodos de prueba; costo {args.cost_bps:g} pb por lado, "
@@ -588,8 +653,8 @@ def resumen(pasan, n_modelos):
     if pasan:
         print("Configuraciones que pasan: " + ", ".join(f"modelo {m}, {n} a {h}d" for m, h, n in pasan))
         print(f"OJO: se probaron {6 * n_modelos} combinaciones sobre los mismos datos; elegir la mejor infla el")
-        print("resultado. Además la lista de acciones son nombres grandes de hoy (sesgo de")
-        print("supervivencia). Si pasa, confirmar en paper trading antes de usar dinero real.")
+        print("resultado. Además la lista de acciones son las del S&P 500 de HOY (sesgo de")
+        print("supervivencia: las que salieron del índice no están). Si pasa, confirmar en paper trading antes de usar dinero real.")
     else:
         print("Ninguna configuración pasa la vara: con estos datos no hay evidencia de ventaja real.")
 
