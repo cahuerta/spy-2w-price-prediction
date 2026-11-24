@@ -645,7 +645,20 @@ def estadisticas(r):
     return {"ann": ann, "vol": vol, "sharpe": ann / vol if vol > 0 else np.nan, "dd": dd}
 
 
-def simular(pred_h, R, spyR, h, modo, tr_list, k, cost_bps, borrow):
+def betas_rodantes(R, spyR, W=120):
+    """Beta de cada acción contra SPY con los últimos W días hasta HOY (sin mirar adelante)."""
+    r = pd.DataFrame(R)
+    m = pd.Series(spyR)
+    cov = r.rolling(W, min_periods=60).cov(m)
+    var = m.rolling(W, min_periods=60).var()
+    beta = cov.div(var, axis=0).values
+    return np.clip(np.nan_to_num(beta, nan=1.0), 0.2, 3.0)
+
+
+def simular(pred_h, R, spyR, h, modo, tr_list, k, cost_bps, borrow, beta=None):
+    """modo: long | short (solo diagnóstico) | ls (compras y ventas del mismo tamaño) |
+    lsn (compras y ventas con beta total cero: la pierna vendida se escala para que el
+    mercado no empuje el resultado)."""
     T, N = pred_h.shape
     W = np.zeros((T, N))
     for t in range(T):
@@ -659,16 +672,26 @@ def simular(pred_h, R, spyR, h, modo, tr_list, k, cost_bps, borrow):
         W[t, orden[-k:]] = 1.0 / k
         if modo == "ls":
             W[t, orden[:k]] = -1.0 / k
-    gross = 1.0 if modo in ("long", "short") else 2.0
-    costo = 2.0 * cost_bps * 1e-4 * gross / h
-    borr = borrow / 252.0 if modo == "ls" else 0.0
+        elif modo == "lsn":
+            bl = beta[t, orden[-k:]].mean()
+            bs = beta[t, orden[:k]].mean()
+            W[t, orden[:k]] = -(bl / bs) / k
+    gross_t = np.abs(W).sum(axis=1)
+    short_t = -np.where(W < 0, W, 0.0).sum(axis=1)
+    es_ls = modo in ("ls", "lsn")
 
     brutos, netos, spys, por_tramo = [], [], [], []
     for a, b in tr_list:
         dias = np.arange(a + h + 1, b + 2)
         pnl = np.zeros(len(dias))
+        g = np.zeros(len(dias))
+        sh = np.zeros(len(dias))
         for lag in range(2, h + 2):
             pnl += (W[dias - lag] * R[dias]).sum(axis=1) / h
+            g += gross_t[dias - lag] / h
+            sh += short_t[dias - lag] / h
+        costo = 2.0 * cost_bps * 1e-4 * g / h
+        borr = borrow / 252.0 * sh if es_ls else 0.0
         neto = pnl - costo - borr
         brutos.append(pnl)
         netos.append(neto)
@@ -744,6 +767,7 @@ def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
     print(f"\nEntrenando modelo {modelo}...", flush=True)
     pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, epocas, modelo, args.frac)
 
+    B = betas_rodantes(R, spyR)
     print("\n" + "=" * 78)
     print(f"RESULTADOS modelo {modelo.upper()} (solo períodos de prueba; costo {args.cost_bps:g} pb por lado, "
           f"préstamo {args.borrow * 100:g}%/año, K={args.k} por lado)")
@@ -798,6 +822,25 @@ def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
                   f"  {'pasaría' if ok else 'no pasa'}")
         print("    * el signo se invirtió mirando estos mismos resultados: solo orienta, no vale como prueba.")
         print("      'signo tramo prev' decide el signo de cada tramo con el tramo anterior (sin mirar adelante).")
+
+        # --- neutral al mercado: el beta total de compras + ventas es cero ---
+        print("  Neutral al mercado (beta ~0, así el alza o baja del mercado no decide el resultado):")
+        bruto, neto, spy, por_n = simular(ph, R, spyR, h, "lsn", tr_list, args.k, args.cost_bps, args.borrow, beta=B)
+        causal_n = ph.copy()
+        for i, (a, b) in enumerate(tr_list):
+            if i > 0 and por_n[i - 1] < 0:
+                causal_n[a:b + 1] = -causal_n[a:b + 1]
+        for etiqueta, pr in (("neutral", ph), ("neutral INVERTIDO*", -ph), ("neutral signo prev", causal_n)):
+            bruto, neto, spy, por_tramo = simular(pr, R, spyR, h, "lsn", tr_list, args.k,
+                                                  args.cost_bps, args.borrow, beta=B)
+            sb, sn, ss = estadisticas(bruto), estadisticas(neto), estadisticas(spy)
+            ok, pos = veredicto(por_tramo, sn, ss)
+            if etiqueta == "neutral" and ok:
+                pasan.append((h, "compras+cortos neutral"))
+            bt = float(np.cov(neto, spy)[0, 1] / np.var(spy, ddof=1))
+            print(f"  {etiqueta:<18}{sb['ann'] * 100:>9.1f}%{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}"
+                  f"{sn['dd'] * 100:>7.1f}%{pos:>5}/{len(por_tramo):<3}  beta real {bt:+.2f}"
+                  f"  {'PASA' if ok and etiqueta == 'neutral' else ('pasaría' if ok else 'no pasa')}")
 
     return pasan
 
