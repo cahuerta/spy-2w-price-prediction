@@ -218,6 +218,24 @@ def limpiar(p):
     return p, buenos
 
 
+def filtrar_liquidas(p, tickers, n, precio_min=10.0):
+    """Criterio más estricto que el del S&P 500: se quedan solo las N acciones más líquidas
+    (valor transado diario promedio) y con precio de al menos 10 dólares. La elección usa SOLO la
+    primera ventana de entrenamiento, así ninguna decisión mira el futuro de los períodos de
+    prueba (elegir 'las que mejor rindieron' hasta hoy daría un resultado falso)."""
+    if n <= 0 or n >= len(tickers):
+        return tickers
+    fin = LOOKBACK + WARMUP + TRAIN_DAYS
+    c = p["close"][tickers].iloc[:fin]
+    v = p["volume"][tickers].iloc[:fin]
+    liq = (c * v).mean()
+    ok = liq[c.median() >= precio_min].sort_values(ascending=False)
+    elegidas = list(ok.index[:n])
+    print(f"Filtro de liquidez: de {len(tickers)} acciones quedan las {len(elegidas)} más líquidas "
+          f"(precio ≥ {precio_min:g} USD), elegidas con datos de {c.index[0].date()} a {c.index[-1].date()}.")
+    return elegidas
+
+
 def construir(p, tickers):
     ctx = [x for x in CONTEXTO if x in p["close"].columns]
     o, h, l, c, v = (p[k][tickers + [BENCH] + ctx] for k in ("open", "high", "low", "close", "volume"))
@@ -611,10 +629,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--demo", choices=["ruido", "senal", "cruzada"],
                     help="usar datos inventados para probar el sistema")
-    ap.add_argument("--modelo", choices=["fila", "bloque", "ambos"], default="bloque",
+    ap.add_argument("--modelo", type=str.lower, choices=["fila", "bloque", "ambos"], default="bloque",
                     help="fila: una GRU por acción; bloque: la red ve todas las acciones a la vez")
-    ap.add_argument("--universo", choices=["sp500", "top100"], default="sp500",
+    ap.add_argument("--universo", type=str.lower, choices=["sp500", "top100"], default="sp500",
                     help="sp500: todo el índice (Wikipedia); top100: lista corta")
+    ap.add_argument("--liquidas", type=int, default=150,
+                    help="quedarse solo con las N acciones más líquidas (y de precio >= 10 USD); 0 = sin filtro")
     ap.add_argument("--frac", type=float, default=0.5,
                     help="fracción de días de entrenamiento usada por época en la red en bloque (acelera)")
     ap.add_argument("--years", type=float, default=8.0, help="años de historial a descargar")
@@ -637,6 +657,7 @@ def main():
     else:
         p = a_paneles(descargar_alpaca(args.years, args.cache, args.refresh, obtener_universo(args.universo)))
     p, tickers = limpiar(p)
+    tickers = filtrar_liquidas(p, tickers, args.liquidas)
     F, Y, R, spyR, fechas = construir(p, tickers)
     T, N, H = Y.shape
     print(f"{N} acciones, {T} días ({fechas[0].date()} a {fechas[-1].date()}).")

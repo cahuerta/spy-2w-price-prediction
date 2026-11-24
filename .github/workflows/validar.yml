@@ -7,9 +7,13 @@ on:
       universo:
         description: "sp500 (todo el índice) o top100 (más rápido)"
         default: "sp500"
+        # (mayúsculas o minúsculas, da igual)
       semillas:
         description: "Redes por tramo (más = más lento y más estable)"
         default: "5"
+      liquidas:
+        description: "Quedarse con las N acciones más líquidas del universo (0 = todas)"
+        default: "150"
       anios:
         description: "Años de historial a descargar"
         default: "8"
@@ -33,7 +37,7 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         shell: bash
         run: |
-          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" 2>&1 | tee resultados.txt
+          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" --liquidas "${{ inputs.liquidas }}" 2>&1 | tee resultados.txt
       - name: Mostrar resultado en el resumen
         if: always()
         run: |
