@@ -5,11 +5,12 @@ validar_red.py - ¿Una red neuronal gana dinero de verdad con acciones de EE.UU.
 Horizonte: 1 a 5 días (24 horas a 1 semana). Barras diarias de Alpaca (feed IEX, gratis).
 
 Qué hace, todo en este archivo:
-  1. Descarga ~5 años de barras diarias de todo el S&P 500 (lista actual de Wikipedia; si falla,
+  1. Descarga ~8 años de barras diarias de todo el S&P 500 (lista actual de Wikipedia; si falla,
      ~100 acciones líquidas) + SPY + variables de contexto (volatilidad VIXY, tasas TLT/IEF/SHY,
      dólar UUP, oro, petróleo y los 11 ETF de sectores), todo del mismo feed gratis de Alpaca.
-  2. Una red neuronal pequeña predice, para 1, 3 y 5 días, el retorno de cada acción MENOS
-     el de SPY. Hay dos formas de tratar los números (opción --modelo):
+  2. Una red neuronal pequeña predice, para 1, 3 y 5 días, qué acciones rendirán más o menos
+     que las demás (retorno contra SPY, ordenado cada día entre todas las acciones; no intenta
+     adivinar hacia dónde va el mercado). Se promedian varias redes (semillas). Hay dos formas de tratar los números (opción --modelo):
        - fila:   una GRU lee las últimas 60 barras de cada acción por separado (SPY solo
                  como contexto).
        - bloque: la red recibe el bloque completo (60 días x ~100 acciones x características).
@@ -236,6 +237,27 @@ def construir(p, tickers):
         if se in ctx:
             rel_sec[:, j] = (rt[tk] - ret1[se]).values
     ctx_b = [np.repeat(ret1[x].values[:, None], N, axis=1) for x in ctx]
+    mom5 = np.log(c / c.shift(5))
+    mom20 = np.log(c / c.shift(20))
+    mom60 = np.log(c / c.shift(60))
+    vol20 = ret1.rolling(20, min_periods=10).std()
+
+    def rk(x):  # posición de cada acción entre todas ese día, de -0.5 (la peor) a +0.5 (la mejor)
+        return x[tickers].rank(axis=1, pct=True).values - 0.5
+
+    # momentum de 5 días contra su sector
+    mom5_sec = np.zeros((T, N))
+    for j, tk in enumerate(tickers):
+        se = SECTOR_DE.get(tk)
+        if se in ctx:
+            mom5_sec[:, j] = (mom5[tk] - mom5[se]).values
+    # dónde cerró dentro del rango del día (0 = en el mínimo, 1 = en el máximo)
+    pos_rango = ((c - l) / (h - l).replace(0, np.nan)).clip(0, 1) - 0.5
+    # distancia al máximo de 60 días
+    dist_max = np.log(c / c.rolling(60, min_periods=20).max())
+    # volumen de la última semana contra el del último mes
+    vol_trend = np.log((v.rolling(5, min_periods=3).mean() + 1) / (v.rolling(20, min_periods=10).mean() + 1))
+
     F = np.stack(
         [
             cols(ret1),                                   # retorno del día
@@ -244,10 +266,17 @@ def construir(p, tickers):
             cols(np.log(o / c.shift(1))),                 # gap de apertura
             cols(vol_rel),                                # volumen relativo
             spy_b,                                        # contexto de mercado
-            cols(np.log(c / c.shift(5))),                 # momentum 5 días
-            cols(np.log(c / c.shift(20))),                # momentum 20 días
-            cols(ret1.rolling(20, min_periods=10).std()), # volatilidad 20 días
+            cols(mom5),                                   # momentum 5 días
+            cols(mom20),                                  # momentum 20 días
+            cols(vol20),                                  # volatilidad 20 días
             rel_sec,                                      # retorno vs su sector
+            cols(mom60),                                  # momentum 60 días
+            cols(mom20.sub(mom20[BENCH], axis=0)),        # momentum 20 días vs SPY
+            mom5_sec,                                     # momentum 5 días vs su sector
+            cols(pos_rango),                              # dónde cerró dentro de su rango
+            cols(dist_max),                               # distancia al máximo de 60 días
+            cols(vol_trend),                              # tendencia del volumen
+            rk(ret1), rk(mom5), rk(mom20), rk(vol20),     # posición entre todas las acciones ese día
         ] + ctx_b,                                        # volatilidad, tasas, dólar, oro, petróleo, sectores
         axis=2,
     )
@@ -453,6 +482,22 @@ def tramos(T, hmax):
     return out, gap
 
 
+def objetivo_relativo(Y):
+    """Lo que la red aprende: cada día, qué acciones rinden más o menos que las demás.
+    Se resta el promedio de ese día y se divide por la dispersión de ese día (puntaje z).
+    Así la red no gasta capacidad en adivinar hacia dónde va todo el mercado, solo en ordenar
+    las acciones. Usa solo información del mismo día, no mezcla días."""
+    Yr = np.full(Y.shape, np.nan)
+    for t in range(Y.shape[0]):
+        y = Y[t]                                   # [acciones, horizontes]
+        if not np.isfinite(y).all():
+            continue
+        sd = y.std(axis=0)
+        sd[sd < 1e-12] = 1.0
+        Yr[t] = (y - y.mean(axis=0)) / sd
+    return np.clip(Yr, -5, 5).astype(np.float32)
+
+
 def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1.0):
     T, N, H = Y.shape
     pred = np.full((T, N, H), np.nan)
@@ -469,8 +514,7 @@ def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1
 
         tr = muestras(Y, t_ini, fit_fin)
         va = muestras(Y, v_ini, t_fin)
-        sdh = np.array([np.nanstd(Y[t_ini:fit_fin + 1, :, h]) for h in range(H)])
-        Ys = np.clip(Y / sdh[None, None, :], -5, 5).astype(np.float32)
+        Ys = objetivo_relativo(Y)
 
         if modelo == "bloque":
             dias_tr = np.arange(t_ini, fit_fin + 1)
@@ -573,11 +617,11 @@ def main():
                     help="sp500: todo el índice (Wikipedia); top100: lista corta")
     ap.add_argument("--frac", type=float, default=0.5,
                     help="fracción de días de entrenamiento usada por época en la red en bloque (acelera)")
-    ap.add_argument("--years", type=float, default=5.0, help="años de historial a descargar")
+    ap.add_argument("--years", type=float, default=8.0, help="años de historial a descargar")
     ap.add_argument("--k", type=int, default=10, help="acciones por lado en el portafolio")
     ap.add_argument("--cost-bps", type=float, default=5.0, help="costo por lado en puntos base (spread + slippage)")
     ap.add_argument("--borrow", type=float, default=0.01, help="costo anual de pedir prestadas acciones (0.01 = 1%%)")
-    ap.add_argument("--seeds", type=int, default=2, help="redes por tramo (se promedian)")
+    ap.add_argument("--seeds", type=int, default=5, help="redes por tramo (se promedian)")
     ap.add_argument("--epochs", type=int, default=None,
                     help="máximo de épocas por red (por defecto 20 en fila, 60 en bloque)")
     ap.add_argument("--cache", default="barras_diarias.csv")

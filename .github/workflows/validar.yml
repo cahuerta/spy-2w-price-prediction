@@ -9,7 +9,10 @@ on:
         default: "sp500"
       semillas:
         description: "Redes por tramo (más = más lento y más estable)"
-        default: "2"
+        default: "5"
+      anios:
+        description: "Años de historial a descargar"
+        default: "8"
 
 jobs:
   validar:
@@ -28,8 +31,9 @@ jobs:
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        shell: bash
         run: |
-          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" 2>&1 | tee resultados.txt
+          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" 2>&1 | tee resultados.txt
       - name: Mostrar resultado en el resumen
         if: always()
         run: |
