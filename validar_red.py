@@ -653,10 +653,13 @@ def simular(pred_h, R, spyR, h, modo, tr_list, k, cost_bps, borrow):
         if np.isnan(p).any():
             continue
         orden = np.argsort(p)
+        if modo == "short":                  # solo diagnóstico: la canasta que la red menos quiere
+            W[t, orden[:k]] = 1.0 / k
+            continue
         W[t, orden[-k:]] = 1.0 / k
         if modo == "ls":
             W[t, orden[:k]] = -1.0 / k
-    gross = 1.0 if modo == "long" else 2.0
+    gross = 1.0 if modo in ("long", "short") else 2.0
     costo = 2.0 * cost_bps * 1e-4 * gross / h
     borr = borrow / 252.0 if modo == "ls" else 0.0
 
@@ -767,6 +770,34 @@ def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
             print(f"  {nombre:<18}{sb['ann'] * 100:>9.1f}%{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}"
                   f"{sn['dd'] * 100:>7.1f}%{pos:>5}/{len(por_tramo):<3}{ss['ann'] * 100:>8.1f}%{ss['sharpe']:>8.2f}"
                   f"  {'PASA' if ok else 'no pasa'}")
+            if modo == "ls":
+                por_ls = por_tramo
+
+        # --- ¿de dónde sale la pérdida? Cada pierna por separado (retorno bruto de la canasta) ---
+        ph = pred[:, :, hi]
+        bl, _, sp, _ = simular(ph, R, spyR, h, "long", tr_list, args.k, 0.0, 0.0)
+        bs, _, _, _ = simular(ph, R, spyR, h, "short", tr_list, args.k, 0.0, 0.0)
+        beta = lambda x: float(np.cov(x, sp)[0, 1] / np.var(sp, ddof=1))
+        print(f"  piernas (bruto): comprada top{args.k} {estadisticas(bl)['ann'] * 100:+.1f}%/año (beta {beta(bl):.2f}) | "
+              f"vendida bottom{args.k} {estadisticas(bs)['ann'] * 100:+.1f}%/año (beta {beta(bs):.2f}) | "
+              f"SPY {estadisticas(sp)['ann'] * 100:+.1f}%/año")
+        print("    (si la vendida rinde MÁS que la comprada, la red está ordenando al revés)")
+
+        # --- señal invertida (informativa; ver nota) ---
+        inv = -ph
+        causal = ph.copy()
+        for i, (a, b) in enumerate(tr_list):
+            if i > 0 and por_ls[i - 1] < 0:      # el tramo anterior perdió: este se opera al revés
+                causal[a:b + 1] = -causal[a:b + 1]
+        for etiqueta, pr in (("cortos INVERTIDO*", inv), ("ls signo tramo prev", causal)):
+            bruto, neto, spy, por_tramo = simular(pr, R, spyR, h, "ls", tr_list, args.k, args.cost_bps, args.borrow)
+            sb, sn, ss = estadisticas(bruto), estadisticas(neto), estadisticas(spy)
+            ok, pos = veredicto(por_tramo, sn, ss)
+            print(f"  {etiqueta:<18}{sb['ann'] * 100:>9.1f}%{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}"
+                  f"{sn['dd'] * 100:>7.1f}%{pos:>5}/{len(por_tramo):<3}{ss['ann'] * 100:>8.1f}%{ss['sharpe']:>8.2f}"
+                  f"  {'pasaría' if ok else 'no pasa'}")
+        print("    * el signo se invirtió mirando estos mismos resultados: solo orienta, no vale como prueba.")
+        print("      'signo tramo prev' decide el signo de cada tramo con el tramo anterior (sin mirar adelante).")
 
     return pasan
 
