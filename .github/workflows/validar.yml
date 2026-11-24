@@ -14,6 +14,9 @@ on:
       liquidas:
         description: "Quedarse con las N acciones más líquidas del universo (0 = todas)"
         default: "150"
+      relaciones:
+        description: "Usar variables de relación entre acciones (si / no), para comparar con y sin"
+        default: "si"
       anios:
         description: "Años de historial a descargar"
         default: "8"
@@ -37,7 +40,9 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         shell: bash
         run: |
-          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" --liquidas "${{ inputs.liquidas }}" 2>&1 | tee resultados.txt
+          EXTRA=""
+          if [ "${{ inputs.relaciones }}" = "no" ]; then EXTRA="--sin-relaciones"; fi
+          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" --liquidas "${{ inputs.liquidas }}" $EXTRA 2>&1 | tee resultados.txt
       - name: Mostrar resultado en el resumen
         if: always()
         run: |

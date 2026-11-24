@@ -236,7 +236,60 @@ def filtrar_liquidas(p, tickers, n, precio_min=10.0):
     return elegidas
 
 
-def construir(p, tickers):
+def relaciones(rex, tickers, W=60, k=5, WL=250):
+    """Variables de RELACIÓN entre acciones. Todo se calcula día a día con datos hasta ese día.
+    rex: retornos diarios de cada acción contra SPY, forma [días, acciones].
+      - vecinos: las k acciones que más se mueven igual que ella en los últimos W días. Se mide
+        cómo les fue hoy y en 5 días, y si ella va atrasada o adelantada respecto de ellas.
+      - líderes: las k acciones cuyo movimiento de AYER mejor anticipó el movimiento de HOY de
+        ella (correlación con un día de rezago). Se mide cómo les fue hoy.
+      - pares del sector: promedio de las demás acciones de su mismo sector.
+      - estado del mercado: correlación promedio entre acciones y dispersión del día."""
+    T, N = rex.shape
+    k = max(1, min(k, N - 1))
+    cs = np.cumsum(rex, axis=0)
+    m5 = cs.copy()
+    m5[5:] = cs[5:] - cs[:-5]
+    nb1, nb5, ld1 = (np.zeros((T, N)) for _ in range(3))
+    corr_prom = np.zeros(T)
+
+    def zs(X):
+        return (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+
+    for t in range(W, T):
+        Z = zs(rex[t - W + 1:t + 1])                    # ventana que termina hoy
+        C = Z.T @ Z / W                                 # quién se mueve como quién
+        np.fill_diagonal(C, -9.0)
+        corr_prom[t] = (C.sum() + 9.0 * N) / (N * (N - 1))
+        nb = np.argpartition(-C, k - 1, axis=1)[:, :k]
+        nb1[t] = rex[t][nb].mean(axis=1)
+        nb5[t] = m5[t][nb].mean(axis=1)
+        if t < WL:
+            continue
+        # quién de ayer anticipa a quién de hoy; ventana larga porque la relación es muy débil
+        # y con pocos días se confunde con ruido
+        L = zs(rex[t - WL + 1:t + 1]).T @ zs(rex[t - WL:t]) / WL
+        np.fill_diagonal(L, -9.0)
+        ld = np.argpartition(-L, k - 1, axis=1)[:, :k]
+        ld1[t] = rex[t][ld].mean(axis=1)
+
+    sec1, sec5 = np.zeros((T, N)), np.zeros((T, N))
+    grupos = {}
+    for j, tk in enumerate(tickers):
+        grupos.setdefault(SECTOR_DE.get(tk), []).append(j)
+    for g, idx in grupos.items():
+        if g is None or len(idx) < 2:
+            continue
+        for src, dst in ((rex, sec1), (m5, sec5)):
+            s = src[:, idx].sum(axis=1, keepdims=True)
+            dst[:, idx] = (s - src[:, idx]) / (len(idx) - 1)
+
+    disp = np.repeat(rex.std(axis=1)[:, None], N, axis=1)
+    cp = np.repeat(corr_prom[:, None], N, axis=1)
+    return [nb1, nb5, m5 - nb5, ld1, sec1, sec5, disp, cp]
+
+
+def construir(p, tickers, usar_rel=True):
     ctx = [x for x in CONTEXTO if x in p["close"].columns]
     o, h, l, c, v = (p[k][tickers + [BENCH] + ctx] for k in ("open", "high", "low", "close", "volume"))
     ret1 = np.log(c / c.shift(1))
@@ -276,6 +329,11 @@ def construir(p, tickers):
     # volumen de la última semana contra el del último mes
     vol_trend = np.log((v.rolling(5, min_periods=3).mean() + 1) / (v.rolling(20, min_periods=10).mean() + 1))
 
+    rel_feats = []
+    if usar_rel:
+        rex = np.nan_to_num(cols(ret1.sub(spy_ret, axis=0)), nan=0.0, posinf=0.0, neginf=0.0)
+        rel_feats = relaciones(rex, tickers)
+
     F = np.stack(
         [
             cols(ret1),                                   # retorno del día
@@ -295,7 +353,7 @@ def construir(p, tickers):
             cols(dist_max),                               # distancia al máximo de 60 días
             cols(vol_trend),                              # tendencia del volumen
             rk(ret1), rk(mom5), rk(mom20), rk(vol20),     # posición entre todas las acciones ese día
-        ] + ctx_b,                                        # volatilidad, tasas, dólar, oro, petróleo, sectores
+        ] + rel_feats + ctx_b,                                      # volatilidad, tasas, dólar, oro, petróleo, sectores
         axis=2,
     )
     F = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -637,6 +695,8 @@ def main():
                     help="quedarse solo con las N acciones más líquidas (y de precio >= 10 USD); 0 = sin filtro")
     ap.add_argument("--frac", type=float, default=0.5,
                     help="fracción de días de entrenamiento usada por época en la red en bloque (acelera)")
+    ap.add_argument("--sin-relaciones", action="store_true",
+                    help="no usar las variables de relación entre acciones (para comparar con y sin)")
     ap.add_argument("--years", type=float, default=8.0, help="años de historial a descargar")
     ap.add_argument("--k", type=int, default=10, help="acciones por lado en el portafolio")
     ap.add_argument("--cost-bps", type=float, default=5.0, help="costo por lado en puntos base (spread + slippage)")
@@ -658,7 +718,7 @@ def main():
         p = a_paneles(descargar_alpaca(args.years, args.cache, args.refresh, obtener_universo(args.universo)))
     p, tickers = limpiar(p)
     tickers = filtrar_liquidas(p, tickers, args.liquidas)
-    F, Y, R, spyR, fechas = construir(p, tickers)
+    F, Y, R, spyR, fechas = construir(p, tickers, usar_rel=not args.sin_relaciones)
     T, N, H = Y.shape
     print(f"{N} acciones, {T} días ({fechas[0].date()} a {fechas[-1].date()}).")
 
