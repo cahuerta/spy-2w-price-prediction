@@ -52,7 +52,7 @@ import pandas as pd
 # ----------------------------------------------------------------------------
 # PARÁMETROS (se pueden cambiar por línea de comandos cuando corresponde)
 # ----------------------------------------------------------------------------
-HORIZONTES = (1, 3, 5)      # días de tenencia: 24 horas hasta 1 semana
+HORIZONTES = (1, 3, 5, 21, 63)  # días de tenencia: de 24 horas a ~3 meses (se cambia con --horizontes)
 LOOKBACK = 60               # barras diarias que mira la red
 TRAIN_DAYS = 504            # ~2 años para entrenar en cada tramo
 TEST_DAYS = 126             # ~6 meses de prueba por tramo
@@ -86,6 +86,10 @@ SECTOR_ETF = {
 }
 SECTOR_DE = {}              # símbolo -> ETF de su sector (se llena al cargar el S&P 500)
 OFFS = np.arange(-LOOKBACK + 1, 1)
+NF_PRECIO = None            # cuántas columnas de F son de precio/relaciones/contexto (el resto: fundamentales)
+GRUPOS = {}                 # filosofía -> columnas de F que lee (se llena en construir)
+GATES_LOG = []              # peso que la red le da a cada filosofía (se llena al predecir)
+DEMO_Q = {}                 # calidad inventada de cada acción en los datos de prueba
 
 
 # ----------------------------------------------------------------------------
@@ -113,7 +117,7 @@ def obtener_universo(modo):
         return list(UNIVERSO)
 
 
-def descargar_alpaca(years, cache, refrescar, tickers):
+def descargar_alpaca(years, cache, refrescar, tickers, raw=False):
     if os.path.exists(cache) and not refrescar:
         print(f"Usando datos guardados en {cache} (usa --refresh para volver a descargar)")
         return pd.read_csv(cache)
@@ -131,7 +135,7 @@ def descargar_alpaca(years, cache, refrescar, tickers):
     cli = StockHistoricalDataClient(key, secret)
     fin = datetime.now(timezone.utc) - timedelta(days=1)
     ini = fin - timedelta(days=int(365.25 * years) + 10)
-    todos = list(dict.fromkeys(tickers + [BENCH] + CONTEXTO))
+    todos = list(dict.fromkeys(tickers if raw else tickers + [BENCH] + CONTEXTO))
     print(f"Descargando {len(todos)} símbolos desde Alpaca (feed IEX)...", flush=True)
     partes = []
     for i in range(0, len(todos), 100):
@@ -139,7 +143,7 @@ def descargar_alpaca(years, cache, refrescar, tickers):
         for intento in range(3):
             try:
                 req = StockBarsRequest(symbol_or_symbols=lote_s, timeframe=TimeFrame.Day,
-                                       start=ini, end=fin, adjustment=Adjustment.ALL,
+                                       start=ini, end=fin, adjustment=Adjustment.RAW if raw else Adjustment.ALL,
                                        feed=DataFeed.IEX)
                 d = cli.get_stock_bars(req).df.reset_index()
                 partes.append(d)
@@ -174,6 +178,10 @@ def datos_demo(modo, seed=0):
     mkt = rng.normal(0.0004, 0.010, T)
     beta = rng.uniform(0.7, 1.3, N)
     idio = rng.normal(0.0, 0.015, (T, N))
+    if modo == "calidad":    # las acciones de "buena calidad" suben algo más, de a poco
+        q = rng.normal(0.0, 1.0, N)
+        idio += 0.0003 * q[None, :]
+        DEMO_Q["q"] = q
     if modo == "senal":
         for t in range(1, T):
             idio[t] += 0.06 * idio[t - 1]
@@ -289,7 +297,233 @@ def relaciones(rex, tickers, W=60, k=5, WL=250):
     return [nb1, nb5, m5 - nb5, ld1, sec1, sec5, disp, cp]
 
 
-def construir(p, tickers, usar_rel=True):
+# ----------------------------------------------------------------------------
+# FUNDAMENTALES (SEC EDGAR, gratis): lo que miran los inversores de largo plazo
+# ----------------------------------------------------------------------------
+HECHOS_FLUJO = {   # cifras de un año completo (informe 10-K)
+    "ing": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet", "SalesRevenueGoodsNet"],
+    "util": ["NetIncomeLoss", "ProfitLoss"],
+    "op": ["OperatingIncomeLoss"],
+    "fop": ["NetCashProvidedByUsedInOperatingActivities"],
+    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
+    "idi": ["ResearchAndDevelopmentExpense", "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"],
+    "div": ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends"],
+}
+HECHOS_SALDO = {   # foto del balance en una fecha
+    "pat": ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    "act": ["Assets"],
+}
+FILOSOFIAS = {     # qué cifras lee la capa de cada inversor
+    "Buffett/Munger": ["roe", "margen", "solidez", "estab", "r_util", "r_caja"],
+    "Graham": ["r_libro", "r_util", "solidez", "r_div"],
+    "Lynch": ["crec_util", "r_util", "peg_inv", "crec_ing"],
+    "Kiyosaki": ["caja_act", "r_caja", "r_div"],
+    "Musk": ["crec_ing", "id_ing", "capex_ing"],
+}
+
+
+def compactar(cf):
+    """De la respuesta completa de la SEC deja solo lo que usamos: [fin del período, fecha en que
+    se PUBLICÓ, valor]. Para cada período se guarda la primera publicación (sin correcciones
+    posteriores), que es lo que se sabía en ese momento."""
+    hechos = cf.get("facts", {})
+    gaap, dei = hechos.get("us-gaap", {}), hechos.get("dei", {})
+
+    def filas(tag, fuente, unidades, flujo):
+        res = []
+        for u in unidades:
+            for f in fuente.get(tag, {}).get("units", {}).get(u, []):
+                try:
+                    if flujo:
+                        if f.get("form") not in ("10-K", "10-K/A") or f.get("fp") != "FY":
+                            continue
+                        dias = (pd.Timestamp(f["end"]) - pd.Timestamp(f["start"])).days
+                        if not 330 <= dias <= 400:
+                            continue
+                    res.append((f["end"], f["filed"], float(f["val"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+        return res
+
+    def combinar(tags, fuente, unidades, flujo):
+        por_fin = {}
+        for tag in tags:
+            for fin, pub, val in sorted(filas(tag, fuente, unidades, flujo), key=lambda r: r[1]):
+                por_fin.setdefault(fin, (pub, val))
+        return sorted([[fin, pub, val] for fin, (pub, val) in por_fin.items()])
+
+    out = {k: combinar(v, gaap, ("USD",), True) for k, v in HECHOS_FLUJO.items()}
+    out.update({k: combinar(v, gaap, ("USD",), False) for k, v in HECHOS_SALDO.items()})
+    out["acc"] = combinar(["EntityCommonStockSharesOutstanding"], dei, ("shares",), False) or \
+        combinar(["CommonStockSharesOutstanding"], gaap, ("shares",), False)
+    return out
+
+
+def descargar_fundamentales(tickers, cache, refrescar):
+    """Baja de la SEC (data.sec.gov, gratis, sin llave) las cifras de cada empresa. La SEC pide
+    identificarse con un contacto (variable SEC_CONTACT) y no más de 10 consultas por segundo."""
+    import json
+    import requests
+    datos = {}
+    if os.path.exists(cache) and not refrescar:
+        datos = json.load(open(cache))
+        print(f"Fundamentales: usando {cache} ({len(datos)} empresas)")
+    faltan = [t for t in tickers if t not in datos]
+    if not faltan:
+        return datos
+    contacto = os.getenv("SEC_CONTACT") or "github.com/cahuerta/spy-2w-price-prediction"
+    ses = requests.Session()
+    ses.headers.update({"User-Agent": f"validar_red {contacto}", "Accept-Encoding": "gzip, deflate"})
+    r = ses.get("https://www.sec.gov/files/company_tickers.json", timeout=60)
+    r.raise_for_status()
+    cik = {str(v["ticker"]).upper(): int(v["cik_str"]) for v in r.json().values()}
+    print(f"Fundamentales: bajando {len(faltan)} empresas de la SEC...", flush=True)
+    for i, tk in enumerate(faltan, 1):
+        c = cik.get(tk.upper().replace(".", "-")) or cik.get(tk.upper())
+        if c is None:
+            print(f"  {tk}: no aparece en la lista de la SEC")
+            continue
+        for intento in range(3):
+            try:
+                rr = ses.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{c:010d}.json", timeout=90)
+                if rr.status_code == 404:
+                    break
+                rr.raise_for_status()
+                datos[tk] = compactar(rr.json())
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"  {tk}: error ({e}); reintento {intento + 1}/3", flush=True)
+                time.sleep(3 * (intento + 1))
+        time.sleep(0.15)
+        if i % 25 == 0:
+            print(f"  {i}/{len(faltan)}", flush=True)
+    json.dump(datos, open(cache, "w"))
+    return datos
+
+
+def serie_pit(filas, fechas):
+    """Valor vigente cada día usando SOLO lo ya publicado (desde el día hábil siguiente a la
+    publicación). Devuelve (valor actual, valor del período anterior)."""
+    T = len(fechas)
+    cur, prev = np.full(T, np.nan), np.full(T, np.nan)
+    previo = np.nan
+    for fin, pub, val in filas:
+        i = fechas.searchsorted(pd.Timestamp(pub), side="right")
+        if i >= T:
+            previo = val
+            continue
+        prev[i:] = previo
+        cur[i:] = val
+        previo = val
+    return cur, prev
+
+
+def panel_fundamentales(datos, tickers, fechas, close_raw):
+    """Arma las variables de cada filosofía, todas con datos conocidos ese día. Cada una se
+    convierte en posición entre todas las acciones (de -0.5 a +0.5); sin dato = 0 (neutro)."""
+    T, N = len(fechas), len(tickers)
+    base = {k: np.full((T, N), np.nan) for k in
+            ["ing", "ing_p", "util", "util_p", "op", "fop", "capex", "idi", "div", "pat", "act", "acc", "estab"]}
+    con_datos = 0
+    for j, tk in enumerate(tickers):
+        d = datos.get(tk)
+        if not d:
+            continue
+        con_datos += 1
+        for k in ("ing", "util"):
+            base[k][:, j], base[k + "_p"][:, j] = serie_pit(d.get(k, []), fechas)
+        for k in ("op", "fop", "capex", "idi", "div", "pat", "act", "acc"):
+            base[k][:, j], _ = serie_pit(d.get(k, []), fechas)
+        act_fin = {f[0]: f[2] for f in d.get("act", [])}
+        roa = [(f[0], f[1], f[2] / act_fin[f[0]]) for f in d.get("util", []) if act_fin.get(f[0])]
+        est = [(roa[i][0], roa[i][1], float(np.std([x[2] for x in roa[max(0, i - 4):i + 1]])))
+               for i in range(len(roa)) if i >= 2]
+        base["estab"][:, j], _ = serie_pit(est, fechas)
+    print(f"Fundamentales: {con_datos} de {N} acciones con datos de la SEC.")
+
+    with np.errstate(all="ignore"):
+        cr = close_raw.reindex(fechas)[tickers].values
+        mcap = cr * base["acc"]
+        mcap = np.where(mcap > 0, mcap, np.nan)
+        pat = np.where(base["pat"] > 0, base["pat"], np.nan)
+        ing = np.where(base["ing"] > 0, base["ing"], np.nan)
+        capex = np.nan_to_num(base["capex"], nan=0.0)
+        fcf = base["fop"] - capex
+        r_util = base["util"] / mcap
+        crec_util = np.clip((base["util"] - base["util_p"]) / np.abs(base["util_p"]), -2, 2)
+        crec_ing = np.clip(base["ing"] / np.where(base["ing_p"] > 0, base["ing_p"], np.nan) - 1, -1, 2)
+        cols = {
+            "roe": base["util"] / pat,
+            "margen": base["op"] / ing,
+            "solidez": -(base["act"] - base["pat"]) / base["act"],      # menos deuda = más sólida
+            "estab": -base["estab"],                                    # ganancias más estables
+            "r_util": r_util,                                           # ganancia / precio
+            "r_caja": fcf / mcap,                                       # caja libre / precio
+            "r_libro": base["pat"] / mcap,                              # patrimonio / precio
+            "r_div": np.nan_to_num(base["div"], nan=0.0) / mcap,        # dividendos / precio
+            "crec_util": crec_util,
+            "crec_ing": crec_ing,
+            "peg_inv": np.where(r_util > 0, crec_util * r_util, np.nan),
+            "caja_act": base["fop"] / base["act"],
+            "id_ing": np.nan_to_num(base["idi"], nan=0.0) / ing,
+            "capex_ing": capex / ing,
+        }
+        nombres = list(cols)
+        F = np.stack([pd.DataFrame(np.where(np.isfinite(cols[k]), cols[k], np.nan)).rank(axis=1, pct=True)
+                      .values - 0.5 for k in nombres], axis=2)
+    F = np.nan_to_num(F, nan=0.0).astype(np.float32)
+    grupos = {g: [nombres.index(k) for k in ks] for g, ks in FILOSOFIAS.items()}
+    return F, grupos
+
+
+def fund_demo(p, tickers):
+    """Cifras inventadas en el MISMO formato de la SEC, para probar todo el camino sin internet.
+    La calidad de cada empresa (DEMO_Q) se refleja en sus cifras."""
+    q = DEMO_Q.get("q")
+    idx = p["close"].index
+    anios = range(idx[0].year - 2, idx[-1].year + 1)
+    rng = np.random.default_rng(5)
+    datos = {}
+    for j, tk in enumerate(tickers):
+        qj = 0.0 if q is None else float(q[j])
+        facts = {"us-gaap": {}, "dei": {}}
+
+        def put(tag, unidad, filas):
+            facts["us-gaap" if unidad == "USD" else "dei"][tag] = {"units": {unidad: filas}}
+
+        flujos = {k: [] for k in ("Revenues", "NetIncomeLoss", "OperatingIncomeLoss",
+                                  "NetCashProvidedByUsedInOperatingActivities",
+                                  "PaymentsToAcquirePropertyPlantAndEquipment",
+                                  "ResearchAndDevelopmentExpense", "PaymentsOfDividendsCommonStock")}
+        saldos = {"StockholdersEquity": [], "Assets": []}
+        for a in anios:
+            fin, ini = f"{a}-12-31", f"{a}-01-01"
+            pub = (pd.Timestamp(fin) + pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+            pat = 1e9 * (1 + 0.1 * (a - anios[0]))
+            act = pat * (1.5 + 0.5 * rng.random())
+            ing = act * 0.8
+            ni = (0.08 + 0.05 * qj + 0.01 * rng.normal()) * pat
+            vals = {"Revenues": ing, "NetIncomeLoss": ni, "OperatingIncomeLoss": ing * (0.12 + 0.04 * qj),
+                    "NetCashProvidedByUsedInOperatingActivities": ni * 1.1,
+                    "PaymentsToAcquirePropertyPlantAndEquipment": ing * 0.05,
+                    "ResearchAndDevelopmentExpense": ing * 0.03,
+                    "PaymentsOfDividendsCommonStock": max(ni, 0) * 0.3}
+            for k, v in vals.items():
+                flujos[k].append({"start": ini, "end": fin, "val": v, "form": "10-K", "fp": "FY", "filed": pub})
+            saldos["StockholdersEquity"].append({"end": fin, "val": pat, "form": "10-K", "filed": pub})
+            saldos["Assets"].append({"end": fin, "val": act, "form": "10-K", "filed": pub})
+        for k, v in flujos.items():
+            put(k, "USD", v)
+        for k, v in saldos.items():
+            put(k, "USD", v)
+        facts["dei"]["EntityCommonStockSharesOutstanding"] = {"units": {"shares": [
+            {"end": f"{anios[0]}-12-31", "val": 1e8, "form": "10-K", "filed": f"{anios[0] + 1}-02-28"}]}}
+        datos[tk] = compactar({"facts": facts})
+    return datos, p["close"].copy()
+
+
+def construir(p, tickers, usar_rel=True, fund=None, close_raw=None):
     ctx = [x for x in CONTEXTO if x in p["close"].columns]
     o, h, l, c, v = (p[k][tickers + [BENCH] + ctx] for k in ("open", "high", "low", "close", "volume"))
     ret1 = np.log(c / c.shift(1))
@@ -357,6 +591,12 @@ def construir(p, tickers, usar_rel=True):
         axis=2,
     )
     F = np.nan_to_num(F, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    global NF_PRECIO, GRUPOS
+    NF_PRECIO, GRUPOS = F.shape[2], {}
+    if fund is not None:
+        Ff, g = panel_fundamentales(fund, tickers, c.index, close_raw)
+        F = np.concatenate([F, Ff], axis=2)
+        GRUPOS = {nom: [NF_PRECIO + i for i in idx] for nom, idx in g.items()}
 
     op = cols(o)
     spy_op = o[BENCH].values
@@ -463,13 +703,27 @@ def predecir(net, Fn, ts, ns):
 # ----------------------------------------------------------------------------
 # RED EN BLOQUE: ve todas las acciones a la vez
 # ----------------------------------------------------------------------------
-def crear_red_bloque(nf, nout, hid=32, heads=4):
+def crear_red_bloque(nf, nout, hid=32, heads=4, n_precio=None, grupos=None):
+    """Una GRU lee el precio de 60 días de cada acción (capa 'Soros/Dalio': precio, relaciones y
+    mercado). Si hay fundamentales, cada filosofía (Buffett, Graham, Lynch, Kiyosaki, Musk) tiene
+    su propia capa que lee solo sus cifras. Una compuerta aprende cuánto pesa cada filosofía para
+    cada acción, y después la atención deja que las acciones se miren entre sí."""
+    import torch
     import torch.nn as nn
+
+    n_precio = n_precio or nf
+    grupos = grupos or {}
+    nombres = ["Soros/Dalio (precio y mercado)"] + list(grupos)
 
     class RedBloque(nn.Module):
         def __init__(self):
             super().__init__()
-            self.gru = nn.GRU(nf, hid, batch_first=True)
+            self.nombres = nombres
+            self.gru = nn.GRU(n_precio, hid, batch_first=True)
+            self.mlps = nn.ModuleList([
+                nn.Sequential(nn.Linear(len(ix), hid), nn.GELU(), nn.Linear(hid, hid)) for ix in grupos.values()])
+            self.gate = nn.Linear(hid * len(nombres), len(nombres)) if grupos else None
+            self.gate_prom = None
             self.att = nn.MultiheadAttention(hid, heads, dropout=0.1, batch_first=True)
             self.n1 = nn.LayerNorm(hid)
             self.ff = nn.Sequential(nn.Linear(hid, 2 * hid), nn.GELU(), nn.Linear(2 * hid, hid))
@@ -479,8 +733,15 @@ def crear_red_bloque(nf, nout, hid=32, heads=4):
 
         def forward(self, x):  # x: [días, acciones, barras, características]
             b, n, l, f = x.shape
-            _, hn = self.gru(x.reshape(b * n, l, f))
+            _, hn = self.gru(x[..., :n_precio].reshape(b * n, l, n_precio))
             e = hn[-1].reshape(b, n, -1)              # una "huella" por acción
+            if self.gate is not None:
+                ultimo = x[:, :, -1, :]                # cifras vigentes hoy
+                es = [e] + [m(ultimo[..., ix]) for m, ix in zip(self.mlps, grupos.values())]
+                st = torch.stack(es, dim=2)            # [días, acciones, filosofías, hid]
+                g = torch.softmax(self.gate(st.flatten(2)), dim=-1)
+                self.gate_prom = g.detach().mean(dim=(0, 1))
+                e = (g.unsqueeze(-1) * st).sum(dim=2)
             a, _ = self.att(e, e, e, need_weights=False)  # cada acción mira a todas las demás
             e = self.n1(e + self.drop(a))
             e = self.n2(e + self.drop(self.ff(e)))
@@ -501,7 +762,7 @@ def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, pacien
 
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
-    net = crear_red_bloque(Fn.shape[2], Ys.shape[2])
+    net = crear_red_bloque(Fn.shape[2], Ys.shape[2], n_precio=NF_PRECIO, grupos=GRUPOS)
     opt = torch.optim.AdamW(net.parameters(), lr=LR, weight_decay=1e-3)
     lossf = nn.HuberLoss(delta=1.0)
     mejor, estado, malas, ep_mejor = np.inf, None, 0, 0
@@ -536,10 +797,15 @@ def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, pacien
 
 def predecir_bloque(net, Fn, dias):
     import torch
-    out = []
+    out, pesos = [], []
     with torch.no_grad():
         for i in range(0, len(dias), 16):
-            out.append(net(lote_bloque(Fn, dias[i:i + 16])).numpy())
+            d = dias[i:i + 16]
+            out.append(net(lote_bloque(Fn, d)).numpy())
+            if net.gate_prom is not None:
+                pesos.append(net.gate_prom.numpy() * len(d))
+    if pesos:
+        GATES_LOG.append(np.sum(pesos, axis=0) / len(dias))
     return np.concatenate(out, axis=0)                 # [días, acciones, horizontes]
 
 
@@ -587,6 +853,8 @@ def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1
         mu = F[t_ini:t_fin + 1].reshape(-1, F.shape[2]).mean(axis=0)
         sd = F[t_ini:t_fin + 1].reshape(-1, F.shape[2]).std(axis=0) + 1e-8
         Fn = np.clip((F - mu) / sd, -5, 5).astype(np.float32)
+        if modelo != "bloque" and NF_PRECIO:
+            Fn = np.ascontiguousarray(Fn[:, :, :NF_PRECIO])   # la red por fila no usa fundamentales
 
         tr = muestras(Y, t_ini, fit_fin)
         va = muestras(Y, v_ini, t_fin)
@@ -710,8 +978,9 @@ def veredicto(por_tramo, st_neto, st_spy):
 # PRINCIPAL
 # ----------------------------------------------------------------------------
 def main():
+    global HORIZONTES
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--demo", choices=["ruido", "senal", "cruzada"],
+    ap.add_argument("--demo", choices=["ruido", "senal", "cruzada", "calidad"],
                     help="usar datos inventados para probar el sistema")
     ap.add_argument("--modelo", type=str.lower, choices=["fila", "bloque", "ambos"], default="bloque",
                     help="fila: una GRU por acción; bloque: la red ve todas las acciones a la vez")
@@ -723,6 +992,11 @@ def main():
                     help="fracción de días de entrenamiento usada por época en la red en bloque (acelera)")
     ap.add_argument("--sin-relaciones", action="store_true",
                     help="no usar las variables de relación entre acciones (para comparar con y sin)")
+    ap.add_argument("--sin-fundamentales", action="store_true",
+                    help="no usar cifras de la SEC (capas de Buffett, Graham, Lynch, Kiyosaki, Musk)")
+    ap.add_argument("--horizontes", default=",".join(str(x) for x in HORIZONTES),
+                    help="días de tenencia a evaluar, separados por coma (por defecto 1,3,5,21,63)")
+    ap.add_argument("--sec-cache", default="fundamentales_sec.json")
     ap.add_argument("--years", type=float, default=8.0, help="años de historial a descargar")
     ap.add_argument("--k", type=int, default=10, help="acciones por lado en el portafolio")
     ap.add_argument("--cost-bps", type=float, default=5.0, help="costo por lado en puntos base (spread + slippage)")
@@ -736,6 +1010,7 @@ def main():
 
     import torch
     torch.set_num_threads(os.cpu_count() or 1)
+    HORIZONTES = tuple(int(x) for x in args.horizontes.split(","))
 
     if args.demo:
         print(f"MODO PRUEBA con datos inventados ({args.demo}).")
@@ -744,7 +1019,16 @@ def main():
         p = a_paneles(descargar_alpaca(args.years, args.cache, args.refresh, obtener_universo(args.universo)))
     p, tickers = limpiar(p)
     tickers = filtrar_liquidas(p, tickers, args.liquidas)
-    F, Y, R, spyR, fechas = construir(p, tickers, usar_rel=not args.sin_relaciones)
+    fund = close_raw = None
+    if not args.sin_fundamentales and (args.demo in (None, "calidad")):
+        if args.demo:
+            fund, close_raw = fund_demo(p, tickers)
+        else:
+            fund = descargar_fundamentales(tickers, args.sec_cache, args.refresh)
+            close_raw = a_paneles(descargar_alpaca(args.years, "barras_raw.csv", args.refresh, tickers,
+                                                   raw=True))["close"]
+    F, Y, R, spyR, fechas = construir(p, tickers, usar_rel=not args.sin_relaciones,
+                                      fund=fund, close_raw=close_raw)
     T, N, H = Y.shape
     print(f"{N} acciones, {T} días ({fechas[0].date()} a {fechas[-1].date()}).")
 
@@ -768,6 +1052,11 @@ def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
     pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, epocas, modelo, args.frac)
 
     B = betas_rodantes(R, spyR)
+    if GATES_LOG and GRUPOS:
+        nombres = ["Soros/Dalio (precio y mercado)"] + list(GRUPOS)
+        w = np.mean(GATES_LOG, axis=0)
+        print("Peso medio que la red le dio a cada filosofía: " +
+              " | ".join(f"{n} {x * 100:.0f}%" for n, x in zip(nombres, w)))
     print("\n" + "=" * 78)
     print(f"RESULTADOS modelo {modelo.upper()} (solo períodos de prueba; costo {args.cost_bps:g} pb por lado, "
           f"préstamo {args.borrow * 100:g}%/año, K={args.k} por lado)")
@@ -851,7 +1140,7 @@ def resumen(pasan, n_modelos):
     print("Sharpe mayor que el de comprar SPY en los mismos días.")
     if pasan:
         print("Configuraciones que pasan: " + ", ".join(f"modelo {m}, {n} a {h}d" for m, h, n in pasan))
-        print(f"OJO: se probaron {6 * n_modelos} combinaciones sobre los mismos datos; elegir la mejor infla el")
+        print(f"OJO: se probaron {3 * len(HORIZONTES) * n_modelos} combinaciones sobre los mismos datos; elegir la mejor infla el")
         print("resultado. Además la lista de acciones son las del S&P 500 de HOY (sesgo de")
         print("supervivencia: las que salieron del índice no están). Si pasa, confirmar en paper trading antes de usar dinero real.")
     else:

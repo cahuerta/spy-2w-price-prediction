@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 barras_diarias.csv
 resultados.txt
+fundamentales_sec.json
+barras_raw.csv
