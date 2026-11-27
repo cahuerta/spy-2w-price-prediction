@@ -983,6 +983,9 @@ def simular(pred_h, R, spyR, h, modo, tr_list, k, cost_bps, borrow, beta=None):
         p = pred_h[t]
         if np.isnan(p).any():
             continue
+        if modo == "todas":                  # comparación: todas las acciones a partes iguales
+            W[t] = 1.0 / N
+            continue
         if modo == "pesos":                  # el portafolio que armó la red (softmax de sus puntajes)
             e = np.exp(p - p.max())
             W[t] = e / e.sum()
@@ -1149,14 +1152,50 @@ def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
             print(f"  Filosofías sin red (compra las {args.k} con mejor puntaje de esa filosofía):")
             puntajes = {g: F[:, :, ix].mean(axis=2) for g, ix in GRUPOS.items()}
             puntajes["Todas juntas (se suman)"] = np.mean(list(puntajes.values()), axis=0)
-            for g, sc in puntajes.items():
-                bruto, neto, spy, por_tramo = simular(sc + 1e-9 * np.random.default_rng(0).random(sc.shape),
-                                                      R, spyR, h, "long", tr_list, args.k, args.cost_bps, args.borrow)
+            ruido = 1e-9 * np.random.default_rng(0).random(F.shape[:2])
+
+            # pesos que se ajustan solos: al empezar cada tramo, más peso a la filosofía que mejor le
+            # ganó a SPY en el último año (solo con resultados ya conocidos ese día)
+            solas = {g: v for g, v in puntajes.items() if not g.startswith("Todas")}
+            adapt = np.zeros(F.shape[:2])
+            pesos_tr = []
+            for a, b in tr_list:
+                ventana = [(a - 252, a - h - 2)]
+                sh = []
+                for g, sc in solas.items():
+                    _, nt, sp_, _ = simular(sc + ruido, R, spyR, h, "long", ventana, args.k, args.cost_bps, args.borrow)
+                    ex = nt - sp_
+                    sh.append(ex.mean() / (ex.std() + 1e-9) * np.sqrt(252))
+                wg = np.exp(2.0 * (np.array(sh) - np.max(sh)))
+                wg /= wg.sum()
+                pesos_tr.append(wg)
+                adapt[a:b + 1] = sum(w * sc[a:b + 1] for w, sc in zip(wg, solas.values()))
+            puntajes["Pesos que se ajustan"] = adapt
+
+            def fila(nombre, bruto, neto, spy, por_tramo, marca=True):
                 sb, sn, ss = estadisticas(bruto), estadisticas(neto), estadisticas(spy)
                 ok, pos = veredicto(por_tramo, sn, ss)
-                print(f"  {g[:18]:<18}{sb['ann'] * 100:>9.1f}%{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}"
+                print(f"  {nombre[:18]:<18}{sb['ann'] * 100:>9.1f}%{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}"
                       f"{sn['dd'] * 100:>7.1f}%{pos:>5}/{len(por_tramo):<3}{ss['ann'] * 100:>8.1f}%{ss['sharpe']:>8.2f}"
-                      f"  {'pasaría' if ok else 'no pasa'}")
+                      f"  {('pasaría' if ok else 'no pasa') if marca else ''}")
+                return sn
+
+            for g, sc in puntajes.items():
+                fila(g, *simular(sc + ruido, R, spyR, h, "long", tr_list, args.k, args.cost_bps, args.borrow))
+            print("    pesos usados en cada tramo (" + ", ".join(g.split("/")[0] for g in solas) + "): " +
+                  " | ".join("/".join(f"{x * 100:.0f}" for x in w) for w in pesos_tr))
+
+            # comparaciones para saber si el mérito es de las filosofías o de las acciones elegidas
+            print(f"  Comparación (¿cualquier grupo de estas {F.shape[1]} acciones le habría ganado a SPY?):")
+            fila(f"las {F.shape[1]} iguales", *simular(ruido, R, spyR, h, "todas", tr_list, args.k, args.cost_bps, 0.0))
+            azar = []
+            for i in range(20):
+                rnd = np.random.default_rng(100 + i).random(F.shape[:2])
+                _, nt, sp_, pt = simular(rnd, R, spyR, h, "long", tr_list, args.k, args.cost_bps, 0.0)
+                azar.append((estadisticas(nt), sum(x > 0 for x in pt)))
+            print(f"  {str(args.k) + ' al azar (x20)':<18}{'':>10}{np.mean([a[0]['ann'] for a in azar]) * 100:>9.1f}%"
+                  f"{np.mean([a[0]['sharpe'] for a in azar]):>8.2f}{np.mean([a[0]['dd'] for a in azar]) * 100:>7.1f}%"
+                  f"  (promedio de 20 sorteos; el mejor: {max(a[0]['ann'] for a in azar) * 100:.1f}%/año)")
 
         # --- ¿de dónde sale la pérdida? Cada pierna por separado (retorno bruto de la canasta) ---
         ph = pred[:, :, hi]
