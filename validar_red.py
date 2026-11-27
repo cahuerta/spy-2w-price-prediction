@@ -1166,15 +1166,35 @@ def base_trimestral(S, t0, t1, k=10, cada=63):
     return B
 
 
+def base_escalonada(S, t0, t1, k=10, cada=63, partes=3):
+    """'Todas juntas' escalonada: el dinero en 'partes' carteras de k acciones; cada una rota cada
+    'cada' días pero en fechas distintas (una por mes). Cada cartera pesa 1/partes."""
+    T, N = S.shape
+    B = np.zeros((T, N + 1), dtype=np.float32)
+    paso = cada // partes
+    actuales = [np.argsort(-S[t0])[:k] for _ in range(partes)]
+    for t in range(t0, t1 + 1):
+        for j in range(partes):
+            if t > t0 and (t - t0 - j * paso) % cada == 0:
+                actuales[j] = np.argsort(-S[t])[:k]
+            B[t, actuales[j]] += 1.0 / (k * partes)
+    return B
+
+
+TOPE = 0.15   # máximo por acción en el gestor; lo que sobra queda en SPY
+
+
 def recorrer(net, Xn, S, M, R, spyR, t0, t1, w0, cost_bps, k=10):
     """Simula día a día de t0 a t1. Devuelve exceso neto sobre SPY de cada día, rotación y pesos."""
     import torch
     N = Xn.shape[1]
-    B = torch.from_numpy(base_trimestral(S.numpy(), t0, t1, k))
+    B = torch.from_numpy(base_escalonada(S.numpy(), t0, t1, k))
     w = w0
     exc, rot, pesos, objs = [], [], [], []
     for t in range(t0, t1 + 1):
         obj, vel = net(Xn[t], S[t], M[t] | (B[t, :N] > 0), w, B[t])
+        acc = torch.clamp(obj[:N], max=TOPE)                     # tope por acción
+        obj = torch.cat([acc, (1.0 - acc.sum()).reshape(1)])     # el resto va a SPY
         w_new = w + vel * (obj - w)
         giro = (w_new - w).abs().sum()
         if t + 2 < len(spyR):
@@ -1201,7 +1221,7 @@ def gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers, prec
     val_len = int(TRAIN_DAYS * VAL_FRAC)
     W = np.full((T, N + 1), np.nan)
     print(f"\nGestor diario: cada día revisa las {args.candidatas} mejores de 'Todas juntas', decide el tamaño "
-          f"de cada una (o dejar parte en SPY) y cuánto rotar, pagando {args.cost_bps:g} pb por cada operación.",
+          f"de cada una (máx. {TOPE * 100:.0f}%; el resto en SPY) y cuánto rotar, pagando {args.cost_bps:g} pb por cada operación.",
           flush=True)
     ultimo = None
     for k, (a, b) in enumerate(tr_list, 1):
@@ -1275,22 +1295,24 @@ def gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers, prec
         return sn, ss, ok, pos, len(por_tramo), extra
 
     Wb = np.zeros((T, N + 1))
+    We = np.zeros((T, N + 1))
     for a, b in tr_list:
         Wb[a:b + 1] = base_trimestral(S, a, b, args.k)[a:b + 1]
+        We[a:b + 1] = base_escalonada(S, a, b, args.k)[a:b + 1]
     print("\n" + "=" * 78)
     print("RESULTADO GESTOR DIARIO (mismos días para todos; costo real de cada operación)")
     print("=" * 78)
     print(f"  {'':<24}{'neto/año':>10}{'Sharpe':>8}{'MaxDD':>8}{'tramos+':>9}  {'rota/año':>9}{'acciones':>9}{'en SPY':>7}")
     res = {}
-    for nombre, Wx in (("gestor red", W), ("Todas juntas trimestral", Wb)):
+    for nombre, Wx in (("gestor red", W), ("Todas juntas escalonada", We), ("Todas juntas trimestral", Wb)):
         sn, ss, okx, pos, nt, (giro, nacc, enspy) = evaluar(Wx)
         res[nombre] = (sn, okx)
         print(f"  {nombre:<24}{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}{sn['dd'] * 100:>7.1f}%{pos:>5}/{nt:<3}"
               f"  {giro * 100:>8.0f}%{nacc:>9.1f}{enspy * 100:>6.0f}%")
     print(f"  {'SPY':<24}{ss['ann'] * 100:>9.1f}%{ss['sharpe']:>8.2f}")
-    g, bse = res["gestor red"][0], res["Todas juntas trimestral"][0]
+    g, bse = res["gestor red"][0], res["Todas juntas escalonada"][0]
     ok = res["gestor red"][1] and g["sharpe"] > bse["sharpe"] + 0.05 and g["ann"] > bse["ann"] + 0.005
-    print(f"  Veredicto: la red {'GOBIERNA MEJOR' if ok else 'todavía NO mejora'} que 'Todas juntas' trimestral "
+    print(f"  Veredicto: la red {'GOBIERNA MEJOR' if ok else 'todavía NO mejora'} que 'Todas juntas' escalonada "
           f"(debe ganarle a SPY, y a la base por al menos 0,5 puntos de retorno y 0,05 de Sharpe).")
 
     # ---- portafolio de hoy y ejemplos de depositar / retirar ----

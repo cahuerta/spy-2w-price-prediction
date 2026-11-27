@@ -1,4 +1,4 @@
-name: Paper trading (Todas juntas)
+name: Paper trading (Todas juntas escalonada)
 
 on:
   schedule:

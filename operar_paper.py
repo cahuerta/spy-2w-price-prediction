@@ -1,14 +1,17 @@
 """
 operar_paper.py — Paper trading (dinero ficticio en Alpaca) de la estrategia que pasó la prueba:
-"Todas juntas" con rotación trimestral.
+"Todas juntas" ESCALONADA: el dinero en 3 carteras de 10 acciones; cada una rota cada 3 meses, pero
+en meses distintos (cartera 1: ene/abr/jul/oct; cartera 2: feb/may/ago/nov; cartera 3: mar/jun/sep/dic).
+Así cada mes rota un tercio, que es la versión que mejor salió en la prueba.
 
 Cada día hábil:
   1. Arma el ranking "Todas juntas" (Buffett/Munger, Graham, Lynch, Kiyosaki y Musk, a partes
      iguales) entre las 150 acciones más líquidas del S&P 500, con cifras de la SEC ya publicadas.
   2. Muestra el portafolio actual de la cuenta paper, el ranking de hoy y cuánto le va contra SPY.
-  3. Si es el primer día hábil de un trimestre (enero, abril, julio, octubre), si la cuenta no
-     tiene acciones o si se pide "forzar": vende lo que salió del top 10 y deja las 10 mejores
-     con 10% cada una (deja 1% en efectivo para costos).
+  3. Calcula qué tiene cada cartera: las 10 mejores del ranking del día en que le tocó rotar
+     (se recalcula con los datos que existían ese día, así no hace falta guardar nada).
+  4. El primer día hábil de cada mes, si la cuenta no tiene acciones o si se pide "forzar": ajusta
+     la cuenta a la suma de las 3 carteras (deja 1% en efectivo para costos).
 
 Usa las mismas llaves de Alpaca (las de paper trading, que empiezan con PK). Nunca opera dinero real:
 el cliente se crea siempre con paper=True.
@@ -27,6 +30,7 @@ import validar_red as vr
 K = 10                 # acciones en el portafolio
 LIQUIDAS = 150         # universo: las más líquidas del S&P 500
 EFECTIVO = 0.01        # parte que se deja sin invertir
+PARTES = 3             # carteras escalonadas
 MIN_ORDEN = 25.0       # no se mandan órdenes menores a esto (USD)
 
 
@@ -45,16 +49,33 @@ def ranking_hoy():
     fechas = c.index
     Ff, grupos = vr.panel_fundamentales(fund, elegidas, fechas, c)
     puntajes = {g: Ff[-1][:, ix].mean(axis=1) for g, ix in grupos.items()}
-    total = np.mean(list(puntajes.values()), axis=0)
+    serie = np.mean([Ff[:, :, ix].mean(axis=2) for ix in grupos.values()], axis=0)   # [días, acciones]
     tabla = pd.DataFrame(puntajes, index=elegidas)
-    tabla["Todas juntas"] = total
+    tabla["Todas juntas"] = serie[-1]
     tabla["precio"] = c[elegidas].iloc[-1].values
-    return tabla.sort_values("Todas juntas", ascending=False), fechas[-1], c[vr.BENCH]
+    serie = pd.DataFrame(serie, index=fechas, columns=elegidas)
+    return tabla.sort_values("Todas juntas", ascending=False), fechas[-1], c[vr.BENCH], serie
 
 
-def es_inicio_trimestre(ultima_sesion):
+def carteras(serie):
+    """Para cada cartera: el mes en que rotó por última vez y sus 10 acciones (ranking del último
+    cierre antes de ese día)."""
     hoy = pd.Timestamp(datetime.now(vr.timezone.utc)).tz_convert("America/New_York").tz_localize(None).normalize()
-    return hoy.month in (1, 4, 7, 10) and ultima_sesion.month != hoy.month
+    fechas = serie.index
+    out = []
+    for j in range(PARTES):
+        mes = hoy.to_period("M")
+        while (mes.month - 1) % PARTES != j:
+            mes -= 1
+        previas = fechas[fechas < mes.start_time]
+        d = previas[-1]
+        out.append((j + 1, mes, d, list(serie.loc[d].sort_values(ascending=False).index[:K])))
+    return out
+
+
+def es_inicio_mes(ultima_sesion):
+    hoy = pd.Timestamp(datetime.now(vr.timezone.utc)).tz_convert("America/New_York").tz_localize(None).normalize()
+    return ultima_sesion.to_period("M") != hoy.to_period("M")
 
 
 def main():
@@ -76,11 +97,16 @@ def main():
     posiciones = {ps.symbol: float(ps.market_value) for ps in cli.get_all_positions()}
     abierto = cli.get_clock().is_open
 
-    tabla, ultima, spy = ranking_hoy()
-    top = list(tabla.index[:K])
+    tabla, ultima, spy, serie = ranking_hoy()
+    carts = carteras(serie)
+    objetivo = {}
+    for _, _, _, accs in carts:
+        for a in accs:
+            objetivo[a] = objetivo.get(a, 0.0) + 1.0 / (K * PARTES)
+    top = list(objetivo)
 
     print("\n" + "=" * 70)
-    print(f"PAPER TRADING — 'Todas juntas' trimestral — datos al {ultima.date()}")
+    print(f"PAPER TRADING — 'Todas juntas' escalonada — datos al {ultima.date()}")
     print("=" * 70)
     print(f"Cuenta paper: {equity:,.2f} USD | efectivo {float(cuenta.cash):,.2f} USD | "
           f"mercado {'ABIERTO' if abierto else 'cerrado'}")
@@ -99,31 +125,38 @@ def main():
     print("\nPosiciones actuales:")
     if posiciones:
         for sym, mv in sorted(posiciones.items(), key=lambda x: -x[1]):
-            marca = "" if sym in top else "   <- ya no está en el top 10"
+            marca = "" if sym in top else "   <- ya no está en ninguna cartera"
             print(f"  {sym:<6} {mv:>11,.2f} USD ({mv / equity * 100:4.1f}%){marca}")
     else:
         print("  (ninguna)")
 
+    print("\nCarteras (cada una con 1/3 del dinero):")
+    for j, mes, d, accs in carts:
+        print(f"  Cartera {j}: rotó en {mes} (ranking del {d.date()}): {', '.join(accs)}")
+    print("\nPeso objetivo de cada acción (suma de las 3 carteras):")
+    for a, w in sorted(objetivo.items(), key=lambda x: -x[1]):
+        print(f"  {a:<6} {w * 100:4.1f}%  ahora {posiciones.get(a, 0.0) / equity * 100:4.1f}%")
     print(f"\nRanking 'Todas juntas' de hoy (top {K + 5}; puntaje de -0.5 a +0.5):")
     cols = [c for c in tabla.columns if c not in ("precio",)]
     print("  " + "símbolo".ljust(8) + "".join(c.split("/")[0][:9].rjust(10) for c in cols))
     for sym, fila in tabla.head(K + 5).iterrows():
         print("  " + sym.ljust(8) + "".join(f"{fila[c]:>10.2f}" for c in cols) + ("  *" if sym in top else ""))
 
-    toca = args.forzar or not posiciones or es_inicio_trimestre(ultima)
-    print(f"\n¿Rebalancear hoy? {'SÍ' if toca else 'no'} "
-          f"({'forzado' if args.forzar else 'cuenta sin acciones' if not posiciones else 'inicio de trimestre' if toca else 'se rota el primer día hábil de ene/abr/jul/oct'})")
+    toca = args.forzar or not posiciones or es_inicio_mes(ultima)
+    print(f"\n¿Ajustar hoy? {'SÍ' if toca else 'no'} "
+          f"({'forzado' if args.forzar else 'cuenta sin acciones' if not posiciones else 'primer día hábil del mes' if toca else 'se ajusta el primer día hábil de cada mes'})")
     if not toca:
         return
 
-    meta = equity * (1 - EFECTIVO) / K
+    invertible = equity * (1 - EFECTIVO)
     ordenes = []
     for sym, mv in posiciones.items():
-        if sym not in top:
+        if sym not in objetivo:
             ordenes.append((sym, -mv, "cerrar"))
-    for sym in top:
-        dif = meta - posiciones.get(sym, 0.0)
-        if abs(dif) >= MIN_ORDEN:
+    for sym, w in objetivo.items():
+        dif = invertible * w - posiciones.get(sym, 0.0)
+        # solo se corrigen diferencias que valgan la pena (>1% de la cuenta) o acciones nuevas
+        if abs(dif) >= max(MIN_ORDEN, 0.01 * equity) or (sym not in posiciones and dif >= MIN_ORDEN):
             ordenes.append((sym, dif, "ajustar"))
     ordenes.sort(key=lambda o: o[1])                   # primero ventas, después compras
 
