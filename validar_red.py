@@ -330,21 +330,39 @@ def compactar(cf):
     hechos = cf.get("facts", {})
     gaap, dei = hechos.get("us-gaap", {}), hechos.get("dei", {})
 
+    def ttm(entradas):
+        """Últimos 12 meses en cada informe (anual o trimestral): año anterior + lo que va del
+        año actual - lo que iba a la misma altura del año anterior."""
+        prim = {}
+        for ini, fin, pub, val in sorted(entradas, key=lambda r: r[2]):
+            prim.setdefault((ini, fin), (pub, val))
+        filas_ = [(pd.Timestamp(a), pd.Timestamp(b), p, v) for (a, b), (p, v) in prim.items()]
+        anuales = [r for r in filas_ if 330 <= (r[1] - r[0]).days <= 400]
+        out = [(b.strftime("%Y-%m-%d"), p, v) for a, b, p, v in anuales]
+        for a, b, p, v in filas_:
+            dur = (b - a).days
+            if not 80 <= dur <= 300:
+                continue
+            fy = [r for r in anuales if abs((a - r[1]).days - 1) <= 20]
+            ant = [r for r in filas_ if abs((b - r[1]).days - 365) <= 20 and abs((r[1] - r[0]).days - dur) <= 20]
+            if fy and ant:
+                out.append((b.strftime("%Y-%m-%d"), max(p, fy[0][2], ant[0][2]), fy[0][3] + v - ant[0][3]))
+        return out
+
     def filas(tag, fuente, unidades, flujo):
-        res = []
+        res, crudo = [], []
         for u in unidades:
             for f in fuente.get(tag, {}).get("units", {}).get(u, []):
                 try:
                     if flujo:
-                        if f.get("form") not in ("10-K", "10-K/A") or f.get("fp") != "FY":
+                        if f.get("form") not in ("10-K", "10-K/A", "10-Q", "10-Q/A") or "start" not in f:
                             continue
-                        dias = (pd.Timestamp(f["end"]) - pd.Timestamp(f["start"])).days
-                        if not 330 <= dias <= 400:
-                            continue
+                        crudo.append((f["start"], f["end"], f["filed"], float(f["val"])))
+                        continue
                     res.append((f["end"], f["filed"], float(f["val"])))
                 except (KeyError, ValueError, TypeError):
                     continue
-        return res
+        return ttm(crudo) if flujo else res
 
     def combinar(tags, fuente, unidades, flujo):
         por_fin = {}
@@ -432,7 +450,15 @@ def panel_fundamentales(datos, tickers, fechas, close_raw):
             continue
         con_datos += 1
         for k in ("ing", "util"):
-            base[k][:, j], base[k + "_p"][:, j] = serie_pit(d.get(k, []), fechas)
+            filas_k = d.get(k, [])
+            base[k][:, j], _ = serie_pit(filas_k, fechas)
+            por_fin = {pd.Timestamp(f[0]): f[2] for f in filas_k}
+            hace_un_anio = []
+            for fin, pub, _v in filas_k:
+                previos = [v for ff, v in por_fin.items() if abs((pd.Timestamp(fin) - ff).days - 365) <= 20]
+                if previos:
+                    hace_un_anio.append((fin, pub, previos[0]))
+            base[k + "_p"][:, j], _ = serie_pit(hace_un_anio, fechas)
         for k in ("op", "fop", "capex", "idi", "div", "pat", "act", "acc"):
             base[k][:, j], _ = serie_pit(d.get(k, []), fechas)
         act_fin = {f[0]: f[2] for f in d.get("act", [])}
@@ -756,7 +782,21 @@ def lote_bloque(Fn, dias):
     return torch.from_numpy(np.ascontiguousarray(x.transpose(0, 2, 1, 3)))
 
 
-def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, paciencia=8, frac=1.0):
+def perdida_portafolio(out, y):
+    """La 'nota' de la red cuando el objetivo es GANARLE A SPY: con sus puntajes arma un
+    portafolio (pesos = softmax entre las acciones), y se mide cuánto rindió por sobre SPY en
+    esos días, dividido por su variabilidad (como un Sharpe). Se castiga además concentrar todo
+    en muy pocas acciones. La red minimiza esto, o sea, maximiza ganarle al índice."""
+    import torch
+    w = torch.softmax(out, dim=1)                   # [días, acciones, horizontes]
+    pe = (w * y).sum(dim=1)                         # exceso sobre SPY de cada día y horizonte
+    sharpe = pe.mean(dim=0) / (pe.std(dim=0) + 1e-4)
+    concentra = (w.pow(2).sum(dim=1) * w.shape[1]).mean()
+    return -sharpe.mean() + 0.01 * concentra
+
+
+def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, paciencia=8, frac=1.0,
+                    objetivo="ranking"):
     import torch
     import torch.nn as nn
 
@@ -765,6 +805,9 @@ def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, pacien
     net = crear_red_bloque(Fn.shape[2], Ys.shape[2], n_precio=NF_PRECIO, grupos=GRUPOS)
     opt = torch.optim.AdamW(net.parameters(), lr=LR, weight_decay=1e-3)
     lossf = nn.HuberLoss(delta=1.0)
+    if objetivo == "portafolio":
+        lossf = perdida_portafolio
+        batch_dias, frac = 24, 1.0                  # hacen falta varios días para medir variabilidad
     mejor, estado, malas, ep_mejor = np.inf, None, 0, 0
 
     for ep in range(epochs):
@@ -779,8 +822,9 @@ def entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed, epochs, batch_dias=8, pacien
         net.eval()
         tot = 0.0
         with torch.no_grad():
-            for i in range(0, len(dias_va), 16):
-                d = dias_va[i:i + 16]
+            paso = len(dias_va) if objetivo == "portafolio" else 16
+            for i in range(0, len(dias_va), paso):
+                d = dias_va[i:i + paso]
                 tot += lossf(net(lote_bloque(Fn, d)), torch.from_numpy(Ys[d])).item() * len(d)
         vl = tot / len(dias_va)
         if vl < mejor - 1e-5:
@@ -840,7 +884,7 @@ def objetivo_relativo(Y):
     return np.clip(Yr, -5, 5).astype(np.float32)
 
 
-def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1.0):
+def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1.0, objetivo="ranking"):
     T, N, H = Y.shape
     pred = np.full((T, N, H), np.nan)
     val_len = int(TRAIN_DAYS * VAL_FRAC)
@@ -859,6 +903,11 @@ def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1
         tr = muestras(Y, t_ini, fit_fin)
         va = muestras(Y, v_ini, t_fin)
         Ys = objetivo_relativo(Y)
+        if modelo == "bloque" and objetivo == "portafolio":
+            # retorno real por sobre SPY (no el puntaje ordenado): es lo que se quiere ganar
+            Yp = np.where(np.isfinite(Ys), np.clip(np.nan_to_num(Y), -0.5, 0.5), np.nan).astype(np.float32)
+        else:
+            Yp = Ys
 
         if modelo == "bloque":
             dias_tr = np.arange(t_ini, fit_fin + 1)
@@ -869,7 +918,8 @@ def correr_walk_forward(F, Y, tr_list, gap, seeds, epochs, modelo="fila", frac=1
             acum_b = np.zeros((len(dias_te), N, H))
             for s in range(seeds):
                 t0 = time.time()
-                net, ep, vl = entrenar_bloque(Fn, Ys, dias_tr, dias_va, seed=s, epochs=epochs, frac=frac)
+                net, ep, vl = entrenar_bloque(Fn, Yp, dias_tr, dias_va, seed=s, epochs=epochs, frac=frac,
+                                              objetivo=objetivo)
                 acum_b += predecir_bloque(net, Fn, dias_te)
                 print(f"  tramo {k}/{len(tr_list)} semilla {s}: {len(dias_tr)} días de entrenamiento, "
                       f"mejor época {ep}, pérdida val {vl:.4f}, {time.time() - t0:.0f}s", flush=True)
@@ -933,6 +983,10 @@ def simular(pred_h, R, spyR, h, modo, tr_list, k, cost_bps, borrow, beta=None):
         p = pred_h[t]
         if np.isnan(p).any():
             continue
+        if modo == "pesos":                  # el portafolio que armó la red (softmax de sus puntajes)
+            e = np.exp(p - p.max())
+            W[t] = e / e.sum()
+            continue
         orden = np.argsort(p)
         if modo == "short":                  # solo diagnóstico: la canasta que la red menos quiere
             W[t, orden[:k]] = 1.0 / k
@@ -992,6 +1046,8 @@ def main():
                     help="fracción de días de entrenamiento usada por época en la red en bloque (acelera)")
     ap.add_argument("--sin-relaciones", action="store_true",
                     help="no usar las variables de relación entre acciones (para comparar con y sin)")
+    ap.add_argument("--objetivo", type=str.lower, choices=["portafolio", "ranking"], default="portafolio",
+                    help="portafolio: la red aprende a ganarle a SPY directamente; ranking: a ordenar acciones")
     ap.add_argument("--sin-fundamentales", action="store_true",
                     help="no usar cifras de la SEC (capas de Buffett, Graham, Lynch, Kiyosaki, Musk)")
     ap.add_argument("--horizontes", default=",".join(str(x) for x in HORIZONTES),
@@ -1049,7 +1105,9 @@ def main():
 def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
     epocas = args.epochs or (60 if modelo == "bloque" else 20)
     print(f"\nEntrenando modelo {modelo}...", flush=True)
-    pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, epocas, modelo, args.frac)
+    obj = args.objetivo if modelo == "bloque" else "ranking"
+    print(f"Objetivo de entrenamiento: {'ganarle a SPY (portafolio)' if obj == 'portafolio' else 'ordenar acciones'}")
+    pred = correr_walk_forward(F, Y, tr_list, gap, args.seeds, epocas, modelo, args.frac, obj)
 
     B = betas_rodantes(R, spyR)
     if GATES_LOG and GRUPOS:
@@ -1073,7 +1131,7 @@ def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
         print(f"\nHorizonte {h} día(s) | correlación de ranking (IC) medio {ics.mean():+.4f} (t≈{tstat:+.1f})")
         print(f"  {'modo':<18}{'bruto/año':>10}{'neto/año':>10}{'Sharpe':>8}{'MaxDD':>8}"
               f"{'tramos+':>9}{'SPY/año':>9}{'SPY Sh.':>8}  veredicto")
-        for modo, nombre in (("long", "solo compras"), ("ls", "compras+cortos")):
+        for modo, nombre in (("pesos", "portafolio red"), ("long", "solo compras"), ("ls", "compras+cortos")):
             bruto, neto, spy, por_tramo = simular(
                 pred[:, :, hi], R, spyR, h, modo, tr_list, args.k, args.cost_bps, args.borrow)
             sb, sn, ss = estadisticas(bruto), estadisticas(neto), estadisticas(spy)
@@ -1085,6 +1143,20 @@ def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
                   f"  {'PASA' if ok else 'no pasa'}")
             if modo == "ls":
                 por_ls = por_tramo
+
+        # --- cada filosofía SOLA y todas JUNTAS (sin red): compra las K con mejor puntaje ---
+        if GRUPOS:
+            print(f"  Filosofías sin red (compra las {args.k} con mejor puntaje de esa filosofía):")
+            puntajes = {g: F[:, :, ix].mean(axis=2) for g, ix in GRUPOS.items()}
+            puntajes["Todas juntas (se suman)"] = np.mean(list(puntajes.values()), axis=0)
+            for g, sc in puntajes.items():
+                bruto, neto, spy, por_tramo = simular(sc + 1e-9 * np.random.default_rng(0).random(sc.shape),
+                                                      R, spyR, h, "long", tr_list, args.k, args.cost_bps, args.borrow)
+                sb, sn, ss = estadisticas(bruto), estadisticas(neto), estadisticas(spy)
+                ok, pos = veredicto(por_tramo, sn, ss)
+                print(f"  {g[:18]:<18}{sb['ann'] * 100:>9.1f}%{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}"
+                      f"{sn['dd'] * 100:>7.1f}%{pos:>5}/{len(por_tramo):<3}{ss['ann'] * 100:>8.1f}%{ss['sharpe']:>8.2f}"
+                      f"  {'pasaría' if ok else 'no pasa'}")
 
         # --- ¿de dónde sale la pérdida? Cada pierna por separado (retorno bruto de la canasta) ---
         ph = pred[:, :, hi]

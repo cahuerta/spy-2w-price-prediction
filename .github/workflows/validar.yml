@@ -20,6 +20,9 @@ on:
       fundamentales:
         description: "Usar cifras de la SEC y las capas de Buffett, Graham, Lynch, Kiyosaki y Musk (si / no)"
         default: "si"
+      objetivo:
+        description: "portafolio (la red aprende a ganarle a SPY) o ranking (ordenar acciones)"
+        default: "portafolio"
       horizontes:
         description: "Días de tenencia a evaluar, separados por coma"
         default: "1,3,5,21,63"
@@ -50,12 +53,12 @@ jobs:
           EXTRA=""
           if [ "${{ inputs.relaciones }}" = "no" ]; then EXTRA="--sin-relaciones"; fi
           if [ "${{ inputs.fundamentales }}" = "no" ]; then EXTRA="$EXTRA --sin-fundamentales"; fi
-          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" --liquidas "${{ inputs.liquidas }}" --horizontes "${{ inputs.horizontes }}" $EXTRA 2>&1 | tee resultados.txt
+          python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" --liquidas "${{ inputs.liquidas }}" --horizontes "${{ inputs.horizontes }}" --objetivo "${{ inputs.objetivo }}" $EXTRA 2>&1 | tee resultados.txt
       - name: Mostrar resultado en el resumen
         if: always()
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -n 170 resultados.txt >> "$GITHUB_STEP_SUMMARY" || true
+          tail -n 230 resultados.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
