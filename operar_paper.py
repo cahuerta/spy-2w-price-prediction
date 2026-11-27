@@ -31,6 +31,7 @@ K = 10                 # acciones en el portafolio
 LIQUIDAS = 150         # universo: las más líquidas del S&P 500
 EFECTIVO = 0.01        # parte que se deja sin invertir
 PARTES = 3             # carteras escalonadas
+MAX_SECTOR = 3         # máximo de acciones del mismo sector en cada cartera
 MIN_ORDEN = 25.0       # no se mandan órdenes menores a esto (USD)
 
 
@@ -69,7 +70,9 @@ def carteras(serie):
             mes -= 1
         previas = fechas[fechas < mes.start_time]
         d = previas[-1]
-        out.append((j + 1, mes, d, list(serie.loc[d].sort_values(ascending=False).index[:K])))
+        fila = serie.loc[d]
+        idx = vr.elegir(fila.values, K, [vr.SECTOR_DE.get(t) for t in fila.index], MAX_SECTOR)
+        out.append((j + 1, mes, d, list(fila.index[idx])))
     return out
 
 
@@ -96,6 +99,7 @@ def main():
     equity = float(cuenta.equity)
     posiciones = {ps.symbol: float(ps.market_value) for ps in cli.get_all_positions()}
     abierto = cli.get_clock().is_open
+    pendientes = cli.get_orders()          # órdenes abiertas (aún sin ejecutar)
 
     tabla, ultima, spy, serie = ranking_hoy()
     carts = carteras(serie)
@@ -140,7 +144,8 @@ def main():
     cols = [c for c in tabla.columns if c not in ("precio",)]
     print("  " + "símbolo".ljust(8) + "".join(c.split("/")[0][:9].rjust(10) for c in cols))
     for sym, fila in tabla.head(K + 5).iterrows():
-        print("  " + sym.ljust(8) + "".join(f"{fila[c]:>10.2f}" for c in cols) + ("  *" if sym in top else ""))
+        print("  " + sym.ljust(8) + "".join(f"{fila[c]:>10.2f}" for c in cols) + f"  {vr.SECTOR_DE.get(sym, '?'):<4}"
+              + ("  *" if sym in top else ""))
 
     toca = args.forzar or not posiciones or es_inicio_mes(ultima)
     print(f"\n¿Ajustar hoy? {'SÍ' if toca else 'no'} "
@@ -165,6 +170,9 @@ def main():
         print(f"  {'vender' if monto < 0 else 'comprar'} {sym:<6} {abs(monto):>10,.2f} USD ({tipo})")
     if not ordenes:
         print("  (nada que hacer, ya está balanceado)")
+    if pendientes:
+        print(f"\nHay {len(pendientes)} órdenes pendientes de una corrida anterior; no se mandan más hoy.")
+        return
     if args.solo_mostrar or not abierto:
         print("\nNo se mandaron órdenes (" + ("solo mostrar" if args.solo_mostrar else "mercado cerrado") + ").")
         return

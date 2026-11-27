@@ -2,7 +2,10 @@ name: Paper trading (Todas juntas escalonada)
 
 on:
   schedule:
-    - cron: "45 14 * * 1-5"   # 14:45 UTC = poco después de la apertura de Nueva York
+    # varias veces al día (GitHub a veces atrasa horas las tareas programadas); si ya ajustó, no hace nada
+    - cron: "45 14 * * 1-5"   # 11:45 Chile
+    - cron: "30 16 * * 1-5"   # 13:30 Chile
+    - cron: "30 18 * * 1-5"   # 15:30 Chile
   workflow_dispatch:
     inputs:
       forzar:

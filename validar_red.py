@@ -1053,6 +1053,7 @@ def main():
                     help="portafolio: la red aprende a ganarle a SPY directamente; ranking: a ordenar acciones")
     ap.add_argument("--sin-gestor", action="store_true", help="no correr el gestor diario")
     ap.add_argument("--solo-gestor", action="store_true", help="correr solo el gestor diario (más rápido)")
+    ap.add_argument("--max-sector", type=int, default=3, help="máximo de acciones por sector en la fila con límite")
     ap.add_argument("--candidatas", type=int, default=20,
                     help="cuántas de las mejores de 'Todas juntas' revisa el gestor cada día")
     ap.add_argument("--sin-fundamentales", action="store_true",
@@ -1166,17 +1167,34 @@ def base_trimestral(S, t0, t1, k=10, cada=63):
     return B
 
 
-def base_escalonada(S, t0, t1, k=10, cada=63, partes=3):
+def elegir(fila, k, sectores=None, max_sector=None):
+    """Las k de mejor puntaje; con max_sector, no más de esa cantidad por sector."""
+    orden = np.argsort(-fila)
+    if not max_sector or sectores is None:
+        return orden[:k]
+    cuenta, out = {}, []
+    for i in orden:
+        sec = sectores[i]
+        if sec is not None and cuenta.get(sec, 0) >= max_sector:
+            continue
+        cuenta[sec] = cuenta.get(sec, 0) + 1
+        out.append(i)
+        if len(out) == k:
+            break
+    return np.array(out)
+
+
+def base_escalonada(S, t0, t1, k=10, cada=63, partes=3, sectores=None, max_sector=None):
     """'Todas juntas' escalonada: el dinero en 'partes' carteras de k acciones; cada una rota cada
     'cada' días pero en fechas distintas (una por mes). Cada cartera pesa 1/partes."""
     T, N = S.shape
     B = np.zeros((T, N + 1), dtype=np.float32)
     paso = cada // partes
-    actuales = [np.argsort(-S[t0])[:k] for _ in range(partes)]
+    actuales = [elegir(S[t0], k, sectores, max_sector) for _ in range(partes)]
     for t in range(t0, t1 + 1):
         for j in range(partes):
             if t > t0 and (t - t0 - j * paso) % cada == 0:
-                actuales[j] = np.argsort(-S[t])[:k]
+                actuales[j] = elegir(S[t], k, sectores, max_sector)
             B[t, actuales[j]] += 1.0 / (k * partes)
     return B
 
@@ -1296,20 +1314,26 @@ def gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers, prec
 
     Wb = np.zeros((T, N + 1))
     We = np.zeros((T, N + 1))
+    Ws = np.zeros((T, N + 1))
+    sectores = [SECTOR_DE.get(t) for t in tickers]
     for a, b in tr_list:
         Wb[a:b + 1] = base_trimestral(S, a, b, args.k)[a:b + 1]
         We[a:b + 1] = base_escalonada(S, a, b, args.k)[a:b + 1]
+        Ws[a:b + 1] = base_escalonada(S, a, b, args.k, sectores=sectores, max_sector=args.max_sector)[a:b + 1]
+    con_sector = sum(x is not None for x in sectores)
     print("\n" + "=" * 78)
     print("RESULTADO GESTOR DIARIO (mismos días para todos; costo real de cada operación)")
     print("=" * 78)
     print(f"  {'':<24}{'neto/año':>10}{'Sharpe':>8}{'MaxDD':>8}{'tramos+':>9}  {'rota/año':>9}{'acciones':>9}{'en SPY':>7}")
     res = {}
-    for nombre, Wx in (("gestor red", W), ("Todas juntas escalonada", We), ("Todas juntas trimestral", Wb)):
+    for nombre, Wx in (("gestor red", W), ("Todas juntas escalonada", We),
+                       (f"escalonada máx {args.max_sector}/sector", Ws), ("Todas juntas trimestral", Wb)):
         sn, ss, okx, pos, nt, (giro, nacc, enspy) = evaluar(Wx)
         res[nombre] = (sn, okx)
         print(f"  {nombre:<24}{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}{sn['dd'] * 100:>7.1f}%{pos:>5}/{nt:<3}"
               f"  {giro * 100:>8.0f}%{nacc:>9.1f}{enspy * 100:>6.0f}%")
     print(f"  {'SPY':<24}{ss['ann'] * 100:>9.1f}%{ss['sharpe']:>8.2f}")
+    print(f"  (sector conocido para {con_sector} de {N} acciones; sin sector no se limita)")
     g, bse = res["gestor red"][0], res["Todas juntas escalonada"][0]
     ok = res["gestor red"][1] and g["sharpe"] > bse["sharpe"] + 0.05 and g["ann"] > bse["ann"] + 0.005
     print(f"  Veredicto: la red {'GOBIERNA MEJOR' if ok else 'todavía NO mejora'} que 'Todas juntas' escalonada "
