@@ -23,6 +23,9 @@ on:
       objetivo:
         description: "portafolio (la red aprende a ganarle a SPY) o ranking (ordenar acciones)"
         default: "portafolio"
+      solo_gestor:
+        description: "si = correr solo el gestor diario (más rápido); no = todo"
+        default: "no"
       horizontes:
         description: "Días de tenencia a evaluar, separados por coma"
         default: "1,3,5,21,63"
@@ -53,12 +56,13 @@ jobs:
           EXTRA=""
           if [ "${{ inputs.relaciones }}" = "no" ]; then EXTRA="--sin-relaciones"; fi
           if [ "${{ inputs.fundamentales }}" = "no" ]; then EXTRA="$EXTRA --sin-fundamentales"; fi
+          if [ "${{ inputs.solo_gestor }}" = "si" ]; then EXTRA="$EXTRA --solo-gestor"; fi
           python -u validar_red.py --universo "${{ inputs.universo }}" --seeds "${{ inputs.semillas }}" --years "${{ inputs.anios }}" --liquidas "${{ inputs.liquidas }}" --horizontes "${{ inputs.horizontes }}" --objetivo "${{ inputs.objetivo }}" $EXTRA 2>&1 | tee resultados.txt
       - name: Mostrar resultado en el resumen
         if: always()
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -n 230 resultados.txt >> "$GITHUB_STEP_SUMMARY" || true
+          tail -n 300 resultados.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()

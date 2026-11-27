@@ -1051,6 +1051,10 @@ def main():
                     help="no usar las variables de relación entre acciones (para comparar con y sin)")
     ap.add_argument("--objetivo", type=str.lower, choices=["portafolio", "ranking"], default="portafolio",
                     help="portafolio: la red aprende a ganarle a SPY directamente; ranking: a ordenar acciones")
+    ap.add_argument("--sin-gestor", action="store_true", help="no correr el gestor diario")
+    ap.add_argument("--solo-gestor", action="store_true", help="correr solo el gestor diario (más rápido)")
+    ap.add_argument("--candidatas", type=int, default=20,
+                    help="cuántas de las mejores de 'Todas juntas' revisa el gestor cada día")
     ap.add_argument("--sin-fundamentales", action="store_true",
                     help="no usar cifras de la SEC (capas de Buffett, Graham, Lynch, Kiyosaki, Musk)")
     ap.add_argument("--horizontes", default=",".join(str(x) for x in HORIZONTES),
@@ -1100,9 +1104,230 @@ def main():
 
     modelos = ["fila", "bloque"] if args.modelo == "ambos" else [args.modelo]
     pasan_total = []
-    for m in modelos:
-        pasan_total += [(m, h, n) for h, n in ejecutar(m, args, F, Y, R, spyR, tr_list, gap)]
+    if not args.solo_gestor:
+        for m in modelos:
+            pasan_total += [(m, h, n) for h, n in ejecutar(m, args, F, Y, R, spyR, tr_list, gap)]
+    if GRUPOS and not args.sin_gestor:
+        S = np.mean([F[:, :, ix].mean(axis=2) for ix in GRUPOS.values()], axis=0)
+        if gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers,
+                               p["close"].reindex(fechas)[tickers].values):
+            pasan_total.append(("gestor", 1, "gestor diario"))
     resumen(pasan_total, len(modelos))
+
+
+# ----------------------------------------------------------------------------
+# GESTOR DIARIO: la red decide cuánto de cada acción elegida, y cuándo rotar
+# ----------------------------------------------------------------------------
+def crear_gestor(nf, hid=32):
+    """Cada día recibe las acciones candidatas (las mejores de 'Todas juntas'), sus datos de hoy y
+    cuánto se tiene de cada una. Entrega:
+      - el reparto que quisiera (porcentaje para cada acción y para SPY, que es 'no sé, me quedo en
+        el índice'): así aprende el TAMAÑO de cada posición y cuántas acciones tener;
+      - la velocidad para acercarse a ese reparto (0 = no tocar nada hoy, 1 = rotar todo): así
+        aprende CUÁNDO conviene operar y cuándo esperar para no pagar costos."""
+    import torch
+    import torch.nn as nn
+
+    class Gestor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.acc = nn.Sequential(nn.Linear(nf + 2, hid), nn.GELU(), nn.Linear(hid, hid), nn.GELU())
+            self.tam = nn.Linear(hid, 1)                 # capa del tamaño de cada posición
+            self.mer = nn.Sequential(nn.Linear(hid, hid), nn.GELU())
+            self.spy = nn.Linear(hid, 1)                 # cuánto dejar en el índice
+            self.vel = nn.Linear(hid + 1, 1)             # cuánto rotar hoy
+
+        def forward(self, x, sc, mask, w_prev):
+            # x [N, nf] datos de hoy; sc [N] puntaje 'Todas juntas'; mask [N] candidatas; w_prev [N+1]
+            e = self.acc(torch.cat([x, sc[:, None], 10 * w_prev[:-1, None]], dim=1))
+            logit = self.tam(e).squeeze(1).masked_fill(~mask, -1e9)
+            ctx = self.mer(e[mask].mean(dim=0))
+            objetivo = torch.softmax(torch.cat([logit, self.spy(ctx)]), dim=0)
+            dist = (objetivo - w_prev).abs().sum().reshape(1)
+            vel = torch.sigmoid(self.vel(torch.cat([ctx, dist])))
+            return objetivo, vel
+
+    return Gestor()
+
+
+def recorrer(net, Xn, S, M, R, spyR, t0, t1, w0, cost_bps):
+    """Simula día a día de t0 a t1. Devuelve exceso neto sobre SPY de cada día, rotación y pesos."""
+    import torch
+    N = Xn.shape[1]
+    w = w0
+    exc, rot, pesos, objs = [], [], [], []
+    for t in range(t0, t1 + 1):
+        obj, vel = net(Xn[t], S[t], M[t], w)
+        w_new = w + vel * (obj - w)
+        giro = (w_new - w).abs().sum()
+        if t + 2 < len(spyR):
+            ret = (w_new[:N] * R[t + 2]).sum() + w_new[N] * spyR[t + 2]
+            exc.append(ret - spyR[t + 2] - cost_bps * 1e-4 * giro)
+            rot.append(giro)
+        pesos.append(w_new)
+        objs.append(obj)
+        w = w_new
+    return exc, rot, pesos, objs
+
+
+def gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers, precios):
+    import torch
+    T, N, nf = F.shape
+    M = np.zeros((T, N), dtype=bool)
+    orden = np.argsort(-S, axis=1)
+    for t in range(T):
+        M[t, orden[t, :args.candidatas]] = True
+    Rt = torch.from_numpy(np.nan_to_num(R).astype(np.float32))
+    St = torch.from_numpy(S.astype(np.float32))
+    Mt = torch.from_numpy(M)
+    sp = torch.from_numpy(spyR.astype(np.float32))
+    val_len = int(TRAIN_DAYS * VAL_FRAC)
+    W = np.full((T, N + 1), np.nan)
+    print(f"\nGestor diario: cada día revisa las {args.candidatas} mejores de 'Todas juntas', decide el tamaño "
+          f"de cada una (o dejar parte en SPY) y cuánto rotar, pagando {args.cost_bps:g} pb por cada operación.",
+          flush=True)
+    ultimo = None
+    for k, (a, b) in enumerate(tr_list, 1):
+        t_fin = a - gap - 1
+        t_ini = t_fin - TRAIN_DAYS + 1
+        v_ini = t_fin - val_len + 1
+        fit_fin = v_ini - gap - 1
+        mu = F[t_ini:t_fin + 1].reshape(-1, nf).mean(axis=0)
+        sd = F[t_ini:t_fin + 1].reshape(-1, nf).std(axis=0) + 1e-8
+        Xn = torch.from_numpy(np.clip((F - mu) / sd, -5, 5).astype(np.float32))
+        w_spy = torch.zeros(N + 1)
+        w_spy[N] = 1.0
+        acum = np.zeros((b - a + 1, N + 1))
+        for s in range(args.seeds):
+            torch.manual_seed(s)
+            net = crear_gestor(nf)
+            opt = torch.optim.AdamW(net.parameters(), lr=3e-3, weight_decay=1e-3)
+            mejor, estado, malas = np.inf, None, 0
+            t0_ = time.time()
+            for ep in range(args.epochs or 40):
+                net.train()
+                ini = t_ini + int(np.random.default_rng(s * 1000 + ep).integers(0, 21))
+                ex, rot, _, _ = recorrer(net, Xn, St, Mt, Rt, sp, ini, fit_fin, w_spy, args.cost_bps)
+                ex = torch.stack(ex)
+                perdida = -ex.mean() / (ex.std() + 1e-5)
+                opt.zero_grad()
+                perdida.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                opt.step()
+                net.eval()
+                with torch.no_grad():
+                    exv, _, _, _ = recorrer(net, Xn, St, Mt, Rt, sp, v_ini, t_fin, w_spy, args.cost_bps)
+                    exv = torch.stack(exv)
+                    vl = float(-exv.mean() / (exv.std() + 1e-5))
+                if vl < mejor - 1e-4:
+                    mejor, malas = vl, 0
+                    estado = {kk: vv.clone() for kk, vv in net.state_dict().items()}
+                else:
+                    malas += 1
+                    if malas >= 10:
+                        break
+            net.load_state_dict(estado)
+            net.eval()
+            with torch.no_grad():
+                _, _, pesos, _ = recorrer(net, Xn, St, Mt, Rt, sp, a, b, w_spy, args.cost_bps)
+            acum += torch.stack(pesos).numpy()
+            print(f"  tramo {k}/{len(tr_list)} semilla {s}: Sharpe val {-mejor * np.sqrt(252):+.2f}, "
+                  f"{time.time() - t0_:.0f}s", flush=True)
+            ultimo = (net, Xn)
+        W[a:b + 1] = acum / args.seeds
+
+    # ---- resultado con los pesos diarios (costos según lo que realmente rotó) ----
+    netos, spys, por_tramo, giros, nacc, en_spy = [], [], [], [], [], []
+    for a, b in tr_list:
+        dias = np.arange(a, min(b, T - 3) + 1)
+        w = W[dias]
+        prev = np.vstack([np.r_[np.zeros(N), 1.0], w[:-1]])
+        giro = np.abs(w - prev).sum(axis=1)
+        ret = (w[:, :N] * np.nan_to_num(R[dias + 2])).sum(axis=1) + w[:, N] * spyR[dias + 2]
+        neto = ret - args.cost_bps * 1e-4 * giro
+        netos.append(neto)
+        spys.append(spyR[dias + 2])
+        por_tramo.append(float(np.prod(1 + neto) - 1))
+        giros.append(giro)
+        nacc.append((w[:, :N] > 0.01).sum(axis=1))
+        en_spy.append(w[:, N])
+    sn, ss = estadisticas(np.concatenate(netos)), estadisticas(np.concatenate(spys))
+    ok, pos = veredicto(por_tramo, sn, ss)
+    print("\n" + "=" * 78)
+    print("RESULTADO GESTOR DIARIO (pesos que decide la red, revisados cada día)")
+    print("=" * 78)
+    print(f"  {'':<18}{'neto/año':>10}{'Sharpe':>8}{'MaxDD':>8}{'tramos+':>9}{'SPY/año':>9}{'SPY Sh.':>8}")
+    print(f"  {'gestor red':<18}{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}{sn['dd'] * 100:>7.1f}%"
+          f"{pos:>5}/{len(por_tramo):<3}{ss['ann'] * 100:>8.1f}%{ss['sharpe']:>8.2f}  {'PASA' if ok else 'no pasa'}")
+    print(f"  rotación: {np.concatenate(giros).mean() * 252 * 100:.0f}% del portafolio al año | "
+          f"acciones con más de 1%: {np.concatenate(nacc).mean():.1f} en promedio | "
+          f"en SPY: {np.concatenate(en_spy).mean() * 100:.0f}% en promedio")
+    print("  (comparar con 'Todas juntas' a 63 días más arriba: 10 acciones al 10%, rotando cada trimestre)")
+
+    # ---- portafolio de hoy y ejemplos de depositar / retirar ----
+    if ultimo is not None:
+        net, Xn = ultimo
+        with torch.no_grad():
+            t_hoy = T - 1
+            _, _, pesos, objs = recorrer(net, Xn, St, Mt, Rt, sp, tr_list[-1][0], t_hoy, w_spy, args.cost_bps)
+        w_hoy, obj_hoy = pesos[-1].numpy(), objs[-1].numpy()
+        nombres = list(tickers) + ["SPY"]
+        px = np.r_[precios[-1], np.nan]
+        print(f"\nPortafolio que la red tendría al {fechas[t_hoy].date()} (sobre 10.000 USD):")
+        for i in np.argsort(-w_hoy)[:15]:
+            if w_hoy[i] > 0.005:
+                print(f"  {nombres[i]:<6} {w_hoy[i] * 100:5.1f}%  ({w_hoy[i] * 10000:,.0f} USD)")
+        valores = {nombres[i]: w_hoy[i] * 10000 for i in range(N + 1) if w_hoy[i] > 0.005}
+        obj = {nombres[i]: obj_hoy[i] for i in range(N + 1)}
+        sc = {nombres[i]: (S[t_hoy, i] if i < N else 0.0) for i in range(N + 1)}
+        pr = {nombres[i]: px[i] for i in range(N + 1)}
+        for monto in (1000, -1000):
+            print(f"\nSi {'depositas' if monto > 0 else 'retiras'} {abs(monto):,} USD:")
+            for nom, usd, acc in repartir_flujo(valores, obj, monto, pr, sc):
+                txt = f" (~{abs(acc):.2f} acciones)" if np.isfinite(acc) else ""
+                print(f"  {'comprar' if usd > 0 else 'vender'} {nom:<6} {abs(usd):,.0f} USD{txt}")
+    return ok
+
+
+def repartir_flujo(valores, objetivo, monto, precios, puntaje):
+    """Qué comprar al depositar o qué vender al retirar, con el menor costo futuro.
+    - Depositar: el dinero va primero a lo que está por DEBAJO de su peso objetivo (se rellena sin
+      vender nada, así no hay costo de rotar después).
+    - Retirar: se vende primero lo que está por ENCIMA de su objetivo (igual habría que venderlo
+      después); si no alcanza, lo de menor puntaje. Así no se rompe lo que más se espera que gane.
+    No considera impuestos."""
+    total = sum(valores.values()) + monto
+    nombres = set(valores) | {k for k, v in objetivo.items() if v > 0.005}
+    dif = {k: objetivo.get(k, 0.0) * total - valores.get(k, 0.0) for k in nombres}
+    ordenes = {}
+    if monto > 0:
+        falta = {k: d for k, d in dif.items() if d > 0}
+        tot = sum(falta.values())
+        for k, d in falta.items():
+            ordenes[k] = monto * d / tot if tot > monto else d
+        resto = monto - sum(ordenes.values())
+        if resto > 1:
+            for k in nombres:
+                ordenes[k] = ordenes.get(k, 0.0) + resto * objetivo.get(k, 0.0)
+    else:
+        retirar = -monto
+        sobra = {k: -d for k, d in dif.items() if d < 0}
+        for k in sorted(sobra, key=lambda x: puntaje.get(x, 0.0)):
+            v = min(sobra[k], retirar)
+            ordenes[k] = -v
+            retirar -= v
+            if retirar <= 0:
+                break
+        for k in sorted(valores, key=lambda x: puntaje.get(x, 0.0)):
+            if retirar <= 0:
+                break
+            disp = valores[k] + ordenes.get(k, 0.0)
+            v = min(disp, retirar)
+            ordenes[k] = ordenes.get(k, 0.0) - v
+            retirar -= v
+    out = [(k, v, v / precios[k] if precios.get(k) and np.isfinite(precios[k]) else np.nan)
+           for k, v in ordenes.items() if abs(v) >= 1]
+    return sorted(out, key=lambda r: -abs(r[1]))
 
 
 def ejecutar(modelo, args, F, Y, R, spyR, tr_list, gap):
