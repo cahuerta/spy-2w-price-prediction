@@ -1,0 +1,43 @@
+name: Paper trading (Todas juntas)
+
+on:
+  schedule:
+    - cron: "45 14 * * 1-5"   # 14:45 UTC = poco después de la apertura de Nueva York
+  workflow_dispatch:
+    inputs:
+      forzar:
+        description: "Rebalancear hoy aunque no sea inicio de trimestre (si / no)"
+        default: "no"
+      solo_mostrar:
+        description: "Solo mostrar qué haría, sin mandar órdenes (si / no)"
+        default: "no"
+
+jobs:
+  operar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar
+        run: pip install alpaca-py pandas numpy requests lxml
+      - name: Operar en paper
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SEC_CONTACT: ${{ secrets.SEC_CONTACT }}
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "${{ inputs.forzar }}" = "si" ]; then EXTRA="--forzar"; fi
+          if [ "${{ inputs.solo_mostrar }}" = "si" ]; then EXTRA="$EXTRA --solo-mostrar"; fi
+          set -o pipefail
+          python -u operar_paper.py $EXTRA 2>&1 | tee salida.txt
+      - name: Resumen
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 80 salida.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

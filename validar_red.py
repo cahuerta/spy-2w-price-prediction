@@ -1136,13 +1136,17 @@ def crear_gestor(nf, hid=32):
             self.mer = nn.Sequential(nn.Linear(hid, hid), nn.GELU())
             self.spy = nn.Linear(hid, 1)                 # cuánto dejar en el índice
             self.vel = nn.Linear(hid + 1, 1)             # cuánto rotar hoy
+            for capa in (self.tam, self.spy):            # al inicio no corrige nada: sigue la base
+                nn.init.zeros_(capa.weight)
+                nn.init.zeros_(capa.bias)
 
-        def forward(self, x, sc, mask, w_prev):
+        def forward(self, x, sc, mask, w_prev, base):
             # x [N, nf] datos de hoy; sc [N] puntaje 'Todas juntas'; mask [N] candidatas; w_prev [N+1]
             e = self.acc(torch.cat([x, sc[:, None], 10 * w_prev[:-1, None]], dim=1))
-            logit = self.tam(e).squeeze(1).masked_fill(~mask, -1e9)
+            # parte de 'Todas juntas' trimestral (base) y la red solo corrige hacia arriba o abajo
+            logit = (torch.log(base[:-1] + 1e-3) + self.tam(e).squeeze(1)).masked_fill(~mask, -1e9)
             ctx = self.mer(e[mask].mean(dim=0))
-            objetivo = torch.softmax(torch.cat([logit, self.spy(ctx)]), dim=0)
+            objetivo = torch.softmax(torch.cat([logit, torch.log(base[-1:] + 1e-3) + self.spy(ctx)]), dim=0)
             dist = (objetivo - w_prev).abs().sum().reshape(1)
             vel = torch.sigmoid(self.vel(torch.cat([ctx, dist])))
             return objetivo, vel
@@ -1150,14 +1154,27 @@ def crear_gestor(nf, hid=32):
     return Gestor()
 
 
-def recorrer(net, Xn, S, M, R, spyR, t0, t1, w0, cost_bps):
+def base_trimestral(S, t0, t1, k=10, cada=63):
+    """'Todas juntas' sin red: las k mejores al 10% cada una, rotando cada 'cada' días desde t0."""
+    T, N = S.shape
+    B = np.zeros((T, N + 1), dtype=np.float32)
+    actual = None
+    for t in range(t0, t1 + 1):
+        if (t - t0) % cada == 0:
+            actual = np.argsort(-S[t])[:k]
+        B[t, actual] = 1.0 / k
+    return B
+
+
+def recorrer(net, Xn, S, M, R, spyR, t0, t1, w0, cost_bps, k=10):
     """Simula día a día de t0 a t1. Devuelve exceso neto sobre SPY de cada día, rotación y pesos."""
     import torch
     N = Xn.shape[1]
+    B = torch.from_numpy(base_trimestral(S.numpy(), t0, t1, k))
     w = w0
     exc, rot, pesos, objs = [], [], [], []
     for t in range(t0, t1 + 1):
-        obj, vel = net(Xn[t], S[t], M[t], w)
+        obj, vel = net(Xn[t], S[t], M[t] | (B[t, :N] > 0), w, B[t])
         w_new = w + vel * (obj - w)
         giro = (w_new - w).abs().sum()
         if t + 2 < len(spyR):
@@ -1207,7 +1224,7 @@ def gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers, prec
             for ep in range(args.epochs or 40):
                 net.train()
                 ini = t_ini + int(np.random.default_rng(s * 1000 + ep).integers(0, 21))
-                ex, rot, _, _ = recorrer(net, Xn, St, Mt, Rt, sp, ini, fit_fin, w_spy, args.cost_bps)
+                ex, rot, _, _ = recorrer(net, Xn, St, Mt, Rt, sp, ini, fit_fin, w_spy, 4 * args.cost_bps, args.k)
                 ex = torch.stack(ex)
                 perdida = -ex.mean() / (ex.std() + 1e-5)
                 opt.zero_grad()
@@ -1216,7 +1233,7 @@ def gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers, prec
                 opt.step()
                 net.eval()
                 with torch.no_grad():
-                    exv, _, _, _ = recorrer(net, Xn, St, Mt, Rt, sp, v_ini, t_fin, w_spy, args.cost_bps)
+                    exv, _, _, _ = recorrer(net, Xn, St, Mt, Rt, sp, v_ini, t_fin, w_spy, 4 * args.cost_bps, args.k)
                     exv = torch.stack(exv)
                     vl = float(-exv.mean() / (exv.std() + 1e-5))
                 if vl < mejor - 1e-4:
@@ -1229,47 +1246,59 @@ def gestor_walk_forward(F, R, spyR, S, tr_list, gap, args, fechas, tickers, prec
             net.load_state_dict(estado)
             net.eval()
             with torch.no_grad():
-                _, _, pesos, _ = recorrer(net, Xn, St, Mt, Rt, sp, a, b, w_spy, args.cost_bps)
+                _, _, pesos, _ = recorrer(net, Xn, St, Mt, Rt, sp, a, b, w_spy, args.cost_bps, args.k)
             acum += torch.stack(pesos).numpy()
             print(f"  tramo {k}/{len(tr_list)} semilla {s}: Sharpe val {-mejor * np.sqrt(252):+.2f}, "
                   f"{time.time() - t0_:.0f}s", flush=True)
             ultimo = (net, Xn)
         W[a:b + 1] = acum / args.seeds
 
-    # ---- resultado con los pesos diarios (costos según lo que realmente rotó) ----
-    netos, spys, por_tramo, giros, nacc, en_spy = [], [], [], [], [], []
+    # ---- resultado con los pesos diarios (costos según lo que realmente rotó), en los MISMOS días ----
+    def evaluar(Wx):
+        netos, spys, por_tramo, giros, nacc, en_spy = [], [], [], [], [], []
+        for a, b in tr_list:
+            dias = np.arange(a, min(b, T - 3) + 1)
+            w = Wx[dias]
+            prev = np.vstack([np.r_[np.zeros(N), 1.0], w[:-1]])
+            giro = np.abs(w - prev).sum(axis=1)
+            ret = (w[:, :N] * np.nan_to_num(R[dias + 2])).sum(axis=1) + w[:, N] * spyR[dias + 2]
+            neto = ret - args.cost_bps * 1e-4 * giro
+            netos.append(neto)
+            spys.append(spyR[dias + 2])
+            por_tramo.append(float(np.prod(1 + neto) - 1))
+            giros.append(giro)
+            nacc.append((w[:, :N] > 0.01).sum(axis=1))
+            en_spy.append(w[:, N])
+        sn, ss = estadisticas(np.concatenate(netos)), estadisticas(np.concatenate(spys))
+        ok, pos = veredicto(por_tramo, sn, ss)
+        extra = (np.concatenate(giros).mean() * 252, np.concatenate(nacc).mean(), np.concatenate(en_spy).mean())
+        return sn, ss, ok, pos, len(por_tramo), extra
+
+    Wb = np.zeros((T, N + 1))
     for a, b in tr_list:
-        dias = np.arange(a, min(b, T - 3) + 1)
-        w = W[dias]
-        prev = np.vstack([np.r_[np.zeros(N), 1.0], w[:-1]])
-        giro = np.abs(w - prev).sum(axis=1)
-        ret = (w[:, :N] * np.nan_to_num(R[dias + 2])).sum(axis=1) + w[:, N] * spyR[dias + 2]
-        neto = ret - args.cost_bps * 1e-4 * giro
-        netos.append(neto)
-        spys.append(spyR[dias + 2])
-        por_tramo.append(float(np.prod(1 + neto) - 1))
-        giros.append(giro)
-        nacc.append((w[:, :N] > 0.01).sum(axis=1))
-        en_spy.append(w[:, N])
-    sn, ss = estadisticas(np.concatenate(netos)), estadisticas(np.concatenate(spys))
-    ok, pos = veredicto(por_tramo, sn, ss)
+        Wb[a:b + 1] = base_trimestral(S, a, b, args.k)[a:b + 1]
     print("\n" + "=" * 78)
-    print("RESULTADO GESTOR DIARIO (pesos que decide la red, revisados cada día)")
+    print("RESULTADO GESTOR DIARIO (mismos días para todos; costo real de cada operación)")
     print("=" * 78)
-    print(f"  {'':<18}{'neto/año':>10}{'Sharpe':>8}{'MaxDD':>8}{'tramos+':>9}{'SPY/año':>9}{'SPY Sh.':>8}")
-    print(f"  {'gestor red':<18}{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}{sn['dd'] * 100:>7.1f}%"
-          f"{pos:>5}/{len(por_tramo):<3}{ss['ann'] * 100:>8.1f}%{ss['sharpe']:>8.2f}  {'PASA' if ok else 'no pasa'}")
-    print(f"  rotación: {np.concatenate(giros).mean() * 252 * 100:.0f}% del portafolio al año | "
-          f"acciones con más de 1%: {np.concatenate(nacc).mean():.1f} en promedio | "
-          f"en SPY: {np.concatenate(en_spy).mean() * 100:.0f}% en promedio")
-    print("  (comparar con 'Todas juntas' a 63 días más arriba: 10 acciones al 10%, rotando cada trimestre)")
+    print(f"  {'':<24}{'neto/año':>10}{'Sharpe':>8}{'MaxDD':>8}{'tramos+':>9}  {'rota/año':>9}{'acciones':>9}{'en SPY':>7}")
+    res = {}
+    for nombre, Wx in (("gestor red", W), ("Todas juntas trimestral", Wb)):
+        sn, ss, okx, pos, nt, (giro, nacc, enspy) = evaluar(Wx)
+        res[nombre] = (sn, okx)
+        print(f"  {nombre:<24}{sn['ann'] * 100:>9.1f}%{sn['sharpe']:>8.2f}{sn['dd'] * 100:>7.1f}%{pos:>5}/{nt:<3}"
+              f"  {giro * 100:>8.0f}%{nacc:>9.1f}{enspy * 100:>6.0f}%")
+    print(f"  {'SPY':<24}{ss['ann'] * 100:>9.1f}%{ss['sharpe']:>8.2f}")
+    g, bse = res["gestor red"][0], res["Todas juntas trimestral"][0]
+    ok = res["gestor red"][1] and g["sharpe"] > bse["sharpe"] + 0.05 and g["ann"] > bse["ann"] + 0.005
+    print(f"  Veredicto: la red {'GOBIERNA MEJOR' if ok else 'todavía NO mejora'} que 'Todas juntas' trimestral "
+          f"(debe ganarle a SPY, y a la base por al menos 0,5 puntos de retorno y 0,05 de Sharpe).")
 
     # ---- portafolio de hoy y ejemplos de depositar / retirar ----
     if ultimo is not None:
         net, Xn = ultimo
         with torch.no_grad():
             t_hoy = T - 1
-            _, _, pesos, objs = recorrer(net, Xn, St, Mt, Rt, sp, tr_list[-1][0], t_hoy, w_spy, args.cost_bps)
+            _, _, pesos, objs = recorrer(net, Xn, St, Mt, Rt, sp, tr_list[-1][0], t_hoy, w_spy, args.cost_bps, args.k)
         w_hoy, obj_hoy = pesos[-1].numpy(), objs[-1].numpy()
         nombres = list(tickers) + ["SPY"]
         px = np.r_[precios[-1], np.nan]
